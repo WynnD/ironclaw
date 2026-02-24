@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/nearai/ironclaw/compare/v0.11.1...v0.12.0) - 2026-02-24
+
+### Added
+
+- add OpenRouter preset to setup wizard ([#270](https://github.com/nearai/ironclaw/pull/270))
+- *(channels)* add native Signal channel via signal-cli HTTP daemon ([#271](https://github.com/nearai/ironclaw/pull/271))
+
+### Fixed
+
+- resolve telegram/slack name collision between tool and channel registries ([#346](https://github.com/nearai/ironclaw/pull/346))
+- make onboarding installs prefer release artifacts with source fallback ([#323](https://github.com/nearai/ironclaw/pull/323))
+- copy missing files in Dockerfile to fix build ([#322](https://github.com/nearai/ironclaw/pull/322))
+- fall back to build-from-source when extension download fails ([#312](https://github.com/nearai/ironclaw/pull/312))
+
+### Other
+
+- Update FEATURE_PARITY.md ([#337](https://github.com/nearai/ironclaw/pull/337))
+- add brew install ironclaw instructions ([#310](https://github.com/nearai/ironclaw/pull/310))
+- Fix skills system: enable by default, fix registry and install ([#300](https://github.com/nearai/ironclaw/pull/300))
+
 ## [0.11.1](https://github.com/nearai/ironclaw/compare/v0.11.0...v0.11.1) - 2026-02-23
 
 ### Other
