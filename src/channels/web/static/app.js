@@ -1930,6 +1930,7 @@ function activateExtension(name) {
   apiFetch('/api/extensions/' + encodeURIComponent(name) + '/activate', { method: 'POST' })
     .then((res) => {
       if (res.success) {
+        showToast(res.message || ('Activated ' + name), 'success');
         loadExtensions();
         return;
       }

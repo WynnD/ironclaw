@@ -22,10 +22,11 @@ use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::config::RoutineCronTimezone;
 use crate::error::RoutineError;
 
 /// A routine is a named, persistent, user-owned task with a trigger and an action.
@@ -394,18 +395,43 @@ pub fn content_hash(content: &str) -> u64 {
 
 /// Parse a cron expression and compute the next fire time from now.
 pub fn next_cron_fire(schedule: &str) -> Result<Option<DateTime<Utc>>, RoutineError> {
+    next_cron_fire_with_timezone(schedule, &RoutineCronTimezone::Local)
+}
+
+/// Parse a cron expression and compute the next fire time using a specific timezone.
+///
+/// Returned timestamps are normalized to UTC for storage.
+pub fn next_cron_fire_with_timezone(
+    schedule: &str,
+    timezone: &RoutineCronTimezone,
+) -> Result<Option<DateTime<Utc>>, RoutineError> {
     let cron_schedule =
         cron::Schedule::from_str(schedule).map_err(|e| RoutineError::InvalidCron {
             reason: e.to_string(),
         })?;
-    Ok(cron_schedule.upcoming(Utc).next())
+
+    let next = match timezone {
+        RoutineCronTimezone::Local => cron_schedule
+            .upcoming(Local)
+            .next()
+            .map(|dt| dt.with_timezone(&Utc)),
+        RoutineCronTimezone::Utc => cron_schedule.upcoming(Utc).next(),
+        RoutineCronTimezone::Iana(tz) => cron_schedule
+            .upcoming(tz.clone())
+            .next()
+            .map(|dt| dt.with_timezone(&Utc)),
+    };
+
+    Ok(next)
 }
 
 #[cfg(test)]
 mod tests {
     use crate::agent::routine::{
         RoutineAction, RoutineGuardrails, RunStatus, Trigger, content_hash, next_cron_fire,
+        next_cron_fire_with_timezone,
     };
+    use crate::config::RoutineCronTimezone;
 
     #[test]
     fn test_trigger_roundtrip() {
@@ -494,6 +520,13 @@ mod tests {
     fn test_next_cron_fire_invalid() {
         let result = next_cron_fire("not a cron");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_next_cron_fire_with_explicit_timezone() {
+        let next = next_cron_fire_with_timezone("* * * * * *", &RoutineCronTimezone::Utc)
+            .expect("valid cron");
+        assert!(next.is_some());
     }
 
     #[test]

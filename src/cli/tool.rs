@@ -15,7 +15,7 @@ use crate::db::Database;
 #[cfg(feature = "postgres")]
 use crate::secrets::PostgresSecretsStore;
 use crate::secrets::{CreateSecretParams, SecretsCrypto, SecretsStore};
-use crate::tools::wasm::{CapabilitiesFile, compute_binary_hash};
+use crate::tools::wasm::{AuthCapabilitySchema, CapabilitiesFile, compute_binary_hash};
 
 /// Default tools directory.
 fn default_tools_dir() -> PathBuf {
@@ -524,6 +524,80 @@ fn print_capabilities_detail(caps: &CapabilitiesFile) {
     }
 }
 
+fn infer_legacy_auth_config(name: &str, caps: &CapabilitiesFile) -> Option<AuthCapabilitySchema> {
+    let mut candidates: Vec<String> = Vec::new();
+
+    if let Some(http) = &caps.http {
+        for mapping in http.credentials.values() {
+            if !candidates.iter().any(|s| s == &mapping.secret_name) {
+                candidates.push(mapping.secret_name.clone());
+            }
+        }
+    }
+
+    if let Some(secrets) = &caps.secrets {
+        for secret in &secrets.allowed_names {
+            if !candidates.iter().any(|s| s == secret) {
+                candidates.push(secret.clone());
+            }
+        }
+    }
+
+    let tool_name_lc = name.to_ascii_lowercase();
+    let selected = match candidates.len() {
+        0 => return None,
+        1 => candidates.into_iter().next()?,
+        _ => {
+            if let Some(secret) = candidates.iter().find(|s| {
+                let s_lc = s.to_ascii_lowercase();
+                s_lc == format!("{}_token", tool_name_lc)
+                    || s_lc == format!("{}_api_key", tool_name_lc)
+                    || s_lc.contains(&tool_name_lc)
+            }) {
+                secret.clone()
+            } else {
+                return None;
+            }
+        }
+    };
+
+    let env_var = selected
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+
+    let secret_lc = selected.to_ascii_lowercase();
+    let (setup_url, token_hint) = if secret_lc.contains("github") || tool_name_lc == "github" {
+        (
+            Some("https://github.com/settings/tokens".to_string()),
+            Some("Use a GitHub PAT (fine-grained or classic)".to_string()),
+        )
+    } else {
+        (None, None)
+    };
+
+    Some(AuthCapabilitySchema {
+        secret_name: selected.clone(),
+        display_name: Some(name.to_string()),
+        oauth: None,
+        instructions: Some(format!(
+            "Enter the token/API key for '{}'. This auth setup was inferred from the tool's legacy capabilities file.",
+            name
+        )),
+        setup_url,
+        token_hint,
+        env_var: Some(env_var),
+        provider: None,
+        validation_endpoint: None,
+    })
+}
+
 /// Configure authentication for a tool.
 async fn auth_tool(name: String, dir: Option<PathBuf>, user_id: String) -> anyhow::Result<()> {
     let tools_dir = dir.unwrap_or_else(default_tools_dir);
@@ -543,7 +617,12 @@ async fn auth_tool(name: String, dir: Option<PathBuf>, user_id: String) -> anyho
         .map_err(|e| anyhow::anyhow!("Invalid capabilities file: {}", e))?;
 
     // Check for auth section
-    let auth = caps.auth.ok_or_else(|| {
+    let inferred_legacy_auth = caps.auth.is_none();
+    let auth = caps
+        .auth
+        .clone()
+        .or_else(|| infer_legacy_auth_config(&name, &caps));
+    let auth = auth.ok_or_else(|| {
         anyhow::anyhow!(
             "Tool '{}' has no auth configuration.\n\
              The tool may not require authentication, or auth setup is not defined.",
@@ -559,6 +638,13 @@ async fn auth_tool(name: String, dir: Option<PathBuf>, user_id: String) -> anyho
     println!("║  {:^62}║", header);
     println!("╚════════════════════════════════════════════════════════════════╝");
     println!();
+
+    if inferred_legacy_auth {
+        println!(
+            "  Using inferred manual auth from legacy capabilities. Reinstall/update the tool to add explicit auth metadata."
+        );
+        println!();
+    }
 
     // Initialize secrets store
     let config = Config::from_env().await?;

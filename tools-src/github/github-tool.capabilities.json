@@ -1,41 +1,39 @@
 {
-  "capabilities": {
-    "http": {
-      "allowlist": [
-        {
-          "host": "api.github.com",
-          "path_prefix": "/",
-          "methods": [
-            "GET",
-            "POST"
-          ]
-        }
-      ],
-      "credentials": {
-        "github_token": {
-          "secret_name": "github_token",
-          "location": {
-            "type": "bearer"
-          },
-          "host_patterns": [
-            "api.github.com"
-          ]
-        }
-      },
-      "rate_limit": {
-        "requests_per_minute": 60,
-        "requests_per_hour": 3600
+  "http": {
+    "allowlist": [
+      {
+        "host": "api.github.com",
+        "path_prefix": "/",
+        "methods": ["GET", "POST"]
+      }
+    ],
+    "credentials": {
+      "github_token": {
+        "secret_name": "github_token",
+        "location": { "type": "bearer" },
+        "host_patterns": ["api.github.com"]
       }
     },
-    "secrets": {
-      "allowed_names": [
-        "github_token",
-        "github_*"
-      ]
+    "rate_limit": {
+      "requests_per_minute": 60,
+      "requests_per_hour": 3600
     }
   },
-  "config": {
-    "default_limit": 30,
-    "max_limit": 100
+  "secrets": {
+    "allowed_names": ["github_token", "github_*"]
+  },
+  "auth": {
+    "secret_name": "github_token",
+    "display_name": "GitHub",
+    "instructions": "1. Create a GitHub Personal Access Token (classic or fine-grained) at https://github.com/settings/tokens\n2. Grant the permissions your workflows need (common: repo, workflow, read:org)\n3. Paste the token here when prompted, or set GITHUB_TOKEN in your environment before running auth",
+    "setup_url": "https://github.com/settings/tokens",
+    "token_hint": "GitHub token (ghp_, github_pat_, or fine-grained PAT)",
+    "env_var": "GITHUB_TOKEN",
+    "provider": "github",
+    "validation_endpoint": {
+      "url": "https://api.github.com/user",
+      "method": "GET",
+      "success_status": 200
+    }
   }
 }

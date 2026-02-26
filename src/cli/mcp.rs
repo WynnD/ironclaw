@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::db::Database;
 #[cfg(feature = "postgres")]
 use crate::secrets::PostgresSecretsStore;
-use crate::secrets::{SecretsCrypto, SecretsStore};
+use crate::secrets::{CreateSecretParams, SecretsCrypto, SecretsStore};
 use crate::tools::mcp::{
     McpClient, McpServerConfig, McpSessionManager, OAuthConfig,
     auth::{authorize_mcp_server, is_authenticated},
@@ -62,7 +62,7 @@ pub enum McpCommand {
         verbose: bool,
     },
 
-    /// Authenticate with an MCP server (OAuth flow)
+    /// Authenticate with an MCP server (OAuth flow or manual bearer token)
     Auth {
         /// Server name to authenticate
         name: String,
@@ -70,6 +70,10 @@ pub enum McpCommand {
         /// User ID for storing the token (default: "default")
         #[arg(short, long, default_value = "default")]
         user: String,
+
+        /// Manually provide a bearer token (skips OAuth discovery/flow)
+        #[arg(long)]
+        token: Option<String>,
     },
 
     /// Test connection to an MCP server
@@ -122,7 +126,7 @@ pub async fn run_mcp_command(cmd: McpCommand) -> anyhow::Result<()> {
         }
         McpCommand::Remove { name } => remove_server(name).await,
         McpCommand::List { verbose } => list_servers(verbose).await,
-        McpCommand::Auth { name, user } => auth_server(name, user).await,
+        McpCommand::Auth { name, user, token } => auth_server(name, user, token).await,
         McpCommand::Test { name, user } => test_server(name, user).await,
         McpCommand::Toggle {
             name,
@@ -268,7 +272,11 @@ async fn list_servers(verbose: bool) -> anyhow::Result<()> {
 }
 
 /// Authenticate with an MCP server.
-async fn auth_server(name: String, user_id: String) -> anyhow::Result<()> {
+async fn auth_server(
+    name: String,
+    user_id: String,
+    manual_token: Option<String>,
+) -> anyhow::Result<()> {
     // Get server config
     let db = connect_db().await;
     let servers = load_servers(db.as_deref()).await?;
@@ -279,6 +287,20 @@ async fn auth_server(name: String, user_id: String) -> anyhow::Result<()> {
 
     // Initialize secrets store
     let secrets = get_secrets_store().await?;
+
+    if let Some(token) = manual_token {
+        let params = CreateSecretParams::new(server.token_secret_name(), &token)
+            .with_provider(format!("mcp:{}", server.name));
+
+        secrets.create(&user_id, params).await?;
+
+        println!();
+        println!("  ✓ Saved bearer token for '{}'!", name);
+        println!();
+        println!("  IronClaw will send it as: Authorization: Bearer <token>");
+        println!();
+        return Ok(());
+    }
 
     // Check if already authenticated
     if is_authenticated(&server, &secrets, &user_id).await {
@@ -328,6 +350,10 @@ async fn auth_server(name: String, user_id: String) -> anyhow::Result<()> {
                 "    ironclaw mcp add {} {} --client-id YOUR_CLIENT_ID",
                 name, server.url
             );
+            println!();
+            println!("  Or, if the server accepts bearer tokens directly:");
+            println!();
+            println!("    ironclaw mcp auth {} --token YOUR_TOKEN", name);
             println!();
         }
         Err(e) => {

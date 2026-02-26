@@ -14,17 +14,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use regex::Regex;
 use tokio::sync::{RwLock, mpsc};
 use uuid::Uuid;
 
 use crate::agent::Scheduler;
 use crate::agent::routine::{
-    NotifyConfig, Routine, RoutineAction, RoutineRun, RunStatus, Trigger, next_cron_fire,
+    NotifyConfig, Routine, RoutineAction, RoutineRun, RunStatus, Trigger,
+    next_cron_fire_with_timezone,
 };
 use crate::channels::{IncomingMessage, OutgoingResponse};
-use crate::config::RoutineConfig;
+use crate::config::{RoutineConfig, RoutineCronTimezone};
 use crate::db::Database;
 use crate::error::RoutineError;
 use crate::llm::{ChatMessage, CompletionRequest, FinishReason, LlmProvider};
@@ -65,6 +66,11 @@ impl RoutineEngine {
             event_cache: Arc::new(RwLock::new(Vec::new())),
             scheduler,
         }
+    }
+
+    /// Compute the next fire time for a cron schedule using the configured routine timezone.
+    pub fn next_cron_fire(&self, schedule: &str) -> Result<Option<DateTime<Utc>>, RoutineError> {
+        next_cron_fire_with_timezone(schedule, &self.config.cron_timezone)
     }
 
     /// Refresh the in-memory event trigger cache from DB.
@@ -237,6 +243,7 @@ impl RoutineEngine {
             notify_tx: self.notify_tx.clone(),
             running_count: self.running_count.clone(),
             scheduler: self.scheduler.clone(),
+            cron_timezone: self.config.cron_timezone.clone(),
         };
 
         tokio::spawn(async move {
@@ -269,6 +276,7 @@ impl RoutineEngine {
             notify_tx: self.notify_tx.clone(),
             running_count: self.running_count.clone(),
             scheduler: self.scheduler.clone(),
+            cron_timezone: self.config.cron_timezone.clone(),
         };
 
         // Record the run in DB, then spawn execution
@@ -316,6 +324,7 @@ struct EngineContext {
     notify_tx: mpsc::Sender<OutgoingResponse>,
     running_count: Arc<AtomicUsize>,
     scheduler: Option<Arc<Scheduler>>,
+    cron_timezone: RoutineCronTimezone,
 }
 
 /// Execute a routine run. Handles both lightweight and full_job modes.
@@ -360,7 +369,7 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
     // Update routine runtime state
     let now = Utc::now();
     let next_fire = if let Trigger::Cron { ref schedule } = routine.trigger {
-        next_cron_fire(schedule).unwrap_or(None)
+        next_cron_fire_with_timezone(schedule, &ctx.cron_timezone).unwrap_or(None)
     } else {
         None
     };

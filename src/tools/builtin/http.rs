@@ -302,6 +302,9 @@ impl Tool for HttpTool {
             None
         };
 
+        let leak_scan_url = parsed_url.clone();
+        let leak_scan_headers = headers_vec.clone();
+
         // Credential injection from shared registry
         if let (Some(registry), Some(store)) = (
             self.credential_registry.as_ref(),
@@ -338,9 +341,16 @@ impl Tool for HttpTool {
         }
 
         // Leak detection on outbound request (url/headers/body)
+        // Scan only caller-supplied request data. Host-injected credentials are
+        // appended after this point and are intentionally omitted to avoid false
+        // positives for legitimate injected auth headers (e.g. GitHub PATs).
         let detector = LeakDetector::new();
         detector
-            .scan_http_request(parsed_url.as_str(), &headers_vec, body_bytes.as_deref())
+            .scan_http_request(
+                leak_scan_url.as_str(),
+                &leak_scan_headers,
+                body_bytes.as_deref(),
+            )
             .map_err(|e| ToolError::NotAuthorized(format!("{}", e)))?;
 
         // Execute request

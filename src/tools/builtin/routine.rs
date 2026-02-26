@@ -14,9 +14,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use uuid::Uuid;
 
-use crate::agent::routine::{
-    NotifyConfig, Routine, RoutineAction, RoutineGuardrails, Trigger, next_cron_fire,
-};
+use crate::agent::routine::{NotifyConfig, Routine, RoutineAction, RoutineGuardrails, Trigger};
 use crate::agent::routine_engine::RoutineEngine;
 use crate::context::JobContext;
 use crate::db::Database;
@@ -130,7 +128,7 @@ impl Tool for RoutineCreateTool {
                             )
                         })?;
                 // Validate cron expression
-                next_cron_fire(schedule).map_err(|e| {
+                self.engine.next_cron_fire(schedule).map_err(|e| {
                     ToolError::InvalidParameters(format!("invalid cron schedule: {e}"))
                 })?;
                 Trigger::Cron {
@@ -211,7 +209,7 @@ impl Tool for RoutineCreateTool {
 
         // Compute next fire time for cron
         let next_fire = if let Trigger::Cron { ref schedule } = trigger {
-            next_cron_fire(schedule).unwrap_or(None)
+            self.engine.next_cron_fire(schedule).unwrap_or(None)
         } else {
             None
         };
@@ -426,13 +424,14 @@ impl Tool for RoutineUpdateTool {
 
         if let Some(schedule) = params.get("schedule").and_then(|v| v.as_str()) {
             // Validate
-            next_cron_fire(schedule)
+            self.engine
+                .next_cron_fire(schedule)
                 .map_err(|e| ToolError::InvalidParameters(format!("invalid cron schedule: {e}")))?;
 
             routine.trigger = Trigger::Cron {
                 schedule: schedule.to_string(),
             };
-            routine.next_fire_at = next_cron_fire(schedule).unwrap_or(None);
+            routine.next_fire_at = self.engine.next_cron_fire(schedule).unwrap_or(None);
         }
 
         self.store

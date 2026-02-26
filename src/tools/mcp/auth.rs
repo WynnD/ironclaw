@@ -206,6 +206,81 @@ fn extract_origin(server_url: &str) -> Result<String, AuthError> {
     Ok(parsed.origin().ascii_serialization())
 }
 
+/// Parse a URL for metadata discovery, stripping query and fragment components.
+fn parse_discovery_url(url: &str) -> Result<reqwest::Url, AuthError> {
+    let mut parsed = reqwest::Url::parse(url)
+        .map_err(|e| AuthError::DiscoveryFailed(format!("Invalid server URL: {}", e)))?;
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Ok(parsed)
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+/// Return path variants for well-known metadata discovery.
+///
+/// For path-based issuers/resources, OAuth well-known metadata lives under:
+///   {origin}/.well-known/<kind>/<path>
+///
+/// We try a trimmed-trailing-slash variant first because many services canonicalize
+/// `/mcp/` to `/mcp` in metadata even when users configure the MCP URL with a slash.
+fn discovery_path_variants(parsed_url: &reqwest::Url) -> Vec<String> {
+    let path = parsed_url.path().trim_start_matches('/');
+    if path.is_empty() {
+        return Vec::new();
+    }
+
+    let mut variants = Vec::new();
+    let trimmed = path.trim_end_matches('/');
+    if !trimmed.is_empty() {
+        push_unique(&mut variants, trimmed.to_string());
+    }
+    if !path.is_empty() {
+        push_unique(&mut variants, path.to_string());
+    }
+    variants
+}
+
+/// Build a forgiving list of well-known metadata URLs for a resource/issuer URL.
+///
+/// The first candidates follow RFC 8414 / RFC 9728 path-based well-known placement,
+/// then we fall back to root and legacy suffix-style placement for compatibility.
+fn well_known_metadata_candidates(
+    url: &str,
+    metadata_name: &str,
+) -> Result<Vec<String>, AuthError> {
+    let parsed = parse_discovery_url(url)?;
+    let origin = parsed.origin().ascii_serialization();
+
+    let mut candidates = Vec::new();
+    let root_candidate = format!("{}/.well-known/{}", origin, metadata_name);
+
+    // Standards-compliant path-aware placement (RFC 8414 / RFC 9728).
+    for path in discovery_path_variants(&parsed) {
+        push_unique(
+            &mut candidates,
+            format!("{}/.well-known/{}/{}", origin, metadata_name, path),
+        );
+    }
+
+    // Root-level well-known metadata (standard when there is no path; useful fallback otherwise).
+    push_unique(&mut candidates, root_candidate);
+
+    // Legacy/non-standard suffix style some implementations use:
+    //   https://host/path/.well-known/<metadata>
+    let legacy_base = parsed.as_str().trim_end_matches('/');
+    push_unique(
+        &mut candidates,
+        format!("{}/.well-known/{}", legacy_base, metadata_name),
+    );
+
+    Ok(candidates)
+}
+
 /// Discover protected resource metadata from an MCP server.
 pub async fn discover_protected_resource(
     server_url: &str,
@@ -215,26 +290,34 @@ pub async fn discover_protected_resource(
         .build()
         .map_err(|e| AuthError::Http(e.to_string()))?;
 
-    // The .well-known endpoints are always at the root of the origin, not under any path.
-    let origin = extract_origin(server_url)?;
+    let candidates = well_known_metadata_candidates(server_url, "oauth-protected-resource")?;
+    let mut attempted_statuses = Vec::new();
 
-    // Try the well-known endpoint at the origin root
-    let well_known_url = format!("{}/.well-known/oauth-protected-resource", origin);
+    for url in candidates {
+        let response = match client.get(&url).send().await {
+            Ok(response) => response,
+            Err(e) => {
+                attempted_statuses.push(format!("{} -> request error: {}", url, e));
+                continue;
+            }
+        };
 
-    let response = client
-        .get(&well_known_url)
-        .send()
-        .await
-        .map_err(|e| AuthError::DiscoveryFailed(e.to_string()))?;
+        if response.status().is_success() {
+            match response.json().await {
+                Ok(metadata) => return Ok(metadata),
+                Err(e) => {
+                    attempted_statuses.push(format!("{} -> invalid metadata: {}", url, e));
+                    continue;
+                }
+            }
+        }
 
-    if !response.status().is_success() {
-        return Err(AuthError::NotSupported);
+        attempted_statuses.push(format!("{} -> HTTP {}", url, response.status()));
     }
 
-    response
-        .json()
-        .await
-        .map_err(|e| AuthError::DiscoveryFailed(format!("Invalid metadata: {}", e)))
+    // Signal "no protected-resource metadata" so callers can try direct auth-server metadata.
+    let _ = attempted_statuses;
+    Err(AuthError::NotSupported)
 }
 
 /// Discover authorization server metadata.
@@ -246,26 +329,35 @@ pub async fn discover_authorization_server(
         .build()
         .map_err(|e| AuthError::Http(e.to_string()))?;
 
-    let base_url = auth_server_url.trim_end_matches('/');
-    let well_known_url = format!("{}/.well-known/oauth-authorization-server", base_url);
+    let candidates = well_known_metadata_candidates(auth_server_url, "oauth-authorization-server")?;
+    let mut attempted = Vec::new();
 
-    let response = client
-        .get(&well_known_url)
-        .send()
-        .await
-        .map_err(|e| AuthError::DiscoveryFailed(e.to_string()))?;
+    for url in candidates {
+        let response = match client.get(&url).send().await {
+            Ok(response) => response,
+            Err(e) => {
+                attempted.push(format!("{} -> request error: {}", url, e));
+                continue;
+            }
+        };
 
-    if !response.status().is_success() {
-        return Err(AuthError::DiscoveryFailed(format!(
-            "HTTP {}",
-            response.status()
-        )));
+        if response.status().is_success() {
+            match response.json().await {
+                Ok(metadata) => return Ok(metadata),
+                Err(e) => {
+                    attempted.push(format!("{} -> invalid metadata: {}", url, e));
+                    continue;
+                }
+            }
+        }
+
+        attempted.push(format!("{} -> HTTP {}", url, response.status()));
     }
 
-    response
-        .json()
-        .await
-        .map_err(|e| AuthError::DiscoveryFailed(format!("Invalid metadata: {}", e)))
+    Err(AuthError::DiscoveryFailed(format!(
+        "No authorization server metadata found (tried: {})",
+        attempted.join(", ")
+    )))
 }
 
 /// Discover OAuth endpoints for an MCP server.
@@ -865,5 +957,45 @@ mod tests {
             extract_origin("https://example.com:8443/nested/path").unwrap(),
             "https://example.com:8443"
         );
+    }
+
+    #[test]
+    fn test_well_known_candidates_for_path_based_resource_use_standard_path_placement_first() {
+        let urls = well_known_metadata_candidates(
+            "https://api.githubcopilot.com/mcp/",
+            "oauth-protected-resource",
+        )
+        .unwrap();
+
+        assert_eq!(
+            urls.first().unwrap(),
+            "https://api.githubcopilot.com/.well-known/oauth-protected-resource/mcp"
+        );
+        assert!(urls.contains(
+            &"https://api.githubcopilot.com/.well-known/oauth-protected-resource".to_string()
+        ));
+        assert!(urls.contains(
+            &"https://api.githubcopilot.com/mcp/.well-known/oauth-protected-resource".to_string()
+        ));
+    }
+
+    #[test]
+    fn test_well_known_candidates_for_path_based_issuer_use_rfc8414_path_form() {
+        let urls = well_known_metadata_candidates(
+            "https://github.com/login/oauth",
+            "oauth-authorization-server",
+        )
+        .unwrap();
+
+        assert_eq!(
+            urls.first().unwrap(),
+            "https://github.com/.well-known/oauth-authorization-server/login/oauth"
+        );
+        assert!(
+            urls.contains(&"https://github.com/.well-known/oauth-authorization-server".to_string())
+        );
+        assert!(urls.contains(
+            &"https://github.com/login/oauth/.well-known/oauth-authorization-server".to_string()
+        ));
     }
 }

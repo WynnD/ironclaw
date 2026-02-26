@@ -64,14 +64,24 @@ pub struct CapabilitiesFile {
 }
 
 impl CapabilitiesFile {
+    fn is_effectively_empty(&self) -> bool {
+        self.workspace.is_none()
+            && self.http.is_none()
+            && self.tool_invoke.is_none()
+            && self.secrets.is_none()
+            && self.auth.is_none()
+    }
+
     /// Parse from JSON string.
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
+        let parsed: Self = serde_json::from_str(json)?;
+        Self::maybe_unwrap_legacy_capabilities(parsed, json.as_bytes())
     }
 
     /// Parse from JSON bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
+        let parsed: Self = serde_json::from_slice(bytes)?;
+        Self::maybe_unwrap_legacy_capabilities(parsed, bytes)
     }
 
     /// Convert to runtime Capabilities.
@@ -107,6 +117,29 @@ impl CapabilitiesFile {
         }
 
         caps
+    }
+
+    fn maybe_unwrap_legacy_capabilities(
+        parsed: Self,
+        raw_json: &[u8],
+    ) -> Result<Self, serde_json::Error> {
+        // Be forgiving with older capability files that wrapped the schema under
+        // {"capabilities": {...}}. Serde treats that as "all fields absent" due
+        // to our optional fields, so detect the effectively-empty parse and retry.
+        if !parsed.is_effectively_empty() {
+            return Ok(parsed);
+        }
+
+        let value: serde_json::Value = match serde_json::from_slice(raw_json) {
+            Ok(v) => v,
+            Err(_) => return Ok(parsed),
+        };
+
+        let Some(inner) = value.get("capabilities") else {
+            return Ok(parsed);
+        };
+
+        serde_json::from_value(inner.clone()).or(Ok(parsed))
     }
 }
 
@@ -753,5 +786,38 @@ mod tests {
         assert_eq!(auth.secret_name, "my_api_key");
         assert!(auth.display_name.is_none());
         assert!(auth.setup_url.is_none());
+    }
+
+    #[test]
+    fn test_parse_legacy_wrapped_capabilities() {
+        let json = r#"{
+            "capabilities": {
+                "http": {
+                    "allowlist": [
+                        { "host": "api.github.com", "path_prefix": "/" }
+                    ],
+                    "credentials": {
+                        "github": {
+                            "secret_name": "github_token",
+                            "location": { "type": "bearer" }
+                        }
+                    }
+                },
+                "secrets": {
+                    "allowed_names": ["github_token"]
+                }
+            }
+        }"#;
+
+        let caps = CapabilitiesFile::from_json(json).unwrap();
+        let http = caps.http.expect("http capability should be unwrapped");
+        assert_eq!(http.allowlist.len(), 1);
+        assert!(http.credentials.contains_key("github"));
+        assert_eq!(
+            caps.secrets
+                .expect("secrets capability should be unwrapped")
+                .allowed_names,
+            vec!["github_token"]
+        );
     }
 }

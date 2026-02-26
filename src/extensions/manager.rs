@@ -1600,11 +1600,23 @@ impl ExtensionManager {
             tool_names.len()
         );
 
+        let message = if tool_names.is_empty() {
+            format!("Connected to '{}' but the server reported 0 tools", name)
+        } else if tool_names.len() == 1 {
+            format!("Connected to '{}' and loaded 1 tool", name)
+        } else {
+            format!(
+                "Connected to '{}' and loaded {} tools",
+                name,
+                tool_names.len()
+            )
+        };
+
         Ok(ActivateResult {
             name: name.to_string(),
             kind: ExtensionKind::McpServer,
             tools_loaded: tool_names,
-            message: format!("Connected to '{}' and loaded tools", name),
+            message,
         })
     }
 

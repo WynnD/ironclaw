@@ -290,22 +290,25 @@ impl near::agent::host::Host for StoreData {
             .collect();
 
         let mut url = injected_url;
-
-        // Inject pre-resolved host credentials (Bearer tokens, API keys, etc.)
-        // based on the request's target host.
-        if let Some(host) = extract_host_from_url(&url) {
-            self.inject_host_credentials(&host, &mut headers, &mut url);
-        }
-
         let leak_detector = LeakDetector::new();
         let header_vec: Vec<(String, String)> = headers
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
+        // Scan only tool-supplied request data (plus explicit placeholder injection).
+        // Host-injected credentials are added after this check so legitimate auth
+        // headers/query params from the credential registry do not trigger false
+        // positives (e.g. GitHub fine-grained PATs matching leak patterns).
         leak_detector
             .scan_http_request(&url, &header_vec, body.as_deref())
             .map_err(|e| format!("Potential secret leak blocked: {}", e))?;
+
+        // Inject pre-resolved host credentials (Bearer tokens, API keys, etc.)
+        // based on the request's target host.
+        if let Some(host) = extract_host_from_url(&url) {
+            self.inject_host_credentials(&host, &mut headers, &mut url);
+        }
 
         // Get the max response size from capabilities (default 10MB).
         let max_response_bytes = self

@@ -479,9 +479,10 @@ impl Agent {
                     // via a local to use in the message loop below.
 
                     tracing::info!(
-                        "Routines enabled: cron ticker every {}s, max {} concurrent",
+                        "Routines enabled: cron ticker every {}s, max {} concurrent, cron timezone {}",
                         rt_config.cron_check_interval_secs,
-                        rt_config.max_concurrent_routines
+                        rt_config.max_concurrent_routines,
+                        rt_config.cron_timezone
                     );
 
                     Some((cron_handle, engine_ref))
