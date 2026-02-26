@@ -1090,9 +1090,16 @@ function createNewThread() {
 
 function toggleThreadSidebar() {
   const sidebar = document.getElementById('thread-sidebar');
-  sidebar.classList.toggle('collapsed');
-  const btn = document.getElementById('thread-toggle-btn');
-  btn.innerHTML = sidebar.classList.contains('collapsed') ? '&raquo;' : '&laquo;';
+  const isMobile = window.matchMedia('(max-width: 768px)').matches;
+  if (isMobile) {
+    sidebar.classList.toggle('expanded-mobile');
+    const btn = document.getElementById('thread-toggle-btn');
+    btn.innerHTML = sidebar.classList.contains('expanded-mobile') ? '&laquo;' : '&raquo;';
+  } else {
+    sidebar.classList.toggle('collapsed');
+    const btn = document.getElementById('thread-toggle-btn');
+    btn.innerHTML = sidebar.classList.contains('collapsed') ? '&raquo;' : '&laquo;';
+  }
 }
 
 // Chat input auto-resize and keyboard handling

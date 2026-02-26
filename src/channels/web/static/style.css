@@ -23,6 +23,12 @@
   margin: 0;
   padding: 0;
   box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 body {
@@ -730,7 +736,7 @@ body {
 
 @media (max-width: 768px) {
   .activity-group {
-    max-width: 95%;
+    max-width: 100%;
   }
 }
 
@@ -2787,6 +2793,8 @@ mark {
 .thread-list {
   flex: 1;
   overflow-y: auto;
+  display: flex;
+  flex-direction: column;
 }
 
 .thread-item {
@@ -2798,6 +2806,7 @@ mark {
   font-size: 13px;
   color: var(--text-secondary);
   border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+  flex-shrink: 0;
 }
 
 .thread-item:hover {
@@ -3181,17 +3190,22 @@ mark {
 /* --- Mobile responsive --- */
 
 @media (max-width: 768px) {
-  /* Tab bar: use a compact selector instead of horizontal scrolling */
+  /* ====== Tab bar / top nav ====== */
   .tab-bar {
     overflow-x: visible;
     padding: 0 8px;
     gap: 8px;
     min-height: 48px;
+    position: sticky;
+    top: 0;
+    z-index: 60;
   }
 
   .tab-mobile-select {
     display: block;
     flex: 1;
+    min-height: 36px;
+    font-size: 14px;
   }
 
   .tab-bar button[data-tab],
@@ -3203,6 +3217,7 @@ mark {
   .tab-bar .status {
     margin-left: auto;
     min-width: auto;
+    flex-shrink: 0;
   }
 
   .tab-bar .status span {
@@ -3213,12 +3228,59 @@ mark {
     display: none !important;
   }
 
-  /* Chat messages: wider */
-  .message {
-    max-width: 95%;
+  /* ====== Auth screen ====== */
+  .auth-card-login {
+    padding: 24px 16px 20px;
+    margin: 0 12px;
+    max-width: 100%;
+    gap: 16px;
   }
 
-  /* Thread sidebar: hidden behind toggle */
+  .auth-brand h1 {
+    font-size: 24px;
+  }
+
+  /* ====== Chat tab ====== */
+  .message {
+    max-width: 100%;
+  }
+
+  .activity-group {
+    max-width: 100%;
+  }
+
+  .approval-card,
+  .auth-card {
+    max-width: 100%;
+  }
+
+  .chat-messages {
+    padding: 10px 8px;
+    gap: 8px;
+  }
+
+  .chat-input {
+    padding: 8px;
+    gap: 6px;
+  }
+
+  .chat-input textarea {
+    font-size: 16px; /* prevents iOS zoom on focus */
+    min-height: 44px;
+  }
+
+  .chat-input button {
+    padding: 10px 16px;
+    min-height: 44px;
+    align-self: flex-end;
+  }
+
+  .chat-status {
+    padding: 4px 8px;
+    font-size: 11px;
+  }
+
+  /* Thread sidebar: collapsed by default, overlay when expanded */
   .thread-sidebar {
     width: 36px;
   }
@@ -3236,19 +3298,23 @@ mark {
     left: 0;
     top: 0;
     bottom: 0;
-    width: 200px;
+    width: 240px;
     z-index: 50;
+    box-shadow: 4px 0 16px rgba(0, 0, 0, 0.4);
   }
 
   .thread-sidebar.expanded-mobile .thread-sidebar-header span,
   .thread-sidebar.expanded-mobile .thread-new-btn,
-  .thread-sidebar.expanded-mobile .thread-list,
   .thread-sidebar.expanded-mobile .assistant-item,
   .thread-sidebar.expanded-mobile .threads-section-header {
     display: flex;
   }
 
-  /* Memory: vertical stack */
+  .thread-sidebar.expanded-mobile .thread-list {
+    display: flex;
+  }
+
+  /* ====== Memory tab ====== */
   .memory-container {
     flex-direction: column;
   }
@@ -3260,34 +3326,175 @@ mark {
     border-bottom: 1px solid var(--border);
   }
 
+  .memory-viewer {
+    padding: 10px;
+    font-size: 13px;
+  }
+
+  .memory-breadcrumb {
+    padding: 6px 10px;
+    font-size: 12px;
+  }
+
+  /* ====== Jobs tab ====== */
+  .jobs-container {
+    padding: 10px 8px;
+  }
+
+  .jobs-summary {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+
+  .summary-card {
+    padding: 10px;
+  }
+
+  .summary-card .count {
+    font-size: 22px;
+  }
+
+  /* Tables: horizontal scroll wrapper */
+  .jobs-table,
+  .routines-table,
+  .tools-table {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    white-space: nowrap;
+  }
+
+  .jobs-table th,
+  .jobs-table td,
+  .routines-table th,
+  .routines-table td,
+  .tools-table th,
+  .tools-table td {
+    padding: 8px;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+
   /* Job detail sub-tabs: wrap */
   .job-detail-tabs {
     flex-wrap: wrap;
   }
 
+  .job-detail-tabs button {
+    padding: 8px 12px;
+    font-size: 12px;
+  }
+
   .job-detail-header {
     flex-wrap: wrap;
+    gap: 8px;
   }
 
   .job-detail-header h2 {
     min-width: 100%;
     order: -1;
+    font-size: 16px;
+  }
+
+  .job-meta-grid {
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
   }
 
   /* Job files: vertical */
   .job-files {
     flex-direction: column;
     height: auto;
+    max-height: 60vh;
   }
 
   .job-files-sidebar {
     width: 100%;
-    max-height: 180px;
+    max-height: 150px;
     border-right: none;
     border-bottom: 1px solid var(--border);
   }
 
-  /* Extension install form */
+  /* ====== Routines tab ====== */
+  .routines-container {
+    padding: 10px 8px;
+  }
+
+  .routines-summary {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+
+  /* ====== Logs tab ====== */
+  .logs-toolbar {
+    flex-wrap: wrap;
+    padding: 8px;
+    gap: 6px;
+  }
+
+  .logs-toolbar select {
+    min-width: 0;
+    flex: 1 1 calc(50% - 4px);
+    font-size: 12px;
+  }
+
+  .logs-toolbar input {
+    max-width: 100%;
+    flex: 1 1 100%;
+    order: 5;
+  }
+
+  .logs-toolbar button {
+    padding: 6px 10px;
+    min-height: 36px;
+  }
+
+  .logs-checkbox {
+    font-size: 11px;
+  }
+
+  .log-entry {
+    font-size: 11px;
+    padding: 2px 8px;
+    white-space: nowrap;
+    overflow-x: auto;
+  }
+
+  .log-ts {
+    width: 55px;
+    font-size: 10px;
+  }
+
+  .log-level {
+    width: 36px;
+    font-size: 10px;
+  }
+
+  .log-target {
+    max-width: 80px;
+    font-size: 10px;
+  }
+
+  /* ====== Extensions tab ====== */
+  .extensions-container {
+    padding: 10px 8px;
+  }
+
+  .extensions-section {
+    margin-bottom: 16px;
+  }
+
+  .extensions-list {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .ext-card {
+    padding: 10px;
+  }
+
   .ext-install-form {
     flex-direction: column;
     align-items: stretch;
@@ -3295,5 +3502,158 @@ mark {
 
   .ext-install-form input {
     width: 100%;
+    min-height: 40px;
+    font-size: 14px;
+  }
+
+  .ext-install-form button {
+    min-height: 40px;
+    font-size: 14px;
+  }
+
+  .ext-actions {
+    flex-wrap: wrap;
+  }
+
+  .btn-ext {
+    padding: 6px 12px;
+    min-height: 36px;
+  }
+
+  /* ====== Skills tab ====== */
+  .skill-search-box {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .skill-search-box input {
+    min-height: 40px;
+    font-size: 14px;
+  }
+
+  .skill-search-box button {
+    min-height: 40px;
+    font-size: 14px;
+  }
+
+  /* ====== Popovers ====== */
+  .tee-popover {
+    min-width: 0;
+    max-width: calc(100vw - 24px);
+    right: -8px;
+  }
+
+  .gateway-popover {
+    min-width: 0;
+    max-width: calc(100vw - 24px);
+    right: -8px;
+  }
+
+  .configure-modal {
+    width: calc(100vw - 24px);
+    max-height: 90vh;
+    padding: 16px;
+  }
+
+  /* ====== Toasts ====== */
+  #toasts {
+    left: 12px;
+    right: 12px;
+    top: auto;
+    bottom: 12px;
+  }
+
+  .toast {
+    max-width: 100%;
+  }
+
+  /* ====== Empty states ====== */
+  .empty-state {
+    padding: 24px 12px;
+    font-size: 13px;
+  }
+
+  /* ====== Approval / auth cards in chat ====== */
+  .approval-card .approval-actions {
+    flex-wrap: wrap;
+  }
+
+  .approval-card .approval-actions button {
+    flex: 1;
+    min-width: 60px;
+    min-height: 40px;
+    font-size: 13px;
+  }
+
+  .auth-card .auth-token-input {
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .auth-card .auth-token-input input {
+    font-size: 14px;
+    min-height: 40px;
+  }
+
+  .auth-card .auth-actions {
+    flex-wrap: wrap;
+  }
+
+  .auth-card .auth-actions button {
+    flex: 1;
+    min-height: 40px;
+  }
+
+  /* ====== Job card in chat ====== */
+  .job-card {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 10px 12px;
+  }
+
+  .job-card-view,
+  .job-card-browse {
+    min-height: 36px;
+    display: flex;
+    align-items: center;
+  }
+}
+
+/* Extra-small screens (phones < 400px) */
+@media (max-width: 400px) {
+  .tab-bar {
+    padding: 0 4px;
+    gap: 4px;
+  }
+
+  .tab-mobile-select {
+    font-size: 13px;
+    padding: 6px 8px;
+  }
+
+  .chat-messages {
+    padding: 8px 4px;
+  }
+
+  .message {
+    padding: 8px 10px;
+    font-size: 13px;
+  }
+
+  .jobs-summary,
+  .routines-summary {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .job-meta-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .extensions-section h3 {
+    font-size: 14px;
+  }
+
+  .log-target {
+    display: none;
   }
 }
