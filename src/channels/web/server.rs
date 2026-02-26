@@ -37,6 +37,7 @@ use crate::channels::web::types::*;
 use crate::db::Database;
 use crate::extensions::ExtensionManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
+use crate::secrets::{CreateSecretParams, SecretsStore};
 use crate::tools::ToolRegistry;
 use crate::workspace::Workspace;
 
@@ -135,6 +136,8 @@ pub struct GatewayState {
     pub tool_registry: Option<Arc<ToolRegistry>>,
     /// Database store for sandbox job persistence.
     pub store: Option<Arc<dyn Database>>,
+    /// Encrypted secrets store for secure API token persistence.
+    pub secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
     /// Container job manager for sandbox operations.
     pub job_manager: Option<Arc<ContainerJobManager>>,
     /// Prompt queue for Claude Code follow-up prompts.
@@ -287,6 +290,18 @@ pub async fn start_server(
             "/api/settings/{key}",
             axum::routing::delete(settings_delete_handler),
         )
+        // LLM settings
+        .route("/api/llm/settings", get(llm_settings_get_handler))
+        .route(
+            "/api/llm/settings",
+            axum::routing::put(llm_settings_set_handler),
+        )
+        .route("/api/llm/models", get(llm_models_handler))
+        .route("/api/llm/token", axum::routing::put(llm_token_set_handler))
+        .route(
+            "/api/llm/token/{provider}",
+            axum::routing::delete(llm_token_delete_handler),
+        )
         // Gateway control plane
         .route("/api/gateway/status", get(gateway_status_handler))
         // OpenAI-compatible API
@@ -309,6 +324,7 @@ pub async fn start_server(
         .route("/routines", get(index_handler))
         .route("/extensions", get(index_handler))
         .route("/skills", get(index_handler))
+        .route("/settings", get(index_handler))
         .route("/logs", get(index_handler))
         .route("/style.css", get(css_handler))
         .route("/app.js", get(js_handler))
@@ -2573,6 +2589,890 @@ fn routine_to_info(r: &crate::agent::routine::Routine) -> RoutineInfo {
         consecutive_failures: r.consecutive_failures,
         status: status.to_string(),
     }
+}
+
+// --- LLM settings helpers/handlers ---
+
+const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+#[derive(Debug, Deserialize)]
+struct LlmModelsQueryParams {
+    provider: Option<String>,
+    base_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterModelsEnvelope {
+    #[serde(default)]
+    data: Vec<OpenRouterModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterModelEntry {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+fn normalize_provider_alias(provider: &str) -> Option<&'static str> {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "nearai" | "near" | "near_ai" => Some("nearai"),
+        "openai" => Some("openai"),
+        "anthropic" => Some("anthropic"),
+        "ollama" => Some("ollama"),
+        "openai_compatible" | "openai-compatible" | "compatible" => Some("openai_compatible"),
+        "openrouter" => Some("openrouter"),
+        "tinfoil" => Some("tinfoil"),
+        _ => None,
+    }
+}
+
+fn is_openrouter_base_url(base_url: &str) -> bool {
+    let lower = base_url.trim().to_ascii_lowercase();
+    lower.contains("openrouter.ai")
+}
+
+fn parse_accept_language_from_env_extra_headers() -> Option<String> {
+    let raw = crate::config::helpers::optional_env("LLM_EXTRA_HEADERS")
+        .ok()
+        .flatten()?;
+    for part in raw.split(',') {
+        let (key, value) = part.split_once(':')?;
+        if key.trim().eq_ignore_ascii_case("Accept-Language") {
+            let v = value.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn provider_alias_for_backend(backend: &str, compat_base_url: Option<&str>) -> String {
+    if backend == "openai_compatible" && compat_base_url.is_some_and(is_openrouter_base_url) {
+        "openrouter".to_string()
+    } else {
+        backend.to_string()
+    }
+}
+
+fn default_model_for_backend(backend: crate::config::LlmBackend) -> &'static str {
+    match backend {
+        crate::config::LlmBackend::NearAi => "zai-org/GLM-latest",
+        crate::config::LlmBackend::OpenAi => "gpt-4o",
+        crate::config::LlmBackend::Anthropic => "claude-sonnet-4-20250514",
+        crate::config::LlmBackend::Ollama => "llama3",
+        crate::config::LlmBackend::OpenAiCompatible => "default",
+        crate::config::LlmBackend::Tinfoil => "kimi-k2-5",
+    }
+}
+
+fn model_env_var_for_backend(backend: crate::config::LlmBackend) -> &'static str {
+    match backend {
+        crate::config::LlmBackend::NearAi => "NEARAI_MODEL",
+        crate::config::LlmBackend::OpenAi => "OPENAI_MODEL",
+        crate::config::LlmBackend::Anthropic => "ANTHROPIC_MODEL",
+        crate::config::LlmBackend::Ollama => "OLLAMA_MODEL",
+        crate::config::LlmBackend::OpenAiCompatible => "LLM_MODEL",
+        crate::config::LlmBackend::Tinfoil => "TINFOIL_MODEL",
+    }
+}
+
+fn api_token_secret_name_for_provider(provider: &str) -> Option<&'static str> {
+    match normalize_provider_alias(provider)? {
+        "nearai" => Some("llm_nearai_api_key"),
+        "openai" => Some("llm_openai_api_key"),
+        "anthropic" => Some("llm_anthropic_api_key"),
+        "openai_compatible" | "openrouter" => Some("llm_compatible_api_key"),
+        "tinfoil" => Some("llm_tinfoil_api_key"),
+        "ollama" => None,
+        _ => None,
+    }
+}
+
+fn api_token_env_var_for_provider(provider: &str) -> Option<&'static str> {
+    match normalize_provider_alias(provider)? {
+        "nearai" => Some("NEARAI_API_KEY"),
+        "openai" => Some("OPENAI_API_KEY"),
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "openai_compatible" | "openrouter" => Some("LLM_API_KEY"),
+        "tinfoil" => Some("TINFOIL_API_KEY"),
+        "ollama" => None,
+        _ => None,
+    }
+}
+
+fn api_token_provider_hint(provider: &str) -> Option<&'static str> {
+    match normalize_provider_alias(provider)? {
+        "openrouter" => Some("openrouter"),
+        "openai_compatible" => Some("openai_compatible"),
+        "nearai" => Some("nearai"),
+        "openai" => Some("openai"),
+        "anthropic" => Some("anthropic"),
+        "tinfoil" => Some("tinfoil"),
+        "ollama" => None,
+        _ => None,
+    }
+}
+
+fn parse_effective_backend(settings: &crate::settings::Settings) -> crate::config::LlmBackend {
+    if let Ok(Some(raw)) = crate::config::helpers::optional_env("LLM_BACKEND")
+        && let Ok(parsed) = raw.parse::<crate::config::LlmBackend>()
+    {
+        return parsed;
+    }
+
+    if let Some(ref raw) = settings.llm_backend
+        && let Ok(parsed) = raw.parse::<crate::config::LlmBackend>()
+    {
+        return parsed;
+    }
+
+    crate::config::LlmBackend::NearAi
+}
+
+fn effective_model_for_backend(
+    backend: crate::config::LlmBackend,
+    settings: &crate::settings::Settings,
+) -> String {
+    let env_key = model_env_var_for_backend(backend);
+    if let Ok(Some(model)) = crate::config::helpers::optional_env(env_key) {
+        return model;
+    }
+
+    settings
+        .selected_model
+        .clone()
+        .unwrap_or_else(|| default_model_for_backend(backend).to_string())
+}
+
+fn effective_base_url_for_backend(
+    backend: crate::config::LlmBackend,
+    settings: &crate::settings::Settings,
+) -> (Option<String>, bool) {
+    match backend {
+        crate::config::LlmBackend::Ollama => {
+            let env_override = std::env::var_os("OLLAMA_BASE_URL").is_some();
+            let value = if let Ok(Some(v)) = crate::config::helpers::optional_env("OLLAMA_BASE_URL")
+            {
+                Some(v)
+            } else {
+                settings
+                    .ollama_base_url
+                    .clone()
+                    .or_else(|| Some("http://localhost:11434".to_string()))
+            };
+            (value, env_override)
+        }
+        crate::config::LlmBackend::OpenAiCompatible => {
+            let env_override = std::env::var_os("LLM_BASE_URL").is_some();
+            let value = if let Ok(Some(v)) = crate::config::helpers::optional_env("LLM_BASE_URL") {
+                Some(v)
+            } else {
+                settings.openai_compatible_base_url.clone()
+            };
+            (value, env_override)
+        }
+        _ => (None, false),
+    }
+}
+
+fn persisted_summary_from_settings(settings: &crate::settings::Settings) -> LlmSettingsSummary {
+    let backend = settings
+        .llm_backend
+        .clone()
+        .unwrap_or_else(|| crate::config::LlmBackend::NearAi.to_string());
+    let backend_enum = backend
+        .parse::<crate::config::LlmBackend>()
+        .unwrap_or(crate::config::LlmBackend::NearAi);
+    let model = settings
+        .selected_model
+        .clone()
+        .unwrap_or_else(|| default_model_for_backend(backend_enum).to_string());
+    let provider =
+        provider_alias_for_backend(&backend, settings.openai_compatible_base_url.as_deref());
+
+    LlmSettingsSummary {
+        provider,
+        backend,
+        model,
+        accept_language: settings.openai_compatible_accept_language.clone(),
+        openai_compatible_base_url: settings.openai_compatible_base_url.clone(),
+        ollama_base_url: settings.ollama_base_url.clone(),
+    }
+}
+
+fn effective_summary_from_settings(
+    settings: &crate::settings::Settings,
+) -> (LlmSettingsSummary, LlmSettingsEnvOverrides) {
+    let backend_enum = parse_effective_backend(settings);
+    let backend = backend_enum.to_string();
+    let model = effective_model_for_backend(backend_enum, settings);
+    let (base_url, base_url_env_override) = effective_base_url_for_backend(backend_enum, settings);
+    let accept_language_env = parse_accept_language_from_env_extra_headers();
+
+    let provider = provider_alias_for_backend(&backend, base_url.as_deref());
+    let env_overrides = LlmSettingsEnvOverrides {
+        provider: std::env::var_os("LLM_BACKEND").is_some(),
+        model: std::env::var_os(model_env_var_for_backend(backend_enum)).is_some(),
+        base_url: base_url_env_override,
+        accept_language: accept_language_env.is_some(),
+    };
+
+    let mut summary = LlmSettingsSummary {
+        provider,
+        backend,
+        model,
+        accept_language: None,
+        openai_compatible_base_url: None,
+        ollama_base_url: None,
+    };
+
+    match backend_enum {
+        crate::config::LlmBackend::OpenAiCompatible => {
+            summary.openai_compatible_base_url = base_url;
+            summary.accept_language =
+                accept_language_env.or_else(|| settings.openai_compatible_accept_language.clone());
+        }
+        crate::config::LlmBackend::Ollama => {
+            summary.ollama_base_url = base_url;
+        }
+        _ => {}
+    }
+
+    (summary, env_overrides)
+}
+
+fn build_llm_settings_response(
+    settings: &crate::settings::Settings,
+    state: &GatewayState,
+    runtime_active_model: Option<String>,
+) -> LlmSettingsResponse {
+    let persisted = persisted_summary_from_settings(settings);
+    let (effective, env_overrides) = effective_summary_from_settings(settings);
+    let api_token_env_var = api_token_env_var_for_provider(&effective.provider);
+    let api_token_env_override = api_token_env_var.is_some_and(|k| std::env::var_os(k).is_some());
+    let secrets_store_available = state.secrets_store.is_some();
+    let api_token_supported = api_token_secret_name_for_provider(&effective.provider).is_some();
+    let api_token_configured = api_token_supported && (api_token_env_override || false);
+    LlmSettingsResponse {
+        persisted,
+        effective,
+        env_overrides,
+        api_token_supported,
+        api_token_configured,
+        api_token_env_override,
+        secrets_store_available,
+        restart_required_for_provider_change: true,
+        runtime_active_model,
+    }
+}
+
+async fn load_settings_struct(
+    state: &GatewayState,
+) -> Result<crate::settings::Settings, StatusCode> {
+    let store = state
+        .store
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let map = store.get_all_settings(&state.user_id).await.map_err(|e| {
+        tracing::error!("Failed to load settings for LLM view: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(crate::settings::Settings::from_db_map(&map))
+}
+
+async fn llm_api_token_exists_for_effective_provider(
+    state: &GatewayState,
+    provider: &str,
+) -> Result<bool, StatusCode> {
+    let Some(secret_name) = api_token_secret_name_for_provider(provider) else {
+        return Ok(false);
+    };
+
+    if api_token_env_var_for_provider(provider).is_some_and(|k| std::env::var_os(k).is_some()) {
+        return Ok(true);
+    }
+
+    let Some(secrets) = state.secrets_store.as_ref() else {
+        return Ok(false);
+    };
+
+    secrets
+        .exists(&state.user_id, secret_name)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                secret_name,
+                "Failed checking LLM API token secret presence: {}",
+                e
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn llm_settings_get_handler(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<LlmSettingsResponse>, StatusCode> {
+    let settings = load_settings_struct(&state).await?;
+    let runtime_active_model = state
+        .llm_provider
+        .as_ref()
+        .map(|llm| llm.active_model_name());
+    let mut resp = build_llm_settings_response(&settings, &state, runtime_active_model);
+    resp.api_token_configured =
+        llm_api_token_exists_for_effective_provider(&state, &resp.effective.provider).await?;
+    Ok(Json(resp))
+}
+
+async fn llm_settings_set_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(body): Json<LlmSettingsUpdateRequest>,
+) -> Result<Json<LlmSettingsUpdateResponse>, (StatusCode, String)> {
+    let provider = normalize_provider_alias(&body.provider).ok_or((
+        StatusCode::BAD_REQUEST,
+        format!("Unsupported provider '{}'", body.provider),
+    ))?;
+
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database unavailable".to_string(),
+    ))?;
+
+    let mut settings = load_settings_struct(&state)
+        .await
+        .map_err(|status| (status, "Failed to load settings".to_string()))?;
+
+    let mut before = build_llm_settings_response(
+        &settings,
+        &state,
+        state
+            .llm_provider
+            .as_ref()
+            .map(|llm| llm.active_model_name()),
+    );
+    before.api_token_configured =
+        llm_api_token_exists_for_effective_provider(&state, &before.effective.provider)
+            .await
+            .map_err(|status| (status, "Failed to read token status".to_string()))?;
+
+    let normalized_model = body
+        .model
+        .as_ref()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    let normalized_base_url = body
+        .base_url
+        .as_ref()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty());
+    let normalized_accept_language = body
+        .accept_language
+        .as_ref()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty());
+
+    let (backend_to_store, restart_reason_hint) = match provider {
+        "openrouter" => ("openai_compatible", Some("provider/base URL changed")),
+        "openai_compatible" => ("openai_compatible", Some("provider/base URL changed")),
+        "ollama" => ("ollama", Some("provider/base URL changed")),
+        "nearai" => ("nearai", Some("provider changed")),
+        "openai" => ("openai", Some("provider changed")),
+        "anthropic" => ("anthropic", Some("provider changed")),
+        "tinfoil" => ("tinfoil", Some("provider changed")),
+        _ => unreachable!(),
+    };
+
+    store
+        .set_setting(
+            &state.user_id,
+            "llm_backend",
+            &serde_json::json!(backend_to_store),
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to persist llm_backend: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to save provider".to_string(),
+            )
+        })?;
+    settings.llm_backend = Some(backend_to_store.to_string());
+
+    if let Some(model) = normalized_model.clone() {
+        store
+            .set_setting(&state.user_id, "selected_model", &serde_json::json!(model))
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to persist selected_model: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to save model".to_string(),
+                )
+            })?;
+        settings.selected_model = Some(model);
+    } else {
+        store
+            .delete_setting(&state.user_id, "selected_model")
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to delete selected_model: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to clear model".to_string(),
+                )
+            })?;
+        settings.selected_model = None;
+    }
+
+    match provider {
+        "openrouter" => {
+            let base_url = normalized_base_url.unwrap_or_else(|| OPENROUTER_BASE_URL.to_string());
+            store
+                .set_setting(
+                    &state.user_id,
+                    "openai_compatible_base_url",
+                    &serde_json::json!(base_url.clone()),
+                )
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to persist openai_compatible_base_url: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to save provider base URL".to_string(),
+                    )
+                })?;
+            settings.openai_compatible_base_url = Some(base_url);
+            if let Some(v) = normalized_accept_language.clone() {
+                store
+                    .set_setting(
+                        &state.user_id,
+                        "openai_compatible_accept_language",
+                        &serde_json::json!(v.clone()),
+                    )
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(
+                            "Failed to persist openai_compatible_accept_language: {}",
+                            e
+                        );
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to save Accept-Language".to_string(),
+                        )
+                    })?;
+                settings.openai_compatible_accept_language = Some(v);
+            } else {
+                store
+                    .delete_setting(&state.user_id, "openai_compatible_accept_language")
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(
+                            "Failed to clear openai_compatible_accept_language: {}",
+                            e
+                        );
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to clear Accept-Language".to_string(),
+                        )
+                    })?;
+                settings.openai_compatible_accept_language = None;
+            }
+        }
+        "openai_compatible" => {
+            let base_url = normalized_base_url
+                .or_else(|| settings.openai_compatible_base_url.clone())
+                .ok_or((
+                    StatusCode::BAD_REQUEST,
+                    "base_url is required for openai_compatible".to_string(),
+                ))?;
+            store
+                .set_setting(
+                    &state.user_id,
+                    "openai_compatible_base_url",
+                    &serde_json::json!(base_url.clone()),
+                )
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to persist openai_compatible_base_url: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to save provider base URL".to_string(),
+                    )
+                })?;
+            settings.openai_compatible_base_url = Some(base_url);
+            if let Some(v) = normalized_accept_language.clone() {
+                store
+                    .set_setting(
+                        &state.user_id,
+                        "openai_compatible_accept_language",
+                        &serde_json::json!(v.clone()),
+                    )
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(
+                            "Failed to persist openai_compatible_accept_language: {}",
+                            e
+                        );
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to save Accept-Language".to_string(),
+                        )
+                    })?;
+                settings.openai_compatible_accept_language = Some(v);
+            } else {
+                store
+                    .delete_setting(&state.user_id, "openai_compatible_accept_language")
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(
+                            "Failed to clear openai_compatible_accept_language: {}",
+                            e
+                        );
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to clear Accept-Language".to_string(),
+                        )
+                    })?;
+                settings.openai_compatible_accept_language = None;
+            }
+        }
+        "ollama" => {
+            if let Some(base_url) = normalized_base_url {
+                store
+                    .set_setting(
+                        &state.user_id,
+                        "ollama_base_url",
+                        &serde_json::json!(base_url.clone()),
+                    )
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("Failed to persist ollama_base_url: {}", e);
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to save provider base URL".to_string(),
+                        )
+                    })?;
+                settings.ollama_base_url = Some(base_url);
+            }
+        }
+        _ => {}
+    }
+
+    let mut after = build_llm_settings_response(
+        &settings,
+        &state,
+        state
+            .llm_provider
+            .as_ref()
+            .map(|llm| llm.active_model_name()),
+    );
+    after.api_token_configured =
+        llm_api_token_exists_for_effective_provider(&state, &after.effective.provider)
+            .await
+            .map_err(|status| (status, "Failed to read token status".to_string()))?;
+
+    let mut restart_required = false;
+    let mut runtime_update_applied = None;
+    let mut warning = None;
+
+    let provider_or_endpoint_changed = before.effective.provider != after.effective.provider
+        || before.effective.backend != after.effective.backend
+        || before.effective.openai_compatible_base_url
+            != after.effective.openai_compatible_base_url
+        || before.effective.ollama_base_url != after.effective.ollama_base_url
+        || before.effective.accept_language != after.effective.accept_language;
+    if provider_or_endpoint_changed {
+        restart_required = true;
+        let base = if after.env_overrides.provider
+            || after.env_overrides.base_url
+            || after.env_overrides.accept_language
+        {
+            "Saved, but env vars override provider/base URL/Accept-Language until they are removed and the process restarts."
+        } else {
+            "Saved. Provider/base URL/header changes apply after restarting IronClaw."
+        };
+        warning = Some(base.to_string());
+    } else if before.effective.model != after.effective.model {
+        if after.env_overrides.model {
+            warning = Some(format!(
+                "Saved, but {} is set in the environment and overrides the persisted model.",
+                model_env_var_for_backend(parse_effective_backend(&settings))
+            ));
+        } else if let Some(ref llm) = state.llm_provider {
+            match llm.set_model(&after.effective.model) {
+                Ok(()) => {
+                    runtime_update_applied = Some(true);
+                    after.runtime_active_model = Some(after.effective.model.clone());
+                }
+                Err(e) => {
+                    restart_required = true;
+                    runtime_update_applied = Some(false);
+                    warning = Some(format!(
+                        "Saved, but runtime model switch is not supported for the active provider: {}",
+                        e
+                    ));
+                }
+            }
+        } else {
+            runtime_update_applied = Some(false);
+            warning =
+                Some("Saved, but no runtime LLM provider is attached to the gateway.".to_string());
+        }
+    } else if restart_reason_hint.is_some() {
+        // No-op save; keep response deterministic and quiet.
+    }
+
+    Ok(Json(LlmSettingsUpdateResponse {
+        settings: after,
+        restart_required,
+        runtime_update_applied,
+        warning,
+    }))
+}
+
+async fn fetch_openrouter_models(
+    state: &GatewayState,
+    base_url: &str,
+    accept_language: Option<&str>,
+) -> Result<Vec<LlmModelOption>, (StatusCode, String)> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let mut req = client.get(&url);
+    if let Ok(Some(api_key)) = crate::config::helpers::optional_env("LLM_API_KEY")
+        && !api_key.trim().is_empty()
+    {
+        req = req.bearer_auth(api_key);
+    } else if let Some(secrets) = state.secrets_store.as_ref() {
+        match secrets
+            .get_decrypted(&state.user_id, "llm_compatible_api_key")
+            .await
+        {
+            Ok(secret) if !secret.is_empty() => {
+                req = req.bearer_auth(secret.expose().to_string());
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    if let Some(lang) = accept_language
+        && !lang.trim().is_empty()
+    {
+        req = req.header("Accept-Language", lang);
+    }
+
+    let resp = req.send().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to query OpenRouter models: {}", e),
+        )
+    })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("OpenRouter returned {}: {}", status, body),
+        ));
+    }
+
+    let payload: OpenRouterModelsEnvelope = resp.json().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to parse OpenRouter model list: {}", e),
+        )
+    })?;
+
+    let mut models: Vec<LlmModelOption> = payload
+        .data
+        .into_iter()
+        .map(|m| LlmModelOption {
+            id: m.id,
+            name: m.name,
+        })
+        .collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.dedup_by(|a, b| a.id == b.id);
+    Ok(models)
+}
+
+async fn llm_models_handler(
+    State(state): State<Arc<GatewayState>>,
+    Query(query): Query<LlmModelsQueryParams>,
+) -> Result<Json<LlmModelsResponse>, (StatusCode, String)> {
+    let settings = load_settings_struct(&state)
+        .await
+        .map_err(|status| (status, "Failed to load settings".to_string()))?;
+    let effective = build_llm_settings_response(
+        &settings,
+        &state,
+        state
+            .llm_provider
+            .as_ref()
+            .map(|llm| llm.active_model_name()),
+    )
+    .effective;
+
+    let requested_provider = query
+        .provider
+        .as_deref()
+        .and_then(normalize_provider_alias)
+        .unwrap_or_else(|| effective.provider.as_str());
+
+    if requested_provider == "openrouter" {
+        let base_url = query
+            .base_url
+            .as_ref()
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+            .or_else(|| effective.openai_compatible_base_url.clone())
+            .unwrap_or_else(|| OPENROUTER_BASE_URL.to_string());
+        let models =
+            fetch_openrouter_models(&state, &base_url, effective.accept_language.as_deref()).await?;
+        return Ok(Json(LlmModelsResponse {
+            provider: "openrouter".to_string(),
+            source: Some("openrouter".to_string()),
+            base_url: Some(base_url),
+            models,
+        }));
+    }
+
+    if requested_provider == effective.provider
+        && let Some(ref llm) = state.llm_provider
+    {
+        let mut models = llm
+            .list_models()
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to query provider models: {}", e),
+                )
+            })?
+            .into_iter()
+            .map(|id| LlmModelOption { id, name: None })
+            .collect::<Vec<_>>();
+
+        if models.is_empty() {
+            models.push(LlmModelOption {
+                id: llm.active_model_name(),
+                name: None,
+            });
+        }
+
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        models.dedup_by(|a, b| a.id == b.id);
+
+        return Ok(Json(LlmModelsResponse {
+            provider: requested_provider.to_string(),
+            source: Some("active_provider".to_string()),
+            base_url: effective
+                .openai_compatible_base_url
+                .or(effective.ollama_base_url),
+            models,
+        }));
+    }
+
+    Err((
+        StatusCode::BAD_REQUEST,
+        format!(
+            "Model discovery is currently supported for the active provider ('{}') and OpenRouter.",
+            effective.provider
+        ),
+    ))
+}
+
+async fn llm_token_set_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(body): Json<LlmTokenUpdateRequest>,
+) -> Result<Json<LlmTokenUpdateResponse>, (StatusCode, String)> {
+    let provider = normalize_provider_alias(&body.provider).ok_or((
+        StatusCode::BAD_REQUEST,
+        format!("Unsupported provider '{}'", body.provider),
+    ))?;
+    let secret_name = api_token_secret_name_for_provider(provider).ok_or((
+        StatusCode::BAD_REQUEST,
+        format!("Provider '{}' does not use an API token", provider),
+    ))?;
+    let provider_hint = api_token_provider_hint(provider);
+
+    let token = body.api_token.trim();
+    if token.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "api_token is required".to_string()));
+    }
+
+    let secrets = state.secrets_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Secrets store unavailable; configure a secrets backend first".to_string(),
+    ))?;
+
+    let mut params = CreateSecretParams::new(secret_name, token.to_string());
+    if let Some(hint) = provider_hint {
+        params = params.with_provider(hint.to_string());
+    }
+
+    secrets.create(&state.user_id, params).await.map_err(|e| {
+        tracing::error!(
+            "Failed to store LLM API token secret '{}': {}",
+            secret_name,
+            e
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to save API token".to_string(),
+        )
+    })?;
+
+    let env_override =
+        api_token_env_var_for_provider(provider).is_some_and(|k| std::env::var_os(k).is_some());
+    let warning = if env_override {
+        Some("Saved to encrypted secrets, but an environment variable currently overrides this token until restart or env removal.".to_string())
+    } else {
+        None
+    };
+
+    Ok(Json(LlmTokenUpdateResponse {
+        provider: provider.to_string(),
+        saved: true,
+        env_override,
+        warning,
+    }))
+}
+
+async fn llm_token_delete_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(provider_raw): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let provider = normalize_provider_alias(&provider_raw).ok_or((
+        StatusCode::BAD_REQUEST,
+        format!("Unsupported provider '{}'", provider_raw),
+    ))?;
+    let secret_name = api_token_secret_name_for_provider(provider).ok_or((
+        StatusCode::BAD_REQUEST,
+        format!("Provider '{}' does not use an API token", provider),
+    ))?;
+    let secrets = state.secrets_store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Secrets store unavailable; configure a secrets backend first".to_string(),
+    ))?;
+
+    secrets
+        .delete(&state.user_id, secret_name)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                "Failed to delete LLM API token secret '{}': {}",
+                secret_name,
+                e
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to delete API token".to_string(),
+            )
+        })?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // --- Settings handlers ---

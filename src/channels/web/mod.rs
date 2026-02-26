@@ -37,6 +37,7 @@ use crate::db::Database;
 use crate::error::ChannelError;
 use crate::extensions::ExtensionManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
+use crate::secrets::SecretsStore;
 use crate::skills::catalog::SkillCatalog;
 use crate::skills::registry::SkillRegistry;
 use crate::tools::ToolRegistry;
@@ -81,6 +82,7 @@ impl GatewayChannel {
             extension_manager: None,
             tool_registry: None,
             store: None,
+            secrets_store: None,
             job_manager: None,
             prompt_queue: None,
             user_id: config.user_id.clone(),
@@ -114,6 +116,7 @@ impl GatewayChannel {
             extension_manager: self.state.extension_manager.clone(),
             tool_registry: self.state.tool_registry.clone(),
             store: self.state.store.clone(),
+            secrets_store: self.state.secrets_store.clone(),
             job_manager: self.state.job_manager.clone(),
             prompt_queue: self.state.prompt_queue.clone(),
             user_id: self.state.user_id.clone(),
@@ -170,6 +173,12 @@ impl GatewayChannel {
     /// Inject the database store for sandbox job persistence.
     pub fn with_store(mut self, store: Arc<dyn Database>) -> Self {
         self.rebuild_state(|s| s.store = Some(store));
+        self
+    }
+
+    /// Inject the secrets store for secure LLM/API token configuration.
+    pub fn with_secrets_store(mut self, store: Arc<dyn SecretsStore + Send + Sync>) -> Self {
+        self.rebuild_state(|s| s.secrets_store = Some(store));
         self
     }
 

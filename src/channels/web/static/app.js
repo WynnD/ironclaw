@@ -14,8 +14,9 @@ let jobEvents = new Map(); // job_id -> Array of events
 let jobListRefreshTimer = null;
 const JOB_EVENTS_CAP = 500;
 const MEMORY_SEARCH_QUERY_MAX_LENGTH = 100;
-const WEB_TABS = ['chat', 'memory', 'jobs', 'routines', 'extensions', 'skills', 'logs'];
+const WEB_TABS = ['chat', 'memory', 'jobs', 'routines', 'extensions', 'skills', 'settings', 'logs'];
 const WEB_TABS_SET = new Set(WEB_TABS);
+let llmSettingsState = null;
 
 function normalizeTabName(tab) {
   if (!tab) return null;
@@ -164,6 +165,24 @@ function apiFetch(path, options) {
       });
     }
     return res.json();
+  });
+}
+
+function apiFetchNoContent(path, options) {
+  const opts = options || {};
+  opts.headers = opts.headers || {};
+  opts.headers['Authorization'] = 'Bearer ' + token;
+  if (opts.body && typeof opts.body === 'object') {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(opts.body);
+  }
+  return fetch(path, opts).then((res) => {
+    if (!res.ok) {
+      return res.text().then(function(body) {
+        throw new Error(body || (res.status + ' ' + res.statusText));
+      });
+    }
+    return null;
   });
 }
 
@@ -1163,6 +1182,7 @@ function switchTab(tab, options) {
   if (nextTab === 'logs') applyLogFilters();
   if (nextTab === 'extensions') loadExtensions();
   if (nextTab === 'skills') loadSkills();
+  if (nextTab === 'settings') loadLlmSettings();
 }
 
 window.addEventListener('popstate', () => {
@@ -3452,6 +3472,266 @@ document.getElementById('skill-search-input').addEventListener('keydown', functi
   if (e.key === 'Enter') searchClawHub();
 });
 
+// --- LLM Settings ---
+
+function llmSettingsElements() {
+  return {
+    provider: document.getElementById('llm-settings-provider'),
+    baseWrap: document.getElementById('llm-settings-base-url-wrap'),
+    baseUrl: document.getElementById('llm-settings-base-url'),
+    acceptLanguageWrap: document.getElementById('llm-settings-accept-language-wrap'),
+    acceptLanguage: document.getElementById('llm-settings-accept-language'),
+    model: document.getElementById('llm-settings-model'),
+    models: document.getElementById('llm-settings-models'),
+    note: document.getElementById('llm-settings-note'),
+    tokenInput: document.getElementById('llm-api-token'),
+    tokenStatus: document.getElementById('llm-token-status'),
+  };
+}
+
+function providerUsesBaseUrl(provider) {
+  return provider === 'openai_compatible' || provider === 'openrouter' || provider === 'ollama';
+}
+
+function providerUsesAcceptLanguage(provider) {
+  return provider === 'openai_compatible' || provider === 'openrouter';
+}
+
+function providerSupportsApiToken(provider) {
+  return ['nearai', 'openai', 'anthropic', 'openai_compatible', 'openrouter', 'tinfoil'].indexOf(provider) >= 0;
+}
+
+function setLlmBaseUrlVisibility(provider) {
+  var els = llmSettingsElements();
+  var show = providerUsesBaseUrl(provider);
+  els.baseWrap.style.display = show ? '' : 'none';
+  els.acceptLanguageWrap.style.display = providerUsesAcceptLanguage(provider) ? '' : 'none';
+  if (provider === 'openrouter' && !els.baseUrl.value.trim()) {
+    els.baseUrl.value = 'https://openrouter.ai/api/v1';
+  }
+}
+
+function onLlmProviderChange() {
+  var provider = llmSettingsElements().provider.value;
+  setLlmBaseUrlVisibility(provider);
+  renderLlmTokenStatus(llmSettingsState);
+}
+
+function selectLlmModelFromList(value) {
+  if (!value) return;
+  llmSettingsElements().model.value = value;
+}
+
+function renderLlmModelOptions(models) {
+  var select = llmSettingsElements().models;
+  select.innerHTML = '';
+  var placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = 'Select a discovered model...';
+  select.appendChild(placeholder);
+  (models || []).forEach(function(m) {
+    var opt = document.createElement('option');
+    opt.value = m.id;
+    opt.textContent = m.name ? (m.name + ' (' + m.id + ')') : m.id;
+    select.appendChild(opt);
+  });
+}
+
+function renderLlmSettingsNote(data) {
+  var noteEl = llmSettingsElements().note;
+  if (!data) {
+    noteEl.textContent = 'Unavailable';
+    return;
+  }
+  var parts = [];
+  parts.push('Effective provider/model: ' + data.effective.provider + ' / ' + data.effective.model);
+  if (data.runtime_active_model) {
+    parts.push('Runtime model: ' + data.runtime_active_model);
+  }
+  var env = [];
+  if (data.env_overrides.provider) env.push('provider');
+  if (data.env_overrides.model) env.push('model');
+  if (data.env_overrides.base_url) env.push('base URL');
+  if (data.env_overrides.accept_language) env.push('Accept-Language');
+  if (env.length) {
+    parts.push('Env override active for: ' + env.join(', '));
+  }
+  if (data.restart_required_for_provider_change) {
+    parts.push('Provider changes require restart.');
+  }
+  noteEl.textContent = parts.join(' | ');
+}
+
+function renderLlmTokenStatus(data) {
+  var els = llmSettingsElements();
+  var provider = els.provider.value;
+  var supports = providerSupportsApiToken(provider);
+  if (data && data.effective && data.effective.provider === provider) {
+    supports = !!data.api_token_supported;
+  }
+  els.tokenInput.disabled = !supports || !(data ? data.secrets_store_available : true);
+
+  if (!supports) {
+    els.tokenStatus.textContent = 'This provider does not use an API token.';
+    return;
+  }
+  if (data && !data.secrets_store_available) {
+    els.tokenStatus.textContent = 'Encrypted secrets store is unavailable. Configure a secrets backend to save API tokens securely.';
+    return;
+  }
+
+  var parts = [];
+  if (data && data.effective && data.effective.provider === provider) {
+    parts.push(data.api_token_configured ? 'Token configured' : 'No token saved');
+    if (data.api_token_env_override) {
+      parts.push('Environment variable override is active');
+    }
+  } else {
+    parts.push('Save a token for the selected provider');
+  }
+  els.tokenStatus.textContent = parts.join(' | ');
+}
+
+function applyLlmSettingsToForm(data) {
+  llmSettingsState = data;
+  var els = llmSettingsElements();
+  var provider = (data.effective && data.effective.provider) || (data.persisted && data.persisted.provider) || 'nearai';
+  els.provider.value = provider;
+  setLlmBaseUrlVisibility(provider);
+
+  var baseUrl = '';
+  if (provider === 'ollama') {
+    baseUrl = (data.persisted && data.persisted.ollama_base_url) || (data.effective && data.effective.ollama_base_url) || '';
+  } else if (provider === 'openai_compatible' || provider === 'openrouter') {
+    baseUrl = (data.persisted && data.persisted.openai_compatible_base_url) || (data.effective && data.effective.openai_compatible_base_url) || '';
+  }
+  els.baseUrl.value = baseUrl;
+  els.acceptLanguage.value = (data.persisted && data.persisted.accept_language) || '';
+
+  els.model.value = (data.persisted && data.persisted.model) || '';
+  renderLlmSettingsNote(data);
+  renderLlmTokenStatus(data);
+}
+
+function loadLlmSettings() {
+  apiFetch('/api/llm/settings').then(function(data) {
+    applyLlmSettingsToForm(data);
+    if (data.runtime_active_model && data.runtime_active_model !== data.effective.model) {
+      renderLlmModelOptions([]);
+    } else {
+      refreshLlmModels(true);
+    }
+  }).catch(function(err) {
+    var els = llmSettingsElements();
+    els.note.textContent = 'Failed to load settings: ' + err.message;
+    els.tokenStatus.textContent = 'Failed to load token status';
+  });
+}
+
+function currentLlmSettingsFormPayload() {
+  var els = llmSettingsElements();
+  var provider = els.provider.value;
+  var payload = {
+    provider: provider,
+    model: els.model.value.trim() || null,
+    base_url: null,
+    accept_language: null,
+  };
+  if (providerUsesBaseUrl(provider)) {
+    payload.base_url = els.baseUrl.value.trim() || null;
+  }
+  if (providerUsesAcceptLanguage(provider)) {
+    payload.accept_language = els.acceptLanguage.value.trim() || null;
+  }
+  return payload;
+}
+
+function refreshLlmModels(silent) {
+  var els = llmSettingsElements();
+  var provider = els.provider.value;
+  var params = new URLSearchParams();
+  params.set('provider', provider);
+  if (providerUsesBaseUrl(provider) && els.baseUrl.value.trim()) {
+    params.set('base_url', els.baseUrl.value.trim());
+  }
+  if (!silent) {
+    showToast('Refreshing models...', 'info');
+  }
+  apiFetch('/api/llm/models?' + params.toString()).then(function(data) {
+    renderLlmModelOptions(data.models || []);
+    if (!silent) showToast('Loaded ' + ((data.models || []).length) + ' models', 'success');
+  }).catch(function(err) {
+    renderLlmModelOptions([]);
+    if (!silent) showToast('Model refresh failed: ' + err.message, 'error');
+  });
+}
+
+function saveLlmSettings() {
+  var payload = currentLlmSettingsFormPayload();
+  apiFetch('/api/llm/settings', {
+    method: 'PUT',
+    body: payload,
+  }).then(function(res) {
+    if (res.warning) {
+      showToast(res.warning, res.restart_required ? 'error' : 'info');
+    } else {
+      showToast('LLM settings saved', 'success');
+    }
+    applyLlmSettingsToForm(res.settings);
+    if (!res.restart_required) {
+      refreshLlmModels(true);
+    } else {
+      renderLlmModelOptions([]);
+    }
+  }).catch(function(err) {
+    showToast('Failed to save LLM settings: ' + err.message, 'error');
+  });
+}
+
+function saveLlmApiToken() {
+  var els = llmSettingsElements();
+  var provider = els.provider.value;
+  var tokenVal = els.tokenInput.value;
+  if (!providerSupportsApiToken(provider)) {
+    showToast('Selected provider does not use an API token', 'error');
+    return;
+  }
+  if (!tokenVal.trim()) {
+    showToast('API token is required', 'error');
+    return;
+  }
+  apiFetch('/api/llm/token', {
+    method: 'PUT',
+    body: { provider: provider, api_token: tokenVal },
+  }).then(function(res) {
+    els.tokenInput.value = '';
+    if (res.warning) showToast(res.warning, 'info');
+    else showToast('API token saved securely', 'success');
+    loadLlmSettings();
+  }).catch(function(err) {
+    showToast('Failed to save token: ' + err.message, 'error');
+  });
+}
+
+function deleteLlmApiToken() {
+  var els = llmSettingsElements();
+  var provider = els.provider.value;
+  if (!providerSupportsApiToken(provider)) {
+    showToast('Selected provider does not use an API token', 'error');
+    return;
+  }
+  if (!confirm('Delete the saved API token for "' + provider + '"?')) return;
+  apiFetchNoContent('/api/llm/token/' + encodeURIComponent(provider), {
+    method: 'DELETE',
+  }).then(function() {
+    els.tokenInput.value = '';
+    showToast('Saved API token deleted', 'success');
+    loadLlmSettings();
+  }).catch(function(err) {
+    showToast('Failed to delete token: ' + err.message, 'error');
+  });
+}
+
 // --- Keyboard shortcuts ---
 
 document.addEventListener('keydown', (e) => {
@@ -3459,10 +3739,10 @@ document.addEventListener('keydown', (e) => {
   const tag = (e.target.tagName || '').toLowerCase();
   const inInput = tag === 'input' || tag === 'textarea';
 
-  // Mod+1-6: switch tabs
-  if (mod && e.key >= '1' && e.key <= '6') {
+  // Mod+1-7: switch tabs
+  if (mod && e.key >= '1' && e.key <= '7') {
     e.preventDefault();
-    const tabs = ['chat', 'memory', 'jobs', 'routines', 'extensions', 'skills'];
+    const tabs = ['chat', 'memory', 'jobs', 'routines', 'extensions', 'skills', 'settings'];
     const idx = parseInt(e.key) - 1;
     if (tabs[idx]) switchTab(tabs[idx]);
     return;

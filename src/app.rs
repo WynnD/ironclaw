@@ -106,6 +106,17 @@ impl AppBuilder {
         }
     }
 
+    /// Resolve the primary app user ID used for DB-backed config, secrets,
+    /// workspace, and extension/MCP auth during startup.
+    fn app_user_id(&self) -> &str {
+        self.config
+            .channels
+            .gateway
+            .as_ref()
+            .map(|g| g.user_id.as_str())
+            .unwrap_or("default")
+    }
+
     /// Phase 1: Initialize database backend.
     ///
     /// Creates the database connection, runs migrations, reloads config
@@ -182,13 +193,15 @@ impl AppBuilder {
             }
         };
 
+        let app_user_id = self.app_user_id().to_string();
+
         // Post-init: migrate disk config, reload config from DB, attach session, cleanup
-        if let Err(e) = crate::bootstrap::migrate_disk_to_db(db.as_ref(), "default").await {
+        if let Err(e) = crate::bootstrap::migrate_disk_to_db(db.as_ref(), &app_user_id).await {
             tracing::warn!("Disk-to-DB settings migration failed: {}", e);
         }
 
         let toml_path = self.toml_path.as_deref();
-        match Config::from_db_with_toml(db.as_ref(), "default", toml_path).await {
+        match Config::from_db_with_toml(db.as_ref(), &app_user_id, toml_path).await {
             Ok(db_config) => {
                 self.config = db_config;
                 tracing::info!("Configuration reloaded from database");
@@ -201,7 +214,17 @@ impl AppBuilder {
             }
         }
 
-        self.session.attach_store(db.clone(), "default").await;
+        if let Err(e) = crate::bootstrap::backfill_llm_settings_from_config(
+            db.as_ref(),
+            &app_user_id,
+            &self.config.llm,
+        )
+        .await
+        {
+            tracing::warn!("LLM settings backfill failed: {}", e);
+        }
+
+        self.session.attach_store(db.clone(), &app_user_id).await;
 
         // Fire-and-forget housekeeping — no need to block startup.
         let db_cleanup = db.clone();
@@ -221,6 +244,7 @@ impl AppBuilder {
     /// the store, injects any encrypted LLM API keys into the config overlay
     /// and re-resolves config.
     pub async fn init_secrets(&mut self) -> Result<(), anyhow::Error> {
+        let app_user_id = self.app_user_id().to_string();
         let master_key = match self.config.secrets.master_key() {
             Some(k) => k,
             None => {
@@ -269,12 +293,12 @@ impl AppBuilder {
 
         if let Some(ref secrets) = store {
             // Inject LLM API keys from encrypted storage
-            crate::config::inject_llm_keys_from_secrets(secrets.as_ref(), "default").await;
+            crate::config::inject_llm_keys_from_secrets(secrets.as_ref(), &app_user_id).await;
 
             // Re-resolve config with newly available keys
             if let Some(ref db) = self.db {
                 let toml_path = self.toml_path.as_deref();
-                match Config::from_db_with_toml(db.as_ref(), "default", toml_path).await {
+                match Config::from_db_with_toml(db.as_ref(), &app_user_id, toml_path).await {
                     Ok(refreshed) => {
                         self.config = refreshed;
                         tracing::debug!("LlmConfig re-resolved after secret injection");
@@ -354,7 +378,8 @@ impl AppBuilder {
 
         // Register memory tools if database is available
         let workspace = if let Some(ref db) = self.db {
-            let mut ws = Workspace::new_with_db("default", db.clone());
+            let app_user_id = self.app_user_id().to_string();
+            let mut ws = Workspace::new_with_db(&app_user_id, db.clone());
             if let Some(ref emb) = embeddings {
                 ws = ws.with_embeddings(emb.clone());
             }
@@ -401,6 +426,7 @@ impl AppBuilder {
         use crate::tools::wasm::{WasmToolLoader, load_dev_tools};
 
         let mcp_session_manager = Arc::new(McpSessionManager::new());
+        let app_user_id = self.app_user_id().to_string();
 
         // Create WASM tool runtime
         let wasm_tool_runtime: Option<Arc<WasmToolRuntime>> =
@@ -474,6 +500,7 @@ impl AppBuilder {
         };
 
         let mcp_servers_future = {
+            let app_user_id = app_user_id.clone();
             let secrets_store = self.secrets_store.clone();
             let db = self.db.clone();
             let tools = Arc::clone(tools);
@@ -481,7 +508,7 @@ impl AppBuilder {
             async move {
                 if let Some(ref secrets) = secrets_store {
                     let servers_result = if let Some(ref d) = db {
-                        load_mcp_servers_from_db(d.as_ref(), "default").await
+                        load_mcp_servers_from_db(d.as_ref(), &app_user_id).await
                     } else {
                         crate::tools::mcp::config::load_mcp_servers().await
                     };
@@ -497,6 +524,7 @@ impl AppBuilder {
 
                             let mut join_set = tokio::task::JoinSet::new();
                             for server in enabled {
+                                let app_user_id = app_user_id.clone();
                                 let mcp_sm = Arc::clone(&mcp_sm);
                                 let secrets = Arc::clone(secrets);
                                 let tools = Arc::clone(&tools);
@@ -504,11 +532,14 @@ impl AppBuilder {
                                 join_set.spawn(async move {
                                     let server_name = server.name.clone();
                                     let has_tokens =
-                                        is_authenticated(&server, &secrets, "default").await;
+                                        is_authenticated(&server, &secrets, &app_user_id).await;
 
                                     let client = if has_tokens || server.requires_auth() {
                                         McpClient::new_authenticated(
-                                            server, mcp_sm, secrets, "default",
+                                            server,
+                                            mcp_sm,
+                                            secrets,
+                                            &app_user_id,
                                         )
                                     } else {
                                         McpClient::new_with_name(&server_name, &server.url)
@@ -620,7 +651,7 @@ impl AppBuilder {
                 self.config.wasm.tools_dir.clone(),
                 self.config.channels.wasm_channels_dir.clone(),
                 self.config.tunnel.public_url.clone(),
-                "default".to_string(),
+                app_user_id,
                 self.db.clone(),
                 catalog_entries.clone(),
             ));

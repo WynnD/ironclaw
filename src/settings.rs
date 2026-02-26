@@ -53,6 +53,10 @@ pub struct Settings {
     #[serde(default)]
     pub openai_compatible_base_url: Option<String>,
 
+    /// Optional Accept-Language header for OpenAI-compatible requests.
+    #[serde(default)]
+    pub openai_compatible_accept_language: Option<String>,
+
     // === Step 4: Model Selection ===
     /// Currently selected model.
     #[serde(default)]

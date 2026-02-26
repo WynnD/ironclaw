@@ -493,6 +493,9 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref d) = components.db {
             gw = gw.with_store(Arc::clone(d));
         }
+        if let Some(ref secrets) = components.secrets_store {
+            gw = gw.with_secrets_store(Arc::clone(secrets));
+        }
         if let Some(ref jm) = container_job_manager {
             gw = gw.with_job_manager(Arc::clone(jm));
         }

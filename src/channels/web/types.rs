@@ -722,6 +722,96 @@ pub struct SettingsExportResponse {
     pub settings: std::collections::HashMap<String, serde_json::Value>,
 }
 
+// --- LLM Settings ---
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LlmSettingsSummary {
+    pub provider: String,
+    pub backend: String,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accept_language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openai_compatible_base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ollama_base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LlmSettingsEnvOverrides {
+    pub provider: bool,
+    pub model: bool,
+    pub base_url: bool,
+    pub accept_language: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LlmSettingsResponse {
+    pub persisted: LlmSettingsSummary,
+    pub effective: LlmSettingsSummary,
+    pub env_overrides: LlmSettingsEnvOverrides,
+    pub api_token_supported: bool,
+    pub api_token_configured: bool,
+    pub api_token_env_override: bool,
+    pub secrets_store_available: bool,
+    pub restart_required_for_provider_change: bool,
+    pub runtime_active_model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LlmSettingsUpdateRequest {
+    /// Provider alias shown in UI (e.g. nearai, openai, anthropic, ollama, openai_compatible, openrouter, tinfoil)
+    pub provider: String,
+    /// Selected chat model ID. `null` clears the persisted value.
+    pub model: Option<String>,
+    /// Provider-specific base URL (used for ollama/openai_compatible/openrouter).
+    pub base_url: Option<String>,
+    /// Optional Accept-Language header (used for openai_compatible/openrouter).
+    pub accept_language: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlmSettingsUpdateResponse {
+    pub settings: LlmSettingsResponse,
+    pub restart_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_update_applied: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LlmTokenUpdateRequest {
+    pub provider: String,
+    pub api_token: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlmTokenUpdateResponse {
+    pub provider: String,
+    pub saved: bool,
+    pub env_override: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlmModelOption {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlmModelsResponse {
+    pub provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    pub models: Vec<LlmModelOption>,
+}
+
 // --- Health ---
 
 #[derive(Debug, Serialize)]

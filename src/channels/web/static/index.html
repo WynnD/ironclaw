@@ -44,6 +44,7 @@
         <option value="routines">Routines</option>
         <option value="extensions">Extensions</option>
         <option value="skills">Skills</option>
+        <option value="settings">Settings</option>
         <option value="logs">Logs</option>
       </select>
       <button class="active" data-tab="chat">Chat</button>
@@ -52,6 +53,7 @@
       <button data-tab="routines">Routines</button>
       <button data-tab="extensions">Extensions</button>
       <button data-tab="skills">Skills</button>
+      <button data-tab="settings">Settings</button>
       <div class="spacer"></div>
       <button class="status-logs-btn" data-tab="logs" title="Logs">Logs</button>
       <div class="tee-shield" id="tee-shield" style="display:none" title="Running in a Trusted Execution Environment">
@@ -283,6 +285,72 @@
             <input type="text" id="skill-install-name" placeholder="Skill name or slug">
             <input type="text" id="skill-install-url" placeholder="HTTPS URL to SKILL.md (optional)">
             <button onclick="installSkillFromForm()">Install</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings Tab -->
+    <div class="tab-panel" id="tab-settings">
+      <div class="extensions-container">
+        <div class="extensions-section">
+          <h3>LLM Provider</h3>
+          <div class="settings-grid">
+            <label class="settings-field">
+              <span>Provider</span>
+              <select id="llm-settings-provider" onchange="onLlmProviderChange()">
+                <option value="nearai">NEAR AI</option>
+                <option value="openai">OpenAI</option>
+                <option value="anthropic">Anthropic</option>
+                <option value="ollama">Ollama</option>
+                <option value="openrouter">OpenRouter</option>
+                <option value="openai_compatible">OpenAI-Compatible</option>
+                <option value="tinfoil">Tinfoil</option>
+              </select>
+            </label>
+            <label class="settings-field" id="llm-settings-base-url-wrap" style="display:none">
+              <span>Base URL</span>
+              <input type="text" id="llm-settings-base-url" placeholder="https://...">
+            </label>
+            <label class="settings-field" id="llm-settings-accept-language-wrap" style="display:none">
+              <span>Accept-Language</span>
+              <input type="text" id="llm-settings-accept-language" placeholder="en-US,en">
+            </label>
+            <label class="settings-field">
+              <span>Model</span>
+              <div class="settings-inline">
+                <input type="text" id="llm-settings-model" placeholder="model id">
+                <button type="button" onclick="refreshLlmModels()">Refresh Models</button>
+              </div>
+              <select id="llm-settings-models" onchange="selectLlmModelFromList(this.value)">
+                <option value="">Select a discovered model...</option>
+              </select>
+            </label>
+          </div>
+          <div class="settings-note" id="llm-settings-note">Loading...</div>
+          <div class="settings-actions">
+            <button onclick="saveLlmSettings()">Save Provider/Model</button>
+          </div>
+        </div>
+
+        <div class="extensions-section">
+          <h3>API Token</h3>
+          <div class="settings-note" id="llm-token-status">Loading...</div>
+          <div class="settings-grid">
+            <label class="settings-field">
+              <span>Provider Token</span>
+              <input
+                type="password"
+                id="llm-api-token"
+                placeholder="Paste API token"
+                autocomplete="new-password"
+                spellcheck="false"
+              >
+            </label>
+          </div>
+          <div class="settings-actions">
+            <button onclick="saveLlmApiToken()">Save Token Securely</button>
+            <button class="btn-secondary" onclick="deleteLlmApiToken()">Delete Saved Token</button>
           </div>
         </div>
       </div>

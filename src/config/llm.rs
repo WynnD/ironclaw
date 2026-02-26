@@ -247,7 +247,9 @@ impl LlmConfig {
                     key: "OPENAI_API_KEY".to_string(),
                     hint: "Set OPENAI_API_KEY when LLM_BACKEND=openai".to_string(),
                 })?;
-            let model = optional_env("OPENAI_MODEL")?.unwrap_or_else(|| "gpt-4o".to_string());
+            let model = optional_env("OPENAI_MODEL")?
+                .or_else(|| settings.selected_model.clone())
+                .unwrap_or_else(|| "gpt-4o".to_string());
             let base_url = optional_env("OPENAI_BASE_URL")?;
             Some(OpenAiDirectConfig {
                 api_key,
@@ -266,6 +268,7 @@ impl LlmConfig {
                     hint: "Set ANTHROPIC_API_KEY when LLM_BACKEND=anthropic".to_string(),
                 })?;
             let model = optional_env("ANTHROPIC_MODEL")?
+                .or_else(|| settings.selected_model.clone())
                 .unwrap_or_else(|| "claude-sonnet-4-20250514".to_string());
             let base_url = optional_env("ANTHROPIC_BASE_URL")?;
             Some(AnthropicDirectConfig {
@@ -281,7 +284,9 @@ impl LlmConfig {
             let base_url = optional_env("OLLAMA_BASE_URL")?
                 .or_else(|| settings.ollama_base_url.clone())
                 .unwrap_or_else(|| "http://localhost:11434".to_string());
-            let model = optional_env("OLLAMA_MODEL")?.unwrap_or_else(|| "llama3".to_string());
+            let model = optional_env("OLLAMA_MODEL")?
+                .or_else(|| settings.selected_model.clone())
+                .unwrap_or_else(|| "llama3".to_string());
             Some(OllamaConfig { base_url, model })
         } else {
             None
@@ -298,10 +303,21 @@ impl LlmConfig {
             let model = optional_env("LLM_MODEL")?
                 .or_else(|| settings.selected_model.clone())
                 .unwrap_or_else(|| "default".to_string());
-            let extra_headers = optional_env("LLM_EXTRA_HEADERS")?
+            let mut extra_headers = optional_env("LLM_EXTRA_HEADERS")?
                 .map(|val| parse_extra_headers(&val))
                 .transpose()?
                 .unwrap_or_default();
+            if !extra_headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("Accept-Language"))
+                && let Some(lang) = settings
+                    .openai_compatible_accept_language
+                    .as_ref()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+            {
+                extra_headers.push(("Accept-Language".to_string(), lang.to_string()));
+            }
             Some(OpenAiCompatibleConfig {
                 base_url,
                 api_key,
@@ -319,7 +335,9 @@ impl LlmConfig {
                     key: "TINFOIL_API_KEY".to_string(),
                     hint: "Set TINFOIL_API_KEY when LLM_BACKEND=tinfoil".to_string(),
                 })?;
-            let model = optional_env("TINFOIL_MODEL")?.unwrap_or_else(|| "kimi-k2-5".to_string());
+            let model = optional_env("TINFOIL_MODEL")?
+                .or_else(|| settings.selected_model.clone())
+                .unwrap_or_else(|| "kimi-k2-5".to_string());
             Some(TinfoilConfig { api_key, model })
         } else {
             None
@@ -442,6 +460,85 @@ mod tests {
         unsafe {
             std::env::remove_var("LLM_MODEL");
         }
+    }
+
+    #[test]
+    fn openai_uses_selected_model_when_openai_model_env_unset() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::remove_var("LLM_BACKEND");
+            std::env::remove_var("OPENAI_MODEL");
+        }
+
+        let settings = Settings {
+            llm_backend: Some("openai".to_string()),
+            selected_model: Some("gpt-4.1-mini".to_string()),
+            ..Default::default()
+        };
+
+        // OPENAI_API_KEY is required for backend=openai.
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "test-key");
+        }
+
+        let cfg = LlmConfig::resolve(&settings).expect("resolve should succeed");
+        let openai = cfg.openai.expect("openai config should be present");
+        assert_eq!(openai.model, "gpt-4.1-mini");
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+    }
+
+    #[test]
+    fn ollama_uses_selected_model_when_ollama_model_env_unset() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::remove_var("LLM_BACKEND");
+            std::env::remove_var("OLLAMA_MODEL");
+        }
+
+        let settings = Settings {
+            llm_backend: Some("ollama".to_string()),
+            selected_model: Some("llama3.2:latest".to_string()),
+            ..Default::default()
+        };
+
+        let cfg = LlmConfig::resolve(&settings).expect("resolve should succeed");
+        let ollama = cfg.ollama.expect("ollama config should be present");
+        assert_eq!(ollama.model, "llama3.2:latest");
+    }
+
+    #[test]
+    fn openai_compatible_uses_settings_accept_language_when_env_headers_missing() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_openai_compatible_env();
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::remove_var("LLM_EXTRA_HEADERS");
+        }
+
+        let settings = Settings {
+            llm_backend: Some("openai_compatible".to_string()),
+            openai_compatible_base_url: Some("https://api.example.com/v1".to_string()),
+            openai_compatible_accept_language: Some("en-US,en".to_string()),
+            ..Default::default()
+        };
+
+        let cfg = LlmConfig::resolve(&settings).expect("resolve should succeed");
+        let compat = cfg
+            .openai_compatible
+            .expect("openai-compatible config should be present");
+        assert!(
+            compat
+                .extra_headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("Accept-Language") && v == "en-US,en")
+        );
     }
 
     #[test]

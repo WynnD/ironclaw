@@ -300,6 +300,69 @@ pub async fn migrate_disk_to_db(
     Ok(())
 }
 
+/// Backfill persisted LLM provider/model settings from the currently resolved config.
+///
+/// This migrates legacy env-driven deployments into the DB-backed settings model
+/// without changing precedence: env vars still override DB values at runtime.
+/// Only missing keys are written.
+pub async fn backfill_llm_settings_from_config(
+    store: &dyn crate::db::Database,
+    user_id: &str,
+    config: &crate::config::LlmConfig,
+) -> Result<(), MigrationError> {
+    let existing = store
+        .get_all_settings(user_id)
+        .await
+        .map_err(|e| MigrationError::Database(format!("Failed to read settings: {}", e)))?;
+
+    let mut wrote_any = false;
+
+    if !existing.contains_key("llm_backend") {
+        store
+            .set_setting(
+                user_id,
+                "llm_backend",
+                &serde_json::json!(config.backend.to_string()),
+            )
+            .await
+            .map_err(|e| {
+                MigrationError::Database(format!("Failed to persist llm_backend: {}", e))
+            })?;
+        wrote_any = true;
+    }
+
+    if !existing.contains_key("selected_model") {
+        let model = match config.backend {
+            crate::config::LlmBackend::NearAi => Some(config.nearai.model.clone()),
+            crate::config::LlmBackend::OpenAi => config.openai.as_ref().map(|c| c.model.clone()),
+            crate::config::LlmBackend::Anthropic => {
+                config.anthropic.as_ref().map(|c| c.model.clone())
+            }
+            crate::config::LlmBackend::Ollama => config.ollama.as_ref().map(|c| c.model.clone()),
+            crate::config::LlmBackend::OpenAiCompatible => {
+                config.openai_compatible.as_ref().map(|c| c.model.clone())
+            }
+            crate::config::LlmBackend::Tinfoil => config.tinfoil.as_ref().map(|c| c.model.clone()),
+        };
+
+        if let Some(model) = model {
+            store
+                .set_setting(user_id, "selected_model", &serde_json::json!(model))
+                .await
+                .map_err(|e| {
+                    MigrationError::Database(format!("Failed to persist selected_model: {}", e))
+                })?;
+            wrote_any = true;
+        }
+    }
+
+    if wrote_any {
+        tracing::info!("Backfilled persisted LLM provider/model settings from current config");
+    }
+
+    Ok(())
+}
+
 /// Rename a file to `<name>.migrated` as a safety net.
 fn rename_to_migrated(path: &std::path::Path) {
     let mut migrated = path.as_os_str().to_owned();

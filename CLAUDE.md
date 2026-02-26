@@ -26,6 +26,12 @@
 - **Setup wizard**: 7-step interactive onboarding for first-run configuration
 - **Heartbeat system**: Proactive periodic execution with checklist
 
+## Operator Notes
+
+- Do not assume the active web gateway user is `default`.
+- In this environment, the gateway runs with a non-default `GATEWAY_USER_ID` (an ID-like value), so DB queries for settings such as `agent.auto_approved_tools` and `mcp_servers` must use the actual gateway user ID.
+- If the Extensions page shows an empty always-approved list while data exists in `settings`, check the `user_id` on the row first.
+
 ## Build & Test
 
 ```bash
