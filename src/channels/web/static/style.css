@@ -2793,6 +2793,8 @@ mark {
 .thread-list {
   flex: 1;
   overflow-y: auto;
+  display: flex;
+  flex-direction: column;
 }
 
 .thread-item {
@@ -2804,6 +2806,7 @@ mark {
   font-size: 13px;
   color: var(--text-secondary);
   border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+  flex-shrink: 0;
 }
 
 .thread-item:hover {
@@ -3308,7 +3311,7 @@ mark {
   }
 
   .thread-sidebar.expanded-mobile .thread-list {
-    display: block;
+    display: flex;
   }
 
   /* ====== Memory tab ====== */
