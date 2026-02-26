@@ -303,6 +303,9 @@ impl Agent {
 
         // Auto-compact if needed BEFORE adding new turn
         {
+            let context_monitor = self
+                .context_monitor_with_reserved(self.config.context_output_reserve_tokens)
+                .await;
             let mut sess = session.lock().await;
             let thread = sess
                 .threads
@@ -310,8 +313,8 @@ impl Agent {
                 .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
 
             let messages = thread.messages();
-            if let Some(strategy) = self.context_monitor.suggest_compaction(&messages) {
-                let pct = self.context_monitor.usage_percent(&messages);
+            if let Some(strategy) = context_monitor.suggest_compaction(&messages) {
+                let pct = context_monitor.usage_percent(&messages);
                 tracing::info!("Context at {:.1}% capacity, auto-compacting", pct);
 
                 // Notify the user that compaction is happening
@@ -631,6 +634,9 @@ impl Agent {
         session: Arc<Mutex<Session>>,
         thread_id: Uuid,
     ) -> Result<SubmissionResult, Error> {
+        let context_monitor = self
+            .context_monitor_with_reserved(self.config.context_output_reserve_tokens)
+            .await;
         let mut sess = session.lock().await;
         let thread = sess
             .threads
@@ -638,13 +644,10 @@ impl Agent {
             .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
 
         let messages = thread.messages();
-        let usage = self.context_monitor.usage_percent(&messages);
-        let strategy = self
-            .context_monitor
-            .suggest_compaction(&messages)
-            .unwrap_or(
-                crate::agent::context_monitor::CompactionStrategy::Summarize { keep_recent: 5 },
-            );
+        let usage = context_monitor.usage_percent(&messages);
+        let strategy = context_monitor.suggest_compaction(&messages).unwrap_or(
+            crate::agent::context_monitor::CompactionStrategy::Summarize { keep_recent: 5 },
+        );
 
         let compactor = ContextCompactor::new(self.llm().clone(), self.safety().clone());
         match compactor
@@ -844,16 +847,7 @@ impl Agent {
 
             // Add tool result to context
             let result_content = match tool_result {
-                Ok(output) => {
-                    let sanitized = self
-                        .safety()
-                        .sanitize_tool_output(&pending.tool_name, &output);
-                    self.safety().wrap_for_llm(
-                        &pending.tool_name,
-                        &sanitized.content,
-                        sanitized.was_modified,
-                    )
-                }
+                Ok(output) => self.format_tool_result_for_context(&pending.tool_name, &output),
                 Err(e) => format!("Error: {}", e),
             };
 
@@ -1086,14 +1080,7 @@ impl Agent {
                 }
 
                 let deferred_content = match deferred_result {
-                    Ok(output) => {
-                        let sanitized = self.safety().sanitize_tool_output(&tc.name, &output);
-                        self.safety().wrap_for_llm(
-                            &tc.name,
-                            &sanitized.content,
-                            sanitized.was_modified,
-                        )
-                    }
+                    Ok(output) => self.format_tool_result_for_context(&tc.name, &output),
                     Err(e) => format!("Error: {}", e),
                 };
 

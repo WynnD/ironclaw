@@ -417,7 +417,7 @@ pub fn next_cron_fire_with_timezone(
             .map(|dt| dt.with_timezone(&Utc)),
         RoutineCronTimezone::Utc => cron_schedule.upcoming(Utc).next(),
         RoutineCronTimezone::Iana(tz) => cron_schedule
-            .upcoming(tz.clone())
+            .upcoming(*tz)
             .next()
             .map(|dt| dt.with_timezone(&Utc)),
     };

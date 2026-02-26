@@ -27,6 +27,12 @@ pub struct AgentConfig {
     pub max_tool_iterations: usize,
     /// When true, skip tool approval checks entirely. For benchmarks/CI.
     pub auto_approve_tools: bool,
+    /// Override the detected model context limit (tokens). `None` = auto-detect.
+    pub context_limit_override: Option<usize>,
+    /// Tokens to reserve for system/skills/output before history accounting.
+    pub context_output_reserve_tokens: usize,
+    /// Maximum estimated tokens from a single tool result allowed into LLM context.
+    pub max_tool_output_tokens: usize,
 }
 
 impl AgentConfig {
@@ -69,6 +75,12 @@ impl AgentConfig {
                 "AGENT_AUTO_APPROVE_TOOLS",
                 settings.agent.auto_approve_tools,
             )?,
+            context_limit_override: parse_option_env("CONTEXT_LIMIT")?,
+            context_output_reserve_tokens: parse_optional_env(
+                "CONTEXT_OUTPUT_RESERVE_TOKENS",
+                4096usize,
+            )?,
+            max_tool_output_tokens: parse_optional_env("MAX_TOOL_OUTPUT_TOKENS", 4096usize)?,
         })
     }
 }

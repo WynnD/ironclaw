@@ -10,6 +10,7 @@ use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::agent::Agent;
+use crate::agent::context_monitor::estimate_text_tokens;
 use crate::agent::session::{PendingApproval, Session, ThreadState};
 use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
@@ -102,6 +103,16 @@ impl Agent {
             None
         };
 
+        let prompt_reserve_tokens = system_prompt
+            .as_deref()
+            .map(estimate_text_tokens)
+            .unwrap_or(0)
+            + skill_context
+                .as_deref()
+                .map(estimate_text_tokens)
+                .unwrap_or(0)
+            + self.config.context_output_reserve_tokens;
+
         let mut reasoning = Reasoning::new(self.llm().clone(), self.safety().clone())
             .with_channel(message.channel.clone())
             .with_model_name(self.llm().active_model_name())
@@ -192,6 +203,32 @@ impl Agent {
             } else {
                 tool_defs
             };
+
+            // Count the actual context that will be sent (including tool traffic),
+            // not just thread turns. Reserve headroom for prompt wrappers + output.
+            let live_monitor = self
+                .context_monitor_with_reserved(prompt_reserve_tokens)
+                .await;
+            if let Some(strategy) = live_monitor.suggest_compaction(&context_messages) {
+                let before_tokens = live_monitor.estimate_tokens(&context_messages);
+                let before_messages = context_messages.len();
+                tracing::info!(
+                    iteration,
+                    ?strategy,
+                    before_tokens,
+                    before_messages,
+                    context_limit = live_monitor.limit(),
+                    "Live context near limit, compacting before LLM call"
+                );
+                context_messages = compact_messages_for_retry(&context_messages);
+                let after_tokens = live_monitor.estimate_tokens(&context_messages);
+                tracing::info!(
+                    iteration,
+                    after_tokens,
+                    after_messages = context_messages.len(),
+                    "Live context compacted before LLM call"
+                );
+            }
 
             // Call LLM with current context; force_text drops tools to guarantee a
             // text response on the final iteration.
@@ -635,13 +672,7 @@ impl Agent {
                                 // Sanitize and add tool result to context
                                 let result_content = match tool_result {
                                     Ok(output) => {
-                                        let sanitized =
-                                            self.safety().sanitize_tool_output(&tc.name, &output);
-                                        self.safety().wrap_for_llm(
-                                            &tc.name,
-                                            &sanitized.content,
-                                            sanitized.was_modified,
-                                        )
+                                        self.format_tool_result_for_context(&tc.name, &output)
                                     }
                                     Err(e) => format!("Error: {}", e),
                                 };
@@ -990,6 +1021,9 @@ mod tests {
                 max_actions_per_hour: None,
                 max_tool_iterations: 50,
                 auto_approve_tools: false,
+                context_limit_override: None,
+                context_output_reserve_tokens: 4096,
+                max_tool_output_tokens: 4096,
             },
             deps,
             Arc::new(ChannelManager::new()),

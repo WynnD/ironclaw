@@ -10,20 +10,15 @@ use crate::error::ConfigError;
 ///
 /// Routine timestamps remain stored in UTC; this only affects how cron expressions
 /// (e.g. `0 0 9 * * *`) are interpreted.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum RoutineCronTimezone {
     /// Use the host system's local timezone.
+    #[default]
     Local,
     /// Interpret schedules in UTC.
     Utc,
     /// Interpret schedules in an explicit IANA timezone (e.g. America/New_York).
     Iana(Tz),
-}
-
-impl Default for RoutineCronTimezone {
-    fn default() -> Self {
-        Self::Local
-    }
 }
 
 impl RoutineCronTimezone {

@@ -481,6 +481,7 @@ mod tests {
             extension_manager: None,
             tool_registry: None,
             store: None,
+            secrets_store: None,
             job_manager: None,
             prompt_queue: None,
             user_id: "test".to_string(),

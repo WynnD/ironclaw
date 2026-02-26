@@ -487,10 +487,13 @@ impl Agent {
                     }
 
                     match self.llm().set_model(requested) {
-                        Ok(()) => Ok(SubmissionResult::response(format!(
-                            "Switched model to: {}",
-                            requested
-                        ))),
+                        Ok(()) => {
+                            let _ = self.refresh_context_monitor_limit().await;
+                            Ok(SubmissionResult::response(format!(
+                                "Switched model to: {}",
+                                requested
+                            )))
+                        }
                         Err(e) => Ok(SubmissionResult::error(format!(
                             "Failed to switch model: {}",
                             e

@@ -10,8 +10,9 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
+use tokio::sync::RwLock;
 
-use crate::agent::context_monitor::ContextMonitor;
+use crate::agent::context_monitor::{ContextMonitor, estimate_text_tokens};
 use crate::agent::heartbeat::spawn_heartbeat;
 use crate::agent::routine_engine::{RoutineEngine, spawn_cron_ticker};
 use crate::agent::self_repair::{DefaultSelfRepair, RepairResult, SelfRepair};
@@ -84,7 +85,7 @@ pub struct Agent {
     pub(super) scheduler: Arc<Scheduler>,
     pub(super) router: Router,
     pub(super) session_manager: Arc<SessionManager>,
-    pub(super) context_monitor: ContextMonitor,
+    pub(super) context_monitor: Arc<RwLock<ContextMonitor>>,
     pub(super) heartbeat_config: Option<HeartbeatConfig>,
     pub(super) hygiene_config: Option<crate::config::HygieneConfig>,
     pub(super) routine_config: Option<RoutineConfig>,
@@ -129,7 +130,7 @@ impl Agent {
             scheduler,
             router: Router::new(),
             session_manager,
-            context_monitor: ContextMonitor::new(),
+            context_monitor: Arc::new(RwLock::new(ContextMonitor::new())),
             heartbeat_config,
             hygiene_config,
             routine_config,
@@ -169,6 +170,97 @@ impl Agent {
 
     pub(super) fn cost_guard(&self) -> &Arc<crate::agent::cost_guard::CostGuard> {
         &self.deps.cost_guard
+    }
+
+    /// Refresh the base context limit from the active model metadata (unless overridden).
+    pub(super) async fn refresh_context_monitor_limit(&self) -> usize {
+        let base_limit = if let Some(limit) = self.config.context_limit_override {
+            limit
+        } else {
+            let fallback = {
+                let monitor = self.context_monitor.read().await;
+                monitor.limit()
+            };
+            match self.llm().model_metadata().await {
+                Ok(metadata) => {
+                    let limit = metadata
+                        .context_length
+                        .map(|v| v as usize)
+                        .unwrap_or(fallback);
+                    tracing::debug!(
+                        model = %metadata.id,
+                        context_limit = limit,
+                        "Resolved model context limit"
+                    );
+                    limit
+                }
+                Err(err) => {
+                    tracing::warn!("Failed to fetch model metadata for context limit: {}", err);
+                    fallback
+                }
+            }
+        };
+
+        let mut monitor = self.context_monitor.write().await;
+        *monitor = monitor.clone().with_limit(base_limit);
+        base_limit
+    }
+
+    /// Clone the current monitor and apply a reserved-token headroom.
+    pub(super) async fn context_monitor_with_reserved(
+        &self,
+        reserved_tokens: usize,
+    ) -> ContextMonitor {
+        let monitor = self.context_monitor.read().await.clone();
+        let effective_limit = monitor.limit().saturating_sub(reserved_tokens).max(1024);
+        monitor.with_limit(effective_limit)
+    }
+
+    /// Sanitize, cap, and wrap tool output before adding it to LLM context.
+    pub(super) fn format_tool_result_for_context(&self, tool_name: &str, output: &str) -> String {
+        let sanitized = self.safety().sanitize_tool_output(tool_name, output);
+        let capped_content = self
+            .cap_text_for_context_tokens(&sanitized.content, self.config.max_tool_output_tokens);
+        self.safety()
+            .wrap_for_llm(tool_name, &capped_content, sanitized.was_modified)
+    }
+
+    fn cap_text_for_context_tokens(&self, content: &str, max_tokens: usize) -> String {
+        if max_tokens == 0 {
+            return content.to_string();
+        }
+
+        let estimated_tokens = estimate_text_tokens(content);
+        if estimated_tokens <= max_tokens {
+            return content.to_string();
+        }
+
+        let suffix = format!(
+            "\n\n[tool output truncated for context: estimated {} tokens exceeds limit {}]",
+            estimated_tokens, max_tokens
+        );
+        let suffix_tokens = estimate_text_tokens(&suffix);
+        if suffix_tokens >= max_tokens {
+            return suffix;
+        }
+
+        let target_tokens = max_tokens.saturating_sub(suffix_tokens);
+        let total_chars = content.chars().count();
+        let estimated_chars = ((total_chars as f64)
+            * (target_tokens as f64 / estimated_tokens as f64))
+            .floor() as usize;
+        let min_keep = total_chars.min(64);
+        let keep_chars = estimated_chars.clamp(min_keep, total_chars);
+
+        let byte_end = content
+            .char_indices()
+            .nth(keep_chars)
+            .map(|(idx, _)| idx)
+            .unwrap_or(content.len());
+
+        let mut truncated = content[..byte_end].to_string();
+        truncated.push_str(&suffix);
+        truncated
     }
 
     pub(super) fn skill_registry(&self) -> Option<&Arc<std::sync::RwLock<SkillRegistry>>> {
@@ -221,6 +313,8 @@ impl Agent {
 
     /// Run the agent main loop.
     pub async fn run(self) -> Result<(), Error> {
+        let _ = self.refresh_context_monitor_limit().await;
+
         // Start channels
         let mut message_stream = self.channels.start_all().await?;
 

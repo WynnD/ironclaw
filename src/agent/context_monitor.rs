@@ -13,6 +13,8 @@ const COMPACTION_THRESHOLD: f64 = 0.8;
 
 /// Approximate tokens per word (rough estimate for English).
 const TOKENS_PER_WORD: f64 = 1.3;
+/// Approximate tokens per byte (safer for JSON/code than word count).
+const TOKENS_PER_BYTE: f64 = 0.25;
 
 /// Strategy for context compaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +40,7 @@ impl Default for CompactionStrategy {
 }
 
 /// Monitors context size and suggests compaction.
+#[derive(Debug, Clone)]
 pub struct ContextMonitor {
     /// Maximum tokens allowed in context.
     context_limit: usize,
@@ -124,19 +127,32 @@ impl Default for ContextMonitor {
 
 /// Estimate tokens for a single message.
 fn estimate_message_tokens(message: &ChatMessage) -> usize {
-    // Use word-based estimation as it's more accurate for varied content
-    let word_count = message.content.split_whitespace().count();
+    // Add overhead for role and message structure.
+    let mut total = 4;
 
-    // Add overhead for role and structure
-    let overhead = 4; // ~4 tokens for role and message structure
+    total += estimate_text_tokens(&message.content);
 
-    (word_count as f64 * TOKENS_PER_WORD) as usize + overhead
+    if let Some(ref tool_call_id) = message.tool_call_id {
+        total += estimate_text_tokens(tool_call_id);
+    }
+    if let Some(ref name) = message.name {
+        total += estimate_text_tokens(name);
+    }
+    if let Some(ref tool_calls) = message.tool_calls {
+        total += serde_json::to_string(tool_calls)
+            .map(|json| estimate_text_tokens(&json))
+            .unwrap_or(0);
+    }
+
+    total
 }
 
 /// Estimate tokens for raw text.
 pub fn estimate_text_tokens(text: &str) -> usize {
     let word_count = text.split_whitespace().count();
-    (word_count as f64 * TOKENS_PER_WORD) as usize
+    let word_estimate = (word_count as f64 * TOKENS_PER_WORD).ceil() as usize;
+    let byte_estimate = (text.len() as f64 * TOKENS_PER_BYTE).ceil() as usize;
+    word_estimate.max(byte_estimate)
 }
 
 /// Context size breakdown for reporting.
