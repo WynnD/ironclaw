@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IronClaw - Responsive Preview</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    /* Preview-only: make #app visible and remove auth screen */
+    #app { display: flex !important; }
+    #auth-screen { display: none !important; }
+    /* Preview helper: viewport size indicator */
+    .preview-badge {
+      position: fixed;
+      bottom: 8px;
+      left: 8px;
+      background: rgba(52, 211, 153, 0.9);
+      color: #09090b;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 4px 10px;
+      border-radius: 6px;
+      z-index: 99999;
+      font-family: 'IBM Plex Mono', monospace;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <!-- Viewport size indicator -->
+  <div class="preview-badge" id="preview-badge"></div>
+
+  <div id="app">
+    <!-- Tab Bar -->
+    <div class="tab-bar">
+      <select id="tab-mobile-select" class="tab-mobile-select" aria-label="Select tab" onchange="previewSwitchTab(this.value)">
+        <option value="chat">Chat</option>
+        <option value="memory">Memory</option>
+        <option value="jobs">Jobs</option>
+        <option value="routines">Routines</option>
+        <option value="extensions">Extensions</option>
+        <option value="skills">Skills</option>
+        <option value="logs">Logs</option>
+      </select>
+      <button class="active" data-tab="chat" onclick="previewSwitchTab('chat')">Chat</button>
+      <button data-tab="memory" onclick="previewSwitchTab('memory')">Memory</button>
+      <button data-tab="jobs" onclick="previewSwitchTab('jobs')">Jobs</button>
+      <button data-tab="routines" onclick="previewSwitchTab('routines')">Routines</button>
+      <button data-tab="extensions" onclick="previewSwitchTab('extensions')">Extensions</button>
+      <button data-tab="skills" onclick="previewSwitchTab('skills')">Skills</button>
+      <div class="spacer"></div>
+      <button class="status-logs-btn" data-tab="logs" onclick="previewSwitchTab('logs')" title="Logs">Logs</button>
+      <div class="tee-shield" style="display:flex" title="TEE Verified">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+        </svg>
+        <span>TEE Verified</span>
+      </div>
+      <div class="status">
+        <div class="dot"></div>
+        <span>Connected</span>
+      </div>
+    </div>
+
+    <!-- Chat Tab -->
+    <div class="tab-panel active" id="tab-chat">
+      <div class="thread-sidebar" id="thread-sidebar">
+        <div class="thread-sidebar-header">
+          <span>Threads</span>
+          <button class="thread-new-btn" title="New thread">+</button>
+          <button class="thread-toggle-btn" id="thread-toggle-btn" onclick="toggleThreadSidebar()">&laquo;</button>
+        </div>
+        <div class="assistant-item active">
+          <span class="assistant-label">Assistant</span>
+          <span class="assistant-meta">3 msgs</span>
+        </div>
+        <div class="threads-section-header"><span>Conversations</span></div>
+        <div class="thread-list">
+          <div class="thread-item active">
+            <span class="thread-label">Deploy pipeline</span>
+            <span class="thread-meta">2m ago</span>
+          </div>
+          <div class="thread-item">
+            <span class="thread-label">Bug fix #432</span>
+            <span class="thread-meta">1h ago</span>
+          </div>
+          <div class="thread-item">
+            <span class="thread-label">API design review</span>
+            <span class="thread-meta">3h ago</span>
+          </div>
+        </div>
+      </div>
+      <div class="chat-container">
+        <div class="chat-messages" id="chat-messages">
+          <div class="message system">Session started</div>
+          <div class="message user">Can you help me deploy the new API to production?</div>
+          <div class="message assistant">
+            <p>I'll help you deploy the API. Let me check the current status of your infrastructure first.</p>
+            <p>Here's what I found:</p>
+            <ul>
+              <li>Current version: <code>v2.3.1</code></li>
+              <li>Target version: <code>v2.4.0</code></li>
+              <li>All tests passing</li>
+            </ul>
+          </div>
+          <div class="activity-group">
+            <div class="activity-tool-card" data-status="done">
+              <div class="activity-tool-header">
+                <div class="activity-tool-icon"><span class="activity-icon-success">&#10003;</span></div>
+                <span class="activity-tool-name">shell</span>
+                <span class="activity-tool-duration">1.2s</span>
+                <span class="activity-tool-chevron">&#9654;</span>
+              </div>
+            </div>
+            <div class="activity-tool-card" data-status="done">
+              <div class="activity-tool-header">
+                <div class="activity-tool-icon"><span class="activity-icon-success">&#10003;</span></div>
+                <span class="activity-tool-name">http_request</span>
+                <span class="activity-tool-duration">0.8s</span>
+                <span class="activity-tool-chevron">&#9654;</span>
+              </div>
+            </div>
+          </div>
+          <div class="message assistant">
+            <p>The deployment is ready to proceed. I'll need your approval to run the following:</p>
+            <pre><code>kubectl rollout restart deployment/api-server -n production</code></pre>
+          </div>
+          <div class="approval-card">
+            <div class="approval-header">Tool Approval Required</div>
+            <div class="approval-tool-name">shell</div>
+            <div class="approval-description">Execute deployment command on production cluster</div>
+            <div class="approval-actions">
+              <button class="approve">Approve</button>
+              <button class="always">Always Allow</button>
+              <button class="deny">Deny</button>
+            </div>
+          </div>
+          <div class="message user">Looks good, go ahead!</div>
+          <div class="message assistant">
+            <p>Deployment initiated successfully! The rollout is in progress. I'll monitor it and let you know when all pods are healthy.</p>
+          </div>
+        </div>
+        <div class="chat-status">
+          <div class="spinner"></div>
+          Thinking...
+        </div>
+        <div class="chat-input">
+          <textarea placeholder="Type a message..." rows="1"></textarea>
+          <button>Send</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Memory Tab -->
+    <div class="tab-panel" id="tab-memory">
+      <div class="memory-container">
+        <div class="memory-sidebar">
+          <div class="search-box">
+            <input type="text" placeholder="Search memory...">
+          </div>
+          <div class="memory-tree">
+            <div class="tree-row" style="padding-left: 8px">
+              <span class="expand-arrow expanded">&#9654;</span>
+              <span class="tree-label dir">context/</span>
+            </div>
+            <div class="tree-row" style="padding-left: 28px">
+              <span class="expand-arrow-spacer"></span>
+              <span class="tree-label file">vision.md</span>
+            </div>
+            <div class="tree-row" style="padding-left: 28px">
+              <span class="expand-arrow-spacer"></span>
+              <span class="tree-label file">architecture.md</span>
+            </div>
+            <div class="tree-row" style="padding-left: 8px">
+              <span class="expand-arrow">&#9654;</span>
+              <span class="tree-label dir">daily/</span>
+            </div>
+            <div class="tree-row" style="padding-left: 8px">
+              <span class="expand-arrow-spacer"></span>
+              <span class="tree-label file">IDENTITY.md</span>
+            </div>
+          </div>
+        </div>
+        <div class="memory-content">
+          <div class="memory-breadcrumb">
+            <span>workspace / context / vision.md</span>
+            <button class="memory-edit-btn">Edit</button>
+          </div>
+          <div class="memory-viewer">
+            <div class="memory-rendered">
+              <h2>Project Vision</h2>
+              <p>IronClaw is a secure personal AI assistant that protects your data and expands its capabilities on the fly.</p>
+              <h3>Core Principles</h3>
+              <ul>
+                <li>User-first security</li>
+                <li>Self-expanding capabilities</li>
+                <li>Defense in depth</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Jobs Tab -->
+    <div class="tab-panel" id="tab-jobs">
+      <div class="jobs-container">
+        <div class="jobs-summary">
+          <div class="summary-card active"><div class="count">3</div><div class="label">Active</div></div>
+          <div class="summary-card completed"><div class="count">47</div><div class="label">Completed</div></div>
+          <div class="summary-card failed"><div class="count">2</div><div class="label">Failed</div></div>
+          <div class="summary-card stuck"><div class="count">1</div><div class="label">Stuck</div></div>
+        </div>
+        <table class="jobs-table">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Title</th>
+              <th>Source</th>
+              <th>Status</th>
+              <th>Created</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr class="job-row">
+              <td style="font-family: var(--font-mono); font-size: 12px;">a1b2c3d4</td>
+              <td>Deploy API v2.4.0</td>
+              <td><span class="badge source-direct">direct</span></td>
+              <td><span class="badge in_progress">In Progress</span></td>
+              <td>2 min ago</td>
+              <td><button class="btn-cancel">Cancel</button></td>
+            </tr>
+            <tr class="job-row">
+              <td style="font-family: var(--font-mono); font-size: 12px;">e5f6g7h8</td>
+              <td>Run integration tests</td>
+              <td><span class="badge source-sandbox">sandbox</span></td>
+              <td><span class="badge completed">Completed</span></td>
+              <td>15 min ago</td>
+              <td><button class="btn-restart">Restart</button></td>
+            </tr>
+            <tr class="job-row">
+              <td style="font-family: var(--font-mono); font-size: 12px;">i9j0k1l2</td>
+              <td>Generate API documentation from OpenAPI spec</td>
+              <td><span class="badge source-direct">direct</span></td>
+              <td><span class="badge failed">Failed</span></td>
+              <td>1 hour ago</td>
+              <td><button class="btn-restart">Restart</button></td>
+            </tr>
+            <tr class="job-row">
+              <td style="font-family: var(--font-mono); font-size: 12px;">m3n4o5p6</td>
+              <td>Database backup</td>
+              <td><span class="badge source-direct">direct</span></td>
+              <td><span class="badge stuck">Stuck</span></td>
+              <td>2 hours ago</td>
+              <td><button class="btn-cancel">Cancel</button></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Routines Tab -->
+    <div class="tab-panel" id="tab-routines">
+      <div class="routines-container">
+        <div class="routines-summary">
+          <div class="summary-card active"><div class="count">4</div><div class="label">Active</div></div>
+          <div class="summary-card completed"><div class="count">128</div><div class="label">Total Runs</div></div>
+          <div class="summary-card failed"><div class="count">3</div><div class="label">Failures</div></div>
+        </div>
+        <table class="routines-table">
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Trigger</th>
+              <th>Action</th>
+              <th>Last Run</th>
+              <th>Next Run</th>
+              <th>Runs</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr class="routine-row">
+              <td>Daily backup</td>
+              <td>0 2 * * *</td>
+              <td>Run backup script</td>
+              <td>6h ago</td>
+              <td>in 18h</td>
+              <td>45</td>
+              <td><span class="badge enabled">Enabled</span></td>
+              <td>
+                <button class="btn-trigger">Trigger</button>
+                <button class="btn-toggle">Disable</button>
+              </td>
+            </tr>
+            <tr class="routine-row">
+              <td>Health check</td>
+              <td>*/5 * * * *</td>
+              <td>Ping endpoints</td>
+              <td>2m ago</td>
+              <td>in 3m</td>
+              <td>83</td>
+              <td><span class="badge enabled">Enabled</span></td>
+              <td>
+                <button class="btn-trigger">Trigger</button>
+                <button class="btn-toggle">Disable</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Extensions Tab -->
+    <div class="tab-panel" id="tab-extensions">
+      <div class="extensions-container">
+        <div class="extensions-section">
+          <h3>Installed Extensions</h3>
+          <div class="extensions-list">
+            <div class="ext-card">
+              <div class="ext-header">
+                <span class="ext-name">github-tools</span>
+                <span class="ext-kind kind-mcp_server">MCP</span>
+                <div class="ext-auth-dot authed"></div>
+              </div>
+              <div class="ext-desc">GitHub API integration for issues, PRs, and repos</div>
+              <div class="ext-tools">Tools: 12</div>
+              <div class="ext-actions">
+                <span class="ext-active-label">Active</span>
+                <button class="btn-ext configure">Configure</button>
+                <button class="btn-ext remove">Remove</button>
+              </div>
+            </div>
+            <div class="ext-card">
+              <div class="ext-header">
+                <span class="ext-name">web-scraper</span>
+                <span class="ext-kind kind-wasm_tool">WASM</span>
+                <div class="ext-auth-dot unauthed"></div>
+              </div>
+              <div class="ext-desc">Fetch and extract content from web pages</div>
+              <div class="ext-tools">Tools: 3</div>
+              <div class="ext-actions">
+                <button class="btn-ext activate">Activate</button>
+                <button class="btn-ext remove">Remove</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="extensions-section">
+          <h3>Install WASM Extension</h3>
+          <div class="ext-install-form">
+            <input type="text" placeholder="Extension name">
+            <input type="text" placeholder="URL to .tar.gz bundle">
+            <button>Install</button>
+          </div>
+        </div>
+        <div class="extensions-section">
+          <h3>Registered Tools</h3>
+          <table class="tools-table">
+            <thead><tr><th>Name</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td style="font-family: var(--font-mono)">shell</td><td>Execute shell commands</td></tr>
+              <tr><td style="font-family: var(--font-mono)">read_file</td><td>Read file contents from workspace</td></tr>
+              <tr><td style="font-family: var(--font-mono)">write_file</td><td>Write content to a file</td></tr>
+              <tr><td style="font-family: var(--font-mono)">memory_search</td><td>Search workspace memory with hybrid FTS + vector</td></tr>
+              <tr><td style="font-family: var(--font-mono)">http_request</td><td>Make HTTP requests to external APIs</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Skills Tab -->
+    <div class="tab-panel" id="tab-skills">
+      <div class="extensions-container">
+        <div class="extensions-section">
+          <h3>Search ClawHub</h3>
+          <div class="skill-search-box">
+            <input type="text" placeholder="Search for skills...">
+            <button>Search</button>
+          </div>
+          <div class="extensions-list">
+            <div class="ext-card ext-available skill-search-result">
+              <div class="ext-header">
+                <span class="ext-name">docker-deploy</span>
+                <span class="skill-trust trust-installed">installed</span>
+                <span class="skill-version">v1.2.0</span>
+              </div>
+              <div class="ext-desc">Docker deployment automation with rollback support</div>
+              <div class="ext-keywords">docker, deploy, kubernetes, containers</div>
+              <div class="ext-actions">
+                <button class="btn-ext install">Install</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="extensions-section">
+          <h3>Installed Skills</h3>
+          <div class="extensions-list">
+            <div class="ext-card">
+              <div class="ext-header">
+                <span class="ext-name">code-review</span>
+                <span class="skill-trust trust-trusted">trusted</span>
+                <span class="skill-version">v0.3.1</span>
+              </div>
+              <div class="ext-desc">Automated code review with best practices checks</div>
+              <div class="ext-actions">
+                <span class="ext-active-label">Active</span>
+                <button class="btn-ext remove">Remove</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="extensions-section">
+          <h3>Install Skill by URL</h3>
+          <div class="ext-install-form">
+            <input type="text" placeholder="Skill name or slug">
+            <input type="text" placeholder="HTTPS URL to SKILL.md (optional)">
+            <button>Install</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Logs Tab -->
+    <div class="tab-panel" id="tab-logs">
+      <div class="logs-container">
+        <div class="logs-toolbar">
+          <select title="Server-side log level">
+            <option value="info" selected>Server: INFO</option>
+            <option value="debug">Server: DEBUG</option>
+          </select>
+          <select>
+            <option value="all">All Levels</option>
+            <option value="ERROR">Error</option>
+            <option value="WARN">Warn</option>
+          </select>
+          <input type="text" placeholder="Filter by target...">
+          <label class="logs-checkbox"><input type="checkbox" checked> Auto-scroll</label>
+          <button>Pause</button>
+          <button>Clear</button>
+        </div>
+        <div class="logs-output">
+          <div class="log-entry level-INFO">
+            <span class="log-ts">14:32:01</span>
+            <span class="log-level">INFO</span>
+            <span class="log-target">ironclaw::agent</span>
+            <span class="log-msg">Processing message from web channel user=default</span>
+          </div>
+          <div class="log-entry level-DEBUG">
+            <span class="log-ts">14:32:01</span>
+            <span class="log-level">DEBUG</span>
+            <span class="log-target">ironclaw::llm</span>
+            <span class="log-msg">Sending request to LLM provider model=claude-3-5-sonnet tokens=1523</span>
+          </div>
+          <div class="log-entry level-INFO">
+            <span class="log-ts">14:32:03</span>
+            <span class="log-level">INFO</span>
+            <span class="log-target">ironclaw::tools</span>
+            <span class="log-msg">Executing tool shell with params {"command": "kubectl get pods -n production"}</span>
+          </div>
+          <div class="log-entry level-WARN">
+            <span class="log-ts">14:32:04</span>
+            <span class="log-level">WARN</span>
+            <span class="log-target">ironclaw::safety</span>
+            <span class="log-msg">Potential secret detected in tool output, redacting API key pattern</span>
+          </div>
+          <div class="log-entry level-ERROR">
+            <span class="log-ts">14:32:05</span>
+            <span class="log-level">ERROR</span>
+            <span class="log-target">ironclaw::sandbox</span>
+            <span class="log-msg">Container health check failed container_id=abc123 reason="timeout after 30s"</span>
+          </div>
+          <div class="log-entry level-INFO">
+            <span class="log-ts">14:32:06</span>
+            <span class="log-level">INFO</span>
+            <span class="log-target">ironclaw::agent</span>
+            <span class="log-msg">Job completed successfully job_id=a1b2c3d4 duration=4.2s</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toasts">
+    <div class="toast toast-info visible">Extension github-tools activated</div>
+  </div>
+
+  <script>
+    // Minimal JS for tab switching and sidebar toggle in preview
+    function previewSwitchTab(tab) {
+      document.querySelectorAll('.tab-bar button[data-tab]').forEach(b => {
+        b.classList.toggle('active', b.getAttribute('data-tab') === tab);
+      });
+      document.querySelectorAll('.tab-panel').forEach(p => {
+        p.classList.toggle('active', p.id === 'tab-' + tab);
+      });
+      const sel = document.getElementById('tab-mobile-select');
+      if (sel && sel.value !== tab) sel.value = tab;
+    }
+
+    function toggleThreadSidebar() {
+      const sidebar = document.getElementById('thread-sidebar');
+      const isMobile = window.matchMedia('(max-width: 768px)').matches;
+      if (isMobile) {
+        sidebar.classList.toggle('expanded-mobile');
+        const btn = document.getElementById('thread-toggle-btn');
+        btn.innerHTML = sidebar.classList.contains('expanded-mobile') ? '&laquo;' : '&raquo;';
+      } else {
+        sidebar.classList.toggle('collapsed');
+        const btn = document.getElementById('thread-toggle-btn');
+        btn.innerHTML = sidebar.classList.contains('collapsed') ? '&raquo;' : '&laquo;';
+      }
+    }
+
+    // Viewport size badge
+    function updateBadge() {
+      const w = window.innerWidth;
+      let label = 'Desktop';
+      if (w <= 400) label = 'XS Phone';
+      else if (w <= 768) label = 'Mobile';
+      else if (w <= 1024) label = 'Tablet';
+      document.getElementById('preview-badge').textContent = w + 'px \u2014 ' + label;
+    }
+    window.addEventListener('resize', updateBadge);
+    updateBadge();
+  </script>
+</body>
+</html>
