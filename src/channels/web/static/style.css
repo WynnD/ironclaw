@@ -3302,10 +3302,13 @@ mark {
 
   .thread-sidebar.expanded-mobile .thread-sidebar-header span,
   .thread-sidebar.expanded-mobile .thread-new-btn,
-  .thread-sidebar.expanded-mobile .thread-list,
   .thread-sidebar.expanded-mobile .assistant-item,
   .thread-sidebar.expanded-mobile .threads-section-header {
     display: flex;
+  }
+
+  .thread-sidebar.expanded-mobile .thread-list {
+    display: block;
   }
 
   /* ====== Memory tab ====== */
