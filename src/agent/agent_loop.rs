@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 use crate::agent::context_monitor::{ContextMonitor, estimate_text_tokens};
 use crate::agent::heartbeat::spawn_heartbeat;
@@ -53,6 +54,26 @@ pub(crate) fn truncate_for_preview(output: &str, max_chars: usize) -> String {
     } else {
         collapsed
     }
+}
+
+/// Convert external channel thread IDs into a stable internal UUID string.
+///
+/// - If `external_thread_id` is already a UUID, preserve it.
+/// - Otherwise derive a deterministic UUID from channel + user + external ID.
+///
+/// This lets channels like Telegram (numeric chat IDs) map to the same
+/// internal conversation across process restarts.
+fn canonicalize_external_thread_id(
+    channel: &str,
+    user_id: &str,
+    external_thread_id: &str,
+) -> String {
+    if Uuid::parse_str(external_thread_id).is_ok() {
+        return external_thread_id.to_string();
+    }
+
+    let key = format!("{channel}:{user_id}:{external_thread_id}");
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()).to_string()
 }
 
 /// Core dependencies for the agent.
@@ -756,8 +777,15 @@ impl Agent {
             }
         }
 
+        // Normalize external thread IDs to stable UUIDs so non-UUID channels
+        // (e.g. Telegram chat IDs) can restore context after restart.
+        let normalized_external_thread_id = message
+            .thread_id
+            .as_deref()
+            .map(|tid| canonicalize_external_thread_id(&message.channel, &message.user_id, tid));
+
         // Hydrate thread from DB if it's a historical thread not in memory
-        if let Some(ref external_thread_id) = message.thread_id {
+        if let Some(ref external_thread_id) = normalized_external_thread_id {
             self.maybe_hydrate_thread(message, external_thread_id).await;
         }
 
@@ -767,7 +795,7 @@ impl Agent {
             .resolve_thread(
                 &message.user_id,
                 &message.channel,
-                message.thread_id.as_deref(),
+                normalized_external_thread_id.as_deref(),
             )
             .await;
 
@@ -897,7 +925,9 @@ impl Agent {
 
 #[cfg(test)]
 mod tests {
+    use super::canonicalize_external_thread_id;
     use super::truncate_for_preview;
+    use uuid::Uuid;
 
     #[test]
     fn test_truncate_short_input() {
@@ -959,5 +989,30 @@ mod tests {
         let result = truncate_for_preview(input, 8);
         // 'h','e','l','l','o',' ','世','界' = 8 chars
         assert_eq!(result, "hello 世界...");
+    }
+
+    #[test]
+    fn test_canonicalize_external_thread_id_preserves_uuid() {
+        let id = Uuid::new_v4().to_string();
+        let canonical = canonicalize_external_thread_id("telegram", "user-1", &id);
+        assert_eq!(canonical, id);
+    }
+
+    #[test]
+    fn test_canonicalize_external_thread_id_is_stable() {
+        let id1 = canonicalize_external_thread_id("telegram", "user-1", "123456789");
+        let id2 = canonicalize_external_thread_id("telegram", "user-1", "123456789");
+        assert_eq!(id1, id2);
+        assert!(Uuid::parse_str(&id1).is_ok());
+    }
+
+    #[test]
+    fn test_canonicalize_external_thread_id_scopes_by_channel_and_user() {
+        let base = canonicalize_external_thread_id("telegram", "user-1", "42");
+        let diff_channel = canonicalize_external_thread_id("signal", "user-1", "42");
+        let diff_user = canonicalize_external_thread_id("telegram", "user-2", "42");
+
+        assert_ne!(base, diff_channel);
+        assert_ne!(base, diff_user);
     }
 }
