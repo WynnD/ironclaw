@@ -20,6 +20,30 @@ use crate::tools::mcp::protocol::{
 use crate::tools::mcp::session::McpSessionManager;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput};
 
+const DEFAULT_MCP_TIMEOUT_SECS: u64 = 30;
+const LONG_RUNNING_MCP_TIMEOUT_SECS: u64 = 300;
+
+fn request_timeout_for_server(server_name: &str, server_url: &str) -> Duration {
+    let server_id = format!(
+        "{} {}",
+        server_name.to_ascii_lowercase(),
+        server_url.to_ascii_lowercase()
+    );
+
+    if server_id.contains("gemini") || server_id.contains("codex") {
+        Duration::from_secs(LONG_RUNNING_MCP_TIMEOUT_SECS)
+    } else {
+        Duration::from_secs(DEFAULT_MCP_TIMEOUT_SECS)
+    }
+}
+
+fn build_http_client(server_name: &str, server_url: &str) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(request_timeout_for_server(server_name, server_url))
+        .build()
+        .expect("Failed to create HTTP client")
+}
+
 /// MCP client for communicating with MCP servers.
 ///
 /// Supports two modes:
@@ -62,14 +86,12 @@ impl McpClient {
         let url = server_url.into();
         let name = extract_server_name(&url);
         let session_manager = Arc::new(McpSessionManager::new());
+        let http_client = build_http_client(&name, &url);
 
         Self {
             server_url: url,
             server_name: name,
-            http_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("Failed to create HTTP client"),
+            http_client,
             next_id: AtomicU64::new(1),
             tools_cache: RwLock::new(None),
             session_manager: Some(session_manager),
@@ -84,13 +106,14 @@ impl McpClient {
     /// Use this when you have a configured server name but no authentication.
     pub fn new_with_name(server_name: impl Into<String>, server_url: impl Into<String>) -> Self {
         let session_manager = Arc::new(McpSessionManager::new());
+        let server_name = server_name.into();
+        let server_url = server_url.into();
+        let http_client = build_http_client(&server_name, &server_url);
+
         Self {
-            server_url: server_url.into(),
-            server_name: server_name.into(),
-            http_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("Failed to create HTTP client"),
+            server_url,
+            server_name,
+            http_client,
             next_id: AtomicU64::new(1),
             tools_cache: RwLock::new(None),
             session_manager: Some(session_manager),
@@ -109,13 +132,14 @@ impl McpClient {
         secrets: Arc<dyn SecretsStore + Send + Sync>,
         user_id: impl Into<String>,
     ) -> Self {
+        let server_url = config.url.clone();
+        let server_name = config.name.clone();
+        let http_client = build_http_client(&server_name, &server_url);
+
         Self {
-            server_url: config.url.clone(),
-            server_name: config.name.clone(),
-            http_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("Failed to create HTTP client"),
+            server_url,
+            server_name,
+            http_client,
             next_id: AtomicU64::new(1),
             tools_cache: RwLock::new(None),
             session_manager: Some(session_manager),
@@ -584,5 +608,21 @@ mod tests {
         assert_eq!(client.server_url(), "http://localhost:8080");
         assert!(client.session_manager.is_none());
         assert!(client.secrets.is_none());
+    }
+
+    #[test]
+    fn test_request_timeout_for_specific_servers() {
+        assert_eq!(
+            request_timeout_for_server("mcp-gemini-cli", "http://example.com").as_secs(),
+            300
+        );
+        assert_eq!(
+            request_timeout_for_server("mcp-codex-cli", "http://example.com").as_secs(),
+            300
+        );
+        assert_eq!(
+            request_timeout_for_server("mcp-firecrawl", "http://example.com").as_secs(),
+            30
+        );
     }
 }
