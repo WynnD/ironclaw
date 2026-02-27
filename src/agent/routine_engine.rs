@@ -440,6 +440,7 @@ fn sanitize_routine_name(name: &str) -> String {
 /// creation, metadata, persistence, and scheduling), links the routine run to
 /// the job, and returns immediately. The job runs independently via the
 /// existing Worker/Scheduler with full tool access.
+#[allow(clippy::too_many_arguments)]
 async fn execute_full_job(
     ctx: &EngineContext,
     routine: &Routine,

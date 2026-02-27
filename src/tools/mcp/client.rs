@@ -606,7 +606,7 @@ mod tests {
     fn test_simple_client_creation() {
         let client = McpClient::new("http://localhost:8080");
         assert_eq!(client.server_url(), "http://localhost:8080");
-        assert!(client.session_manager.is_none());
+        assert!(client.session_manager.is_some());
         assert!(client.secrets.is_none());
     }
 

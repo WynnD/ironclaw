@@ -506,100 +506,106 @@ impl AppBuilder {
             let tools = Arc::clone(tools);
             let mcp_sm = Arc::clone(&mcp_session_manager);
             async move {
-                if let Some(ref secrets) = secrets_store {
-                    let servers_result = if let Some(ref d) = db {
-                        load_mcp_servers_from_db(d.as_ref(), &app_user_id).await
-                    } else {
-                        crate::tools::mcp::config::load_mcp_servers().await
-                    };
-                    match servers_result {
-                        Ok(servers) => {
-                            let enabled: Vec<_> = servers.enabled_servers().cloned().collect();
-                            if !enabled.is_empty() {
-                                tracing::info!(
-                                    "Loading {} configured MCP server(s)...",
-                                    enabled.len()
-                                );
-                            }
+                let servers_result = if let Some(ref d) = db {
+                    load_mcp_servers_from_db(d.as_ref(), &app_user_id).await
+                } else {
+                    crate::tools::mcp::config::load_mcp_servers().await
+                };
+                match servers_result {
+                    Ok(servers) => {
+                        let enabled: Vec<_> = servers.enabled_servers().cloned().collect();
+                        if !enabled.is_empty() {
+                            tracing::info!("Loading {} configured MCP server(s)...", enabled.len());
+                        }
 
-                            let mut join_set = tokio::task::JoinSet::new();
-                            for server in enabled {
-                                let app_user_id = app_user_id.clone();
-                                let mcp_sm = Arc::clone(&mcp_sm);
-                                let secrets = Arc::clone(secrets);
-                                let tools = Arc::clone(&tools);
+                        let mut join_set = tokio::task::JoinSet::new();
+                        for server in enabled {
+                            let app_user_id = app_user_id.clone();
+                            let mcp_sm = Arc::clone(&mcp_sm);
+                            let secrets_store = secrets_store.clone();
+                            let tools = Arc::clone(&tools);
 
-                                join_set.spawn(async move {
-                                    let server_name = server.name.clone();
+                            join_set.spawn(async move {
+                                let server_name = server.name.clone();
+
+                                let client = if let Some(ref secrets) = secrets_store {
                                     let has_tokens =
-                                        is_authenticated(&server, &secrets, &app_user_id).await;
-
-                                    let client = if has_tokens || server.requires_auth() {
+                                        is_authenticated(&server, secrets, &app_user_id).await;
+                                    if has_tokens || server.requires_auth() {
                                         McpClient::new_authenticated(
                                             server,
                                             mcp_sm,
-                                            secrets,
+                                            secrets.clone(),
                                             &app_user_id,
                                         )
                                     } else {
                                         McpClient::new_with_name(&server_name, &server.url)
-                                    };
+                                    }
+                                } else if server.requires_auth() {
+                                    tracing::warn!(
+                                        "MCP server '{}' requires authentication but no \
+                                         secrets store is available (is SECRETS_MASTER_KEY set?)",
+                                        server_name
+                                    );
+                                    return;
+                                } else {
+                                    McpClient::new_with_name(&server_name, &server.url)
+                                };
 
-                                    match client.list_tools().await {
-                                        Ok(mcp_tools) => {
-                                            let tool_count = mcp_tools.len();
-                                            match client.create_tools().await {
-                                                Ok(tool_impls) => {
-                                                    for tool in tool_impls {
-                                                        tools.register(tool).await;
-                                                    }
-                                                    tracing::info!(
-                                                        "Loaded {} tools from MCP server '{}'",
-                                                        tool_count,
-                                                        server_name
-                                                    );
+                                match client.list_tools().await {
+                                    Ok(mcp_tools) => {
+                                        let tool_count = mcp_tools.len();
+                                        match client.create_tools().await {
+                                            Ok(tool_impls) => {
+                                                for tool in tool_impls {
+                                                    tools.register(tool).await;
                                                 }
-                                                Err(e) => {
-                                                    tracing::warn!(
-                                                        "Failed to create tools from MCP server '{}': {}",
-                                                        server_name,
-                                                        e
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            let err_str = e.to_string();
-                                            if err_str.contains("401")
-                                                || err_str.contains("authentication")
-                                            {
-                                                tracing::warn!(
-                                                    "MCP server '{}' requires authentication. \
-                                                     Run: ironclaw mcp auth {}",
-                                                    server_name,
+                                                tracing::info!(
+                                                    "Loaded {} tools from MCP server '{}'",
+                                                    tool_count,
                                                     server_name
                                                 );
-                                            } else {
+                                            }
+                                            Err(e) => {
                                                 tracing::warn!(
-                                                    "Failed to connect to MCP server '{}': {}",
+                                                    "Failed to create tools from MCP server '{}': {}",
                                                     server_name,
                                                     e
                                                 );
                                             }
                                         }
                                     }
-                                });
-                            }
-
-                            while let Some(result) = join_set.join_next().await {
-                                if let Err(e) = result {
-                                    tracing::warn!("MCP server loading task panicked: {}", e);
+                                    Err(e) => {
+                                        let err_str = e.to_string();
+                                        if err_str.contains("401")
+                                            || err_str.contains("authentication")
+                                        {
+                                            tracing::warn!(
+                                                "MCP server '{}' requires authentication. \
+                                                 Run: ironclaw mcp auth {}",
+                                                server_name,
+                                                server_name
+                                            );
+                                        } else {
+                                            tracing::warn!(
+                                                "Failed to connect to MCP server '{}': {}",
+                                                server_name,
+                                                e
+                                            );
+                                        }
+                                    }
                                 }
+                            });
+                        }
+
+                        while let Some(result) = join_set.join_next().await {
+                            if let Err(e) = result {
+                                tracing::warn!("MCP server loading task panicked: {}", e);
                             }
                         }
-                        Err(e) => {
-                            tracing::debug!("No MCP servers configured ({})", e);
-                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("No MCP servers configured ({})", e);
                     }
                 }
             }

@@ -2920,7 +2920,7 @@ fn build_llm_settings_response(
     let api_token_env_override = api_token_env_var.is_some_and(|k| std::env::var_os(k).is_some());
     let secrets_store_available = state.secrets_store.is_some();
     let api_token_supported = api_token_secret_name_for_provider(&effective.provider).is_some();
-    let api_token_configured = api_token_supported && (api_token_env_override || false);
+    let api_token_configured = api_token_supported && api_token_env_override;
     LlmSettingsResponse {
         persisted,
         effective,
@@ -3133,10 +3133,7 @@ async fn llm_settings_set_handler(
                     .delete_setting(&state.user_id, "openai_compatible_accept_language")
                     .await
                     .map_err(|e| {
-                        tracing::error!(
-                            "Failed to clear openai_compatible_accept_language: {}",
-                            e
-                        );
+                        tracing::error!("Failed to clear openai_compatible_accept_language: {}", e);
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "Failed to clear Accept-Language".to_string(),
@@ -3191,10 +3188,7 @@ async fn llm_settings_set_handler(
                     .delete_setting(&state.user_id, "openai_compatible_accept_language")
                     .await
                     .map_err(|e| {
-                        tracing::error!(
-                            "Failed to clear openai_compatible_accept_language: {}",
-                            e
-                        );
+                        tracing::error!("Failed to clear openai_compatible_accept_language: {}", e);
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "Failed to clear Accept-Language".to_string(),
@@ -3384,7 +3378,7 @@ async fn llm_models_handler(
         .provider
         .as_deref()
         .and_then(normalize_provider_alias)
-        .unwrap_or_else(|| effective.provider.as_str());
+        .unwrap_or(effective.provider.as_str());
 
     if requested_provider == "openrouter" {
         let base_url = query
@@ -3395,7 +3389,8 @@ async fn llm_models_handler(
             .or_else(|| effective.openai_compatible_base_url.clone())
             .unwrap_or_else(|| OPENROUTER_BASE_URL.to_string());
         let models =
-            fetch_openrouter_models(&state, &base_url, effective.accept_language.as_deref()).await?;
+            fetch_openrouter_models(&state, &base_url, effective.accept_language.as_deref())
+                .await?;
         return Ok(Json(LlmModelsResponse {
             provider: "openrouter".to_string(),
             source: Some("openrouter".to_string()),
