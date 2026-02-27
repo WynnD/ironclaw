@@ -152,14 +152,16 @@ impl Store {
             r#"
             INSERT INTO agent_jobs (
                 id, conversation_id, title, description, category, status, source,
-                budget_amount, budget_token, bid_amount, estimated_cost, estimated_time_secs,
-                actual_cost, repair_attempts, created_at, started_at, completed_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                user_id, budget_amount, budget_token, bid_amount, estimated_cost,
+                estimated_time_secs, actual_cost, repair_attempts,
+                created_at, started_at, completed_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
             ON CONFLICT (id) DO UPDATE SET
                 title = EXCLUDED.title,
                 description = EXCLUDED.description,
                 category = EXCLUDED.category,
                 status = EXCLUDED.status,
+                user_id = EXCLUDED.user_id,
                 estimated_cost = EXCLUDED.estimated_cost,
                 estimated_time_secs = EXCLUDED.estimated_time_secs,
                 actual_cost = EXCLUDED.actual_cost,
@@ -175,6 +177,7 @@ impl Store {
                 &ctx.category,
                 &status,
                 &"direct", // source
+                &ctx.user_id,
                 &ctx.budget,
                 &ctx.budget_token,
                 &ctx.bid_amount,
@@ -628,6 +631,76 @@ impl Store {
                 credential_grants_json: r.get::<_, String>("description"),
             })
             .collect())
+    }
+
+    /// List all jobs (any source) belonging to a user.
+    pub async fn list_all_jobs_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<SandboxJobRecord>, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, title, description, status, user_id, project_dir,
+                       success, failure_reason, created_at, started_at, completed_at
+                FROM agent_jobs WHERE user_id = $1
+                ORDER BY created_at DESC
+                "#,
+                &[&user_id],
+            )
+            .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| SandboxJobRecord {
+                id: r.get("id"),
+                task: r.get("title"),
+                status: r.get("status"),
+                user_id: r.get("user_id"),
+                project_dir: r
+                    .get::<_, Option<String>>("project_dir")
+                    .unwrap_or_default(),
+                success: r.get("success"),
+                failure_reason: r.get("failure_reason"),
+                created_at: r.get("created_at"),
+                started_at: r.get("started_at"),
+                completed_at: r.get("completed_at"),
+                credential_grants_json: r.get::<_, String>("description"),
+            })
+            .collect())
+    }
+
+    /// Get a summary of all job counts by status for a specific user.
+    pub async fn all_jobs_summary_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<SandboxJobSummary, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                "SELECT status, COUNT(*) as cnt FROM agent_jobs WHERE user_id = $1 GROUP BY status",
+                &[&user_id],
+            )
+            .await?;
+
+        let mut summary = SandboxJobSummary::default();
+        for row in &rows {
+            let status: String = row.get("status");
+            let count: i64 = row.get("cnt");
+            let c = count as usize;
+            summary.total += c;
+            match status.as_str() {
+                "creating" | "pending" => summary.creating += c,
+                "running" | "in_progress" => summary.running += c,
+                "completed" | "submitted" | "accepted" => summary.completed += c,
+                "failed" | "cancelled" => summary.failed += c,
+                "interrupted" => summary.interrupted += c,
+                "stuck" => summary.running += c,
+                _ => {}
+            }
+        }
+        Ok(summary)
     }
 
     /// Get a summary of sandbox job counts by status for a specific user.

@@ -251,6 +251,82 @@ impl SandboxStore for LibSqlBackend {
         Ok(jobs)
     }
 
+    async fn list_all_jobs_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<SandboxJobRecord>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT id, title, description, status, user_id, project_dir,
+                       success, failure_reason, created_at, started_at, completed_at
+                FROM agent_jobs WHERE user_id = ?1
+                ORDER BY created_at DESC
+                "#,
+                libsql::params![user_id],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut jobs = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            jobs.push(SandboxJobRecord {
+                id: get_text(&row, 0).parse().unwrap_or_default(),
+                task: get_text(&row, 1),
+                credential_grants_json: get_text(&row, 2),
+                status: get_text(&row, 3),
+                user_id: get_text(&row, 4),
+                project_dir: get_text(&row, 5),
+                success: get_opt_bool(&row, 6),
+                failure_reason: get_opt_text(&row, 7),
+                created_at: get_ts(&row, 8),
+                started_at: get_opt_ts(&row, 9),
+                completed_at: get_opt_ts(&row, 10),
+            });
+        }
+        Ok(jobs)
+    }
+
+    async fn all_jobs_summary_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<SandboxJobSummary, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT status, COUNT(*) as cnt FROM agent_jobs WHERE user_id = ?1 GROUP BY status",
+                libsql::params![user_id],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut summary = SandboxJobSummary::default();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            let status = get_text(&row, 0);
+            let count = get_i64(&row, 1) as usize;
+            summary.total += count;
+            match status.as_str() {
+                "creating" | "pending" => summary.creating += count,
+                "running" | "in_progress" => summary.running += count,
+                "completed" | "submitted" | "accepted" => summary.completed += count,
+                "failed" | "cancelled" => summary.failed += count,
+                "interrupted" => summary.interrupted += count,
+                "stuck" => summary.running += count,
+                _ => {}
+            }
+        }
+        Ok(summary)
+    }
+
     async fn sandbox_job_summary_for_user(
         &self,
         user_id: &str,

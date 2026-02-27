@@ -213,7 +213,17 @@ pub trait SandboxStore: Send + Sync {
         &self,
         user_id: &str,
     ) -> Result<Vec<SandboxJobRecord>, DatabaseError>;
+    /// List all jobs (any source) belonging to a user.
+    async fn list_all_jobs_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<SandboxJobRecord>, DatabaseError>;
     async fn sandbox_job_summary_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<SandboxJobSummary, DatabaseError>;
+    /// Summary of all jobs (any source) for a user.
+    async fn all_jobs_summary_for_user(
         &self,
         user_id: &str,
     ) -> Result<SandboxJobSummary, DatabaseError>;

@@ -548,31 +548,58 @@ impl Tool for RoutineUpdateTool {
                     "type": "boolean",
                     "description": "Enable or disable the routine"
                 },
-                "prompt": {
-                    "type": "string",
-                    "description": "New prompt/instructions"
-                },
-                "schedule": {
-                    "type": "string",
-                    "description": "New cron schedule (for cron triggers)"
-                },
                 "description": {
                     "type": "string",
                     "description": "New description"
                 },
+                "prompt": {
+                    "type": "string",
+                    "description": "New prompt/instructions"
+                },
+                "trigger_type": {
+                    "type": "string",
+                    "enum": ["cron", "event", "webhook", "manual"],
+                    "description": "Change the trigger type. When switching types, provide the relevant fields (schedule for cron, event_pattern for event)."
+                },
+                "schedule": {
+                    "type": "string",
+                    "description": "Cron expression. Required when trigger_type is 'cron', also usable to update schedule on existing cron triggers. Uses 6-field cron (sec min hour day month weekday)."
+                },
+                "event_pattern": {
+                    "type": "string",
+                    "description": "Regex pattern for event trigger. Required when trigger_type is 'event'."
+                },
+                "event_channel": {
+                    "type": "string",
+                    "description": "Optional channel filter for event trigger (e.g. 'telegram')"
+                },
+                "action_type": {
+                    "type": "string",
+                    "enum": ["lightweight", "full_job"],
+                    "description": "Switch execution mode: 'lightweight' (single LLM call) or 'full_job' (multi-turn with tools)"
+                },
                 "max_iterations": {
                     "type": "integer",
-                    "description": "New max iterations for full_job routines"
+                    "description": "Maximum iterations for full_job routines (default: 10)"
                 },
                 "tool_allowlist": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "New per-job allowlist for full_job routines"
+                    "description": "Per-job allowlist for approval-gated tools on full_job routines"
                 },
                 "tool_denylist": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "New per-job denylist for full_job routines"
+                    "description": "Per-job denylist that overrides allowlist/global approvals on full_job routines"
+                },
+                "cooldown_secs": {
+                    "type": "integer",
+                    "description": "Minimum seconds between fires"
+                },
+                "context_paths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Workspace paths to load as context for lightweight routines (e.g. ['context/priorities.md'])"
                 }
             },
             "required": ["name"]
@@ -604,70 +631,285 @@ impl Tool for RoutineUpdateTool {
             routine.description = desc.to_string();
         }
 
-        if let Some(prompt) = params.get("prompt").and_then(|v| v.as_str()) {
-            match &mut routine.action {
-                RoutineAction::Lightweight { prompt: p, .. } => *p = prompt.to_string(),
-                RoutineAction::FullJob { description: d, .. } => *d = prompt.to_string(),
+        // --- Trigger updates ---
+        // If trigger_type is provided, rebuild the trigger from scratch.
+        // Otherwise, update fields on the existing trigger in place.
+        if let Some(new_trigger_type) = params.get("trigger_type").and_then(|v| v.as_str()) {
+            routine.trigger = match new_trigger_type {
+                "cron" => {
+                    let Some(schedule_value) = params.get("schedule") else {
+                        let keys = params_key_list(&params);
+                        return Err(ToolError::InvalidParameters(format!(
+                            "switching to cron trigger requires 'schedule'. Received keys: [{}]. \
+                             Example: schedule=\"0 */2 * * * *\" (6-field: sec min hour day month weekday)",
+                            keys
+                        )));
+                    };
+                    let schedule = parse_schedule_param(schedule_value)?;
+                    self.engine.next_cron_fire(&schedule).map_err(|e| {
+                        ToolError::InvalidParameters(format!(
+                            "invalid cron schedule: {e}. Received schedule={:?}. \
+                             Expected 6-field cron: sec min hour day month weekday \
+                             (example: \"0 */2 * * * *\")",
+                            schedule
+                        ))
+                    })?;
+                    routine.next_fire_at = self.engine.next_cron_fire(&schedule).unwrap_or(None);
+                    Trigger::Cron { schedule }
+                }
+                "event" => {
+                    let pattern = params
+                        .get("event_pattern")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            ToolError::InvalidParameters(
+                                "switching to event trigger requires 'event_pattern'".to_string(),
+                            )
+                        })?;
+                    regex::Regex::new(pattern)
+                        .map_err(|e| ToolError::InvalidParameters(format!("invalid regex: {e}")))?;
+                    let channel = params
+                        .get("event_channel")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    routine.next_fire_at = None;
+                    Trigger::Event {
+                        channel,
+                        pattern: pattern.to_string(),
+                    }
+                }
+                "webhook" => {
+                    routine.next_fire_at = None;
+                    Trigger::Webhook {
+                        path: None,
+                        secret: None,
+                    }
+                }
+                "manual" => {
+                    routine.next_fire_at = None;
+                    Trigger::Manual
+                }
+                other => {
+                    return Err(ToolError::InvalidParameters(format!(
+                        "unknown trigger_type: {other}"
+                    )));
+                }
+            };
+        } else {
+            // No trigger_type change -- update fields on the existing trigger in place.
+            if let Some(schedule_value) = params.get("schedule") {
+                let schedule = parse_schedule_param(schedule_value).map_err(|e| {
+                    tracing::warn!(
+                        tool = "routine_update",
+                        schedule_raw = %summarize_json(schedule_value),
+                        error = %e,
+                        "Invalid routine_update schedule parameter"
+                    );
+                    e
+                })?;
+                if !matches!(routine.trigger, Trigger::Cron { .. }) {
+                    return Err(ToolError::InvalidParameters(
+                        "cannot set 'schedule' on a non-cron trigger. \
+                         Use trigger_type='cron' to switch to a cron trigger."
+                            .to_string(),
+                    ));
+                }
+                self.engine.next_cron_fire(&schedule).map_err(|e| {
+                    ToolError::InvalidParameters(format!(
+                        "invalid cron schedule: {e}. Received schedule={:?}. \
+                         Expected 6-field cron: sec min hour day month weekday \
+                         (example: \"0 */2 * * * *\")",
+                        schedule
+                    ))
+                })?;
+                routine.trigger = Trigger::Cron {
+                    schedule: schedule.clone(),
+                };
+                routine.next_fire_at = self.engine.next_cron_fire(&schedule).unwrap_or(None);
+            }
+
+            if let Some(pattern) = params.get("event_pattern").and_then(|v| v.as_str()) {
+                regex::Regex::new(pattern)
+                    .map_err(|e| ToolError::InvalidParameters(format!("invalid regex: {e}")))?;
+                match &mut routine.trigger {
+                    Trigger::Event {
+                        pattern: current, ..
+                    } => *current = pattern.to_string(),
+                    _ => {
+                        return Err(ToolError::InvalidParameters(
+                            "cannot set 'event_pattern' on a non-event trigger. \
+                             Use trigger_type='event' to switch to an event trigger."
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+
+            if let Some(channel) = params.get("event_channel").and_then(|v| v.as_str()) {
+                match &mut routine.trigger {
+                    Trigger::Event {
+                        channel: current, ..
+                    } => *current = Some(channel.to_string()),
+                    _ => {
+                        return Err(ToolError::InvalidParameters(
+                            "cannot set 'event_channel' on a non-event trigger. \
+                             Use trigger_type='event' to switch to an event trigger."
+                                .to_string(),
+                        ));
+                    }
+                }
             }
         }
 
-        if let Some(max_iterations) = params.get("max_iterations").and_then(|v| v.as_u64())
-            && let RoutineAction::FullJob {
-                max_iterations: current,
-                ..
-            } = &mut routine.action
-        {
-            *current = max_iterations as u32;
-        }
+        // --- Action updates ---
+        // If action_type is provided, rebuild the action.
+        if let Some(new_action_type) = params.get("action_type").and_then(|v| v.as_str()) {
+            let prompt_text = params
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| match &routine.action {
+                    RoutineAction::Lightweight { prompt, .. } => prompt.clone(),
+                    RoutineAction::FullJob { description, .. } => description.clone(),
+                });
 
-        if let Some(tool_allowlist) = parse_string_array_param(&params, "tool_allowlist")?
-            && let RoutineAction::FullJob {
-                tool_allowlist: current,
-                ..
-            } = &mut routine.action
-        {
-            *current = tool_allowlist;
-        }
+            routine.action = match new_action_type {
+                "lightweight" => {
+                    let context_paths = params
+                        .get("context_paths")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_else(|| match &routine.action {
+                            RoutineAction::Lightweight { context_paths, .. } => {
+                                context_paths.clone()
+                            }
+                            _ => Vec::new(),
+                        });
+                    RoutineAction::Lightweight {
+                        prompt: prompt_text,
+                        context_paths,
+                        max_tokens: 4096,
+                    }
+                }
+                "full_job" => {
+                    let max_iterations = params
+                        .get("max_iterations")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or_else(|| match &routine.action {
+                            RoutineAction::FullJob { max_iterations, .. } => {
+                                u64::from(*max_iterations)
+                            }
+                            _ => 10,
+                        }) as u32;
+                    let tool_allowlist = parse_string_array_param(&params, "tool_allowlist")?
+                        .unwrap_or_else(|| match &routine.action {
+                            RoutineAction::FullJob { tool_allowlist, .. } => tool_allowlist.clone(),
+                            _ => Vec::new(),
+                        });
+                    let tool_denylist = parse_string_array_param(&params, "tool_denylist")?
+                        .unwrap_or_else(|| match &routine.action {
+                            RoutineAction::FullJob { tool_denylist, .. } => tool_denylist.clone(),
+                            _ => Vec::new(),
+                        });
 
-        if let Some(tool_denylist) = parse_string_array_param(&params, "tool_denylist")?
-            && let RoutineAction::FullJob {
-                tool_denylist: current,
-                ..
-            } = &mut routine.action
-        {
-            *current = tool_denylist;
-        }
-
-        if let Some(schedule) = params.get("schedule") {
-            let schedule = parse_schedule_param(schedule).map_err(|e| {
-                tracing::warn!(
-                    tool = "routine_update",
-                    schedule_raw = %summarize_json(schedule),
-                    error = %e,
-                    "Invalid routine_update schedule parameter"
-                );
-                e
-            })?;
-            // Validate
-            self.engine.next_cron_fire(&schedule).map_err(|e| {
-                tracing::warn!(
-                    tool = "routine_update",
-                    schedule = %schedule,
-                    error = %e,
-                    "routine_update cron validation failed"
-                );
-                ToolError::InvalidParameters(format!(
-                    "invalid cron schedule for routine_update: {e}. Received schedule={:?}. \
-                         Expected 6-field cron: sec min hour day month weekday \
-                         (example: \"0 */2 * * * *\")",
-                    schedule
-                ))
-            })?;
-
-            routine.trigger = Trigger::Cron {
-                schedule: schedule.clone(),
+                    RoutineAction::FullJob {
+                        title: routine.name.clone(),
+                        description: prompt_text,
+                        max_iterations,
+                        tool_allowlist,
+                        tool_denylist,
+                    }
+                }
+                other => {
+                    return Err(ToolError::InvalidParameters(format!(
+                        "unknown action_type: {other}"
+                    )));
+                }
             };
-            routine.next_fire_at = self.engine.next_cron_fire(&schedule).unwrap_or(None);
+        } else {
+            // No action_type change -- update fields on the existing action in place.
+            if let Some(prompt) = params.get("prompt").and_then(|v| v.as_str()) {
+                match &mut routine.action {
+                    RoutineAction::Lightweight { prompt: p, .. } => *p = prompt.to_string(),
+                    RoutineAction::FullJob { description: d, .. } => *d = prompt.to_string(),
+                }
+            }
+
+            if let Some(context_paths_arr) = params.get("context_paths").and_then(|v| v.as_array())
+            {
+                match &mut routine.action {
+                    RoutineAction::Lightweight { context_paths, .. } => {
+                        *context_paths = context_paths_arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect();
+                    }
+                    _ => {
+                        return Err(ToolError::InvalidParameters(
+                            "cannot set 'context_paths' on a full_job routine. \
+                             Use action_type='lightweight' to switch first."
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+
+            if let Some(max_iterations) = params.get("max_iterations").and_then(|v| v.as_u64()) {
+                match &mut routine.action {
+                    RoutineAction::FullJob {
+                        max_iterations: current,
+                        ..
+                    } => *current = max_iterations as u32,
+                    _ => {
+                        return Err(ToolError::InvalidParameters(
+                            "cannot set 'max_iterations' on a lightweight routine. \
+                             Use action_type='full_job' to switch first."
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+
+            if let Some(tool_allowlist) = parse_string_array_param(&params, "tool_allowlist")? {
+                match &mut routine.action {
+                    RoutineAction::FullJob {
+                        tool_allowlist: current,
+                        ..
+                    } => *current = tool_allowlist,
+                    _ => {
+                        return Err(ToolError::InvalidParameters(
+                            "cannot set 'tool_allowlist' on a lightweight routine. \
+                             Use action_type='full_job' to switch first."
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+
+            if let Some(tool_denylist) = parse_string_array_param(&params, "tool_denylist")? {
+                match &mut routine.action {
+                    RoutineAction::FullJob {
+                        tool_denylist: current,
+                        ..
+                    } => *current = tool_denylist,
+                    _ => {
+                        return Err(ToolError::InvalidParameters(
+                            "cannot set 'tool_denylist' on a lightweight routine. \
+                             Use action_type='full_job' to switch first."
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // --- Guardrails updates ---
+        if let Some(cooldown_secs) = params.get("cooldown_secs").and_then(|v| v.as_u64()) {
+            routine.guardrails.cooldown = Duration::from_secs(cooldown_secs);
         }
 
         self.store

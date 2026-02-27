@@ -1176,20 +1176,26 @@ async fn jobs_list_handler(
         "Database not available".to_string(),
     ))?;
 
-    // Fetch sandbox jobs scoped to the authenticated user.
-    let sandbox_jobs = store
-        .list_sandbox_jobs_for_user(&state.user_id)
+    // Fetch all jobs (sandbox + direct) scoped to the authenticated user.
+    let all_jobs = store
+        .list_all_jobs_for_user(&state.user_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Scope jobs to the authenticated user.
-    let mut jobs: Vec<JobInfo> = sandbox_jobs
+    let mut jobs: Vec<JobInfo> = all_jobs
         .iter()
-        .filter(|j| j.user_id == state.user_id)
         .map(|j| {
             let ui_state = match j.status.as_str() {
+                // Sandbox job statuses
                 "creating" => "pending",
                 "running" => "in_progress",
+                // Direct job statuses (from JobState Display)
+                "pending" => "pending",
+                "in_progress" => "in_progress",
+                "completed" | "submitted" | "accepted" => "completed",
+                "failed" => "failed",
+                "stuck" => "stuck",
+                "cancelled" => "failed",
                 s => s,
             };
             JobInfo {
@@ -1218,7 +1224,7 @@ async fn jobs_summary_handler(
     ))?;
 
     let s = store
-        .sandbox_job_summary_for_user(&state.user_id)
+        .all_jobs_summary_for_user(&state.user_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

@@ -306,11 +306,25 @@ impl SandboxStore for PgBackend {
         self.store.list_sandbox_jobs_for_user(user_id).await
     }
 
+    async fn list_all_jobs_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<SandboxJobRecord>, DatabaseError> {
+        self.store.list_all_jobs_for_user(user_id).await
+    }
+
     async fn sandbox_job_summary_for_user(
         &self,
         user_id: &str,
     ) -> Result<SandboxJobSummary, DatabaseError> {
         self.store.sandbox_job_summary_for_user(user_id).await
+    }
+
+    async fn all_jobs_summary_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<SandboxJobSummary, DatabaseError> {
+        self.store.all_jobs_summary_for_user(user_id).await
     }
 
     async fn sandbox_job_belongs_to_user(
