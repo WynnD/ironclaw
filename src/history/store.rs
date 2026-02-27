@@ -932,6 +932,73 @@ impl Store {
             .await?;
         Ok(row.map(|r| r.get("job_mode")))
     }
+
+    /// Get any job by ID, regardless of source. Returns the basic SandboxJobRecord fields.
+    pub async fn get_any_job(&self, id: Uuid) -> Result<Option<SandboxJobRecord>, DatabaseError> {
+        let conn = self.conn().await?;
+        let row = conn
+            .query_opt(
+                r#"
+                SELECT id, title, description, status, user_id, project_dir,
+                       success, failure_reason, created_at, started_at, completed_at
+                FROM agent_jobs WHERE id = $1
+                "#,
+                &[&id],
+            )
+            .await?;
+
+        Ok(row.map(|r| SandboxJobRecord {
+            id: r.get("id"),
+            task: r.get("title"),
+            status: r.get("status"),
+            user_id: r.get("user_id"),
+            project_dir: r
+                .get::<_, Option<String>>("project_dir")
+                .unwrap_or_default(),
+            success: r.get("success"),
+            failure_reason: r.get("failure_reason"),
+            created_at: r.get("created_at"),
+            started_at: r.get("started_at"),
+            completed_at: r.get("completed_at"),
+            credential_grants_json: r.get::<_, String>("description"),
+        }))
+    }
+
+    /// Delete a terminal-state job and its events. Returns true if a row was deleted.
+    pub async fn delete_job(&self, id: Uuid, user_id: &str) -> Result<bool, DatabaseError> {
+        let conn = self.conn().await?;
+        // Delete events first (no FK cascade in all schemas).
+        conn.execute("DELETE FROM job_events WHERE job_id = $1", &[&id])
+            .await?;
+        let count = conn
+            .execute(
+                r#"
+                DELETE FROM agent_jobs
+                WHERE id = $1 AND user_id = $2
+                  AND status NOT IN ('running', 'creating', 'in_progress', 'pending')
+                "#,
+                &[&id, &user_id],
+            )
+            .await?;
+        Ok(count > 0)
+    }
+
+    /// Update a job's title. Returns true if a row was updated.
+    pub async fn update_job_title(
+        &self,
+        id: Uuid,
+        user_id: &str,
+        title: &str,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.conn().await?;
+        let count = conn
+            .execute(
+                "UPDATE agent_jobs SET title = $1 WHERE id = $2 AND user_id = $3",
+                &[&title, &id, &user_id],
+            )
+            .await?;
+        Ok(count > 0)
+    }
 }
 
 // ==================== Routines ====================

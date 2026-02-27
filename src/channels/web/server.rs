@@ -212,9 +212,17 @@ pub async fn start_server(
         .route("/api/memory/write", post(memory_write_handler))
         .route("/api/memory/search", post(memory_search_handler))
         // Jobs
-        .route("/api/jobs", get(jobs_list_handler))
+        .route(
+            "/api/jobs",
+            get(jobs_list_handler).post(jobs_create_handler),
+        )
         .route("/api/jobs/summary", get(jobs_summary_handler))
-        .route("/api/jobs/{id}", get(jobs_detail_handler))
+        .route(
+            "/api/jobs/{id}",
+            get(jobs_detail_handler)
+                .delete(jobs_delete_handler)
+                .put(jobs_update_handler),
+        )
         .route("/api/jobs/{id}/cancel", post(jobs_cancel_handler))
         .route("/api/jobs/{id}/restart", post(jobs_restart_handler))
         .route("/api/jobs/{id}/prompt", post(jobs_prompt_handler))
@@ -1242,72 +1250,90 @@ async fn jobs_detail_handler(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
 ) -> Result<Json<JobDetailResponse>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
     let job_id = Uuid::parse_str(&id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID".to_string()))?;
 
-    // Try sandbox job from DB first, scoped to the authenticated user.
-    if let Some(ref store) = state.store
-        && let Ok(Some(job)) = store.get_sandbox_job(job_id).await
-    {
-        if job.user_id != state.user_id {
-            return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
-        }
+    let job = store
+        .get_any_job(job_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Job not found".to_string()))?;
+
+    if job.user_id != state.user_id {
+        return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
+    }
+
+    let ui_state = match job.status.as_str() {
+        "creating" => "pending",
+        "running" => "in_progress",
+        s => s,
+    };
+
+    let elapsed_secs = job.started_at.map(|start| {
+        let end = job.completed_at.unwrap_or_else(chrono::Utc::now);
+        (end - start).num_seconds().max(0) as u64
+    });
+
+    // Synthesize transitions from timestamps.
+    let mut transitions = Vec::new();
+    if let Some(started) = job.started_at {
+        transitions.push(TransitionInfo {
+            from: "creating".to_string(),
+            to: "running".to_string(),
+            timestamp: started.to_rfc3339(),
+            reason: None,
+        });
+    }
+    if let Some(completed) = job.completed_at {
+        transitions.push(TransitionInfo {
+            from: "running".to_string(),
+            to: job.status.clone(),
+            timestamp: completed.to_rfc3339(),
+            reason: job.failure_reason.clone(),
+        });
+    }
+
+    // Sandbox jobs have a project_dir; provide browse URL and job mode for them.
+    let has_project = !job.project_dir.is_empty();
+    let (project_dir, browse_url, job_mode) = if has_project {
         let browse_id = std::path::Path::new(&job.project_dir)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| job.id.to_string());
+        let mode = store
+            .get_sandbox_job_mode(job.id)
+            .await
+            .ok()
+            .flatten()
+            .filter(|m| m != "worker");
+        (
+            Some(job.project_dir.clone()),
+            Some(format!("/projects/{}/", browse_id)),
+            mode,
+        )
+    } else {
+        (None, None, None)
+    };
 
-        let ui_state = match job.status.as_str() {
-            "creating" => "pending",
-            "running" => "in_progress",
-            s => s,
-        };
-
-        let elapsed_secs = job.started_at.map(|start| {
-            let end = job.completed_at.unwrap_or_else(chrono::Utc::now);
-            (end - start).num_seconds().max(0) as u64
-        });
-
-        // Synthesize transitions from timestamps.
-        let mut transitions = Vec::new();
-        if let Some(started) = job.started_at {
-            transitions.push(TransitionInfo {
-                from: "creating".to_string(),
-                to: "running".to_string(),
-                timestamp: started.to_rfc3339(),
-                reason: None,
-            });
-        }
-        if let Some(completed) = job.completed_at {
-            transitions.push(TransitionInfo {
-                from: "running".to_string(),
-                to: job.status.clone(),
-                timestamp: completed.to_rfc3339(),
-                reason: job.failure_reason.clone(),
-            });
-        }
-
-        return Ok(Json(JobDetailResponse {
-            id: job.id,
-            title: job.task.clone(),
-            description: String::new(),
-            state: ui_state.to_string(),
-            user_id: job.user_id.clone(),
-            created_at: job.created_at.to_rfc3339(),
-            started_at: job.started_at.map(|dt| dt.to_rfc3339()),
-            completed_at: job.completed_at.map(|dt| dt.to_rfc3339()),
-            elapsed_secs,
-            project_dir: Some(job.project_dir.clone()),
-            browse_url: Some(format!("/projects/{}/", browse_id)),
-            job_mode: {
-                let mode = store.get_sandbox_job_mode(job.id).await.ok().flatten();
-                mode.filter(|m| m != "worker")
-            },
-            transitions,
-        }));
-    }
-
-    Err((StatusCode::NOT_FOUND, "Job not found".to_string()))
+    Ok(Json(JobDetailResponse {
+        id: job.id,
+        title: job.task.clone(),
+        description: String::new(),
+        state: ui_state.to_string(),
+        user_id: job.user_id.clone(),
+        created_at: job.created_at.to_rfc3339(),
+        started_at: job.started_at.map(|dt| dt.to_rfc3339()),
+        completed_at: job.completed_at.map(|dt| dt.to_rfc3339()),
+        elapsed_secs,
+        project_dir,
+        browse_url,
+        job_mode,
+        transitions,
+    }))
 }
 
 async fn jobs_cancel_handler(
@@ -1362,14 +1388,14 @@ async fn jobs_restart_handler(
     ))?;
     let jm = state.job_manager.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
-        "Sandbox not enabled".to_string(),
+        "Sandbox not enabled — cannot restart jobs without sandbox".to_string(),
     ))?;
 
     let old_job_id = Uuid::parse_str(&id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID".to_string()))?;
 
     let old_job = store
-        .get_sandbox_job(old_job_id)
+        .get_any_job(old_job_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Job not found".to_string()))?;
@@ -1454,6 +1480,109 @@ async fn jobs_restart_handler(
         "old_job_id": old_job_id,
         "new_job_id": new_job_id,
     })))
+}
+
+// --- Job CRUD handlers ---
+
+async fn jobs_delete_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let job_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID".to_string()))?;
+
+    let deleted = store
+        .delete_job(job_id, &state.user_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            "Job not found or not deletable".to_string(),
+        ))
+    }
+}
+
+async fn jobs_update_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateJobRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let job_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID".to_string()))?;
+
+    if let Some(title) = &body.title {
+        let updated = store
+            .update_job_title(job_id, &state.user_id, title)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        if !updated {
+            return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "updated",
+        "job_id": job_id,
+    })))
+}
+
+async fn jobs_create_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(body): Json<CreateJobRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    let msg_tx = state.msg_tx.read().await;
+    let tx = msg_tx.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Agent not connected".to_string(),
+    ))?;
+
+    let description = body.description.as_deref().unwrap_or("");
+    let content = if description.is_empty() {
+        body.title.clone()
+    } else {
+        format!("{}\n\n{}", body.title, description)
+    };
+
+    let msg = IncomingMessage {
+        id: Uuid::new_v4(),
+        channel: "web".to_string(),
+        user_id: state.user_id.clone(),
+        user_name: None,
+        content,
+        thread_id: None,
+        received_at: chrono::Utc::now(),
+        metadata: serde_json::json!({
+            "source": "jobs_create",
+            "title": body.title,
+        }),
+    };
+
+    tx.send(msg)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "status": "dispatched",
+            "message": "Job request sent to agent",
+        })),
+    ))
 }
 
 // --- Claude Code prompt and events handlers ---

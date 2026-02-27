@@ -315,6 +315,17 @@ pub struct JobDetailResponse {
     pub transitions: Vec<TransitionInfo>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CreateJobRequest {
+    pub title: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateJobRequest {
+    pub title: Option<String>,
+}
+
 // --- Project Files ---
 
 #[derive(Debug, Serialize)]

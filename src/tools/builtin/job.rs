@@ -6,6 +6,7 @@
 //! - Check job status
 //! - Cancel running jobs
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -761,11 +762,15 @@ impl Tool for CreateJobTool {
 /// Tool for listing jobs.
 pub struct ListJobsTool {
     context_manager: Arc<ContextManager>,
+    store: Option<Arc<dyn Database>>,
 }
 
 impl ListJobsTool {
-    pub fn new(context_manager: Arc<ContextManager>) -> Self {
-        Self { context_manager }
+    pub fn new(context_manager: Arc<ContextManager>, store: Option<Arc<dyn Database>>) -> Self {
+        Self {
+            context_manager,
+            store,
+        }
     }
 }
 
@@ -809,22 +814,53 @@ impl Tool for ListJobsTool {
             _ => self.context_manager.all_jobs_for(&ctx.user_id).await,
         };
 
+        let mut seen_ids: HashSet<Uuid> = HashSet::new();
         let mut jobs = Vec::new();
         for job_id in job_ids {
-            if let Ok(ctx) = self.context_manager.get_context(job_id).await {
+            if let Ok(job_ctx) = self.context_manager.get_context(job_id).await {
                 let include = match filter {
-                    "completed" => ctx.state == JobState::Completed,
-                    "failed" => ctx.state == JobState::Failed,
-                    "active" => ctx.state.is_active(),
+                    "completed" => job_ctx.state == JobState::Completed,
+                    "failed" => job_ctx.state == JobState::Failed,
+                    "active" => job_ctx.state.is_active(),
                     _ => true,
                 };
 
                 if include {
+                    seen_ids.insert(job_id);
                     jobs.push(serde_json::json!({
                         "job_id": job_id.to_string(),
-                        "title": ctx.title,
-                        "status": format!("{:?}", ctx.state),
-                        "created_at": ctx.created_at.to_rfc3339()
+                        "title": job_ctx.title,
+                        "status": format!("{:?}", job_ctx.state),
+                        "created_at": job_ctx.created_at.to_rfc3339()
+                    }));
+                }
+            }
+        }
+
+        // Merge in DB jobs that are not already in the in-memory set.
+        if let Some(store) = &self.store
+            && let Ok(db_jobs) = store.list_all_jobs_for_user(&ctx.user_id).await
+        {
+            for rec in db_jobs {
+                if seen_ids.contains(&rec.id) {
+                    continue;
+                }
+
+                let status = map_sandbox_status(&rec.status);
+                let include = match filter {
+                    "completed" => status == "Completed",
+                    "failed" => status == "Failed",
+                    "active" => status == "Pending" || status == "InProgress",
+                    _ => true,
+                };
+
+                if include {
+                    seen_ids.insert(rec.id);
+                    jobs.push(serde_json::json!({
+                        "job_id": rec.id.to_string(),
+                        "title": rec.task,
+                        "status": status,
+                        "created_at": rec.created_at.to_rfc3339()
                     }));
                 }
             }
@@ -854,11 +890,15 @@ impl Tool for ListJobsTool {
 /// Tool for checking job status.
 pub struct JobStatusTool {
     context_manager: Arc<ContextManager>,
+    store: Option<Arc<dyn Database>>,
 }
 
 impl JobStatusTool {
-    pub fn new(context_manager: Arc<ContextManager>) -> Self {
-        Self { context_manager }
+    pub fn new(context_manager: Arc<ContextManager>, store: Option<Arc<dyn Database>>) -> Self {
+        Self {
+            context_manager,
+            store,
+        }
     }
 }
 
@@ -916,9 +956,51 @@ impl Tool for JobStatusTool {
                 });
                 Ok(ToolOutput::success(result, start.elapsed()))
             }
-            Err(e) => {
+            Err(_) => {
+                // Fall back to database lookup. Try parsing job_id as a full
+                // UUID for DB lookup (prefix matching against the DB would be
+                // expensive).
+                if let Some(store) = &self.store
+                    && let Ok(parsed_id) = Uuid::parse_str(job_id_str)
+                {
+                    // Try SandboxStore first (simpler record).
+                    if let Ok(Some(rec)) = store.get_sandbox_job(parsed_id).await
+                        && rec.user_id == requester_id
+                    {
+                        let result = serde_json::json!({
+                            "job_id": rec.id.to_string(),
+                            "title": rec.task,
+                            "status": map_sandbox_status(&rec.status),
+                            "created_at": rec.created_at.to_rfc3339(),
+                            "started_at": rec.started_at.map(|t| t.to_rfc3339()),
+                            "completed_at": rec.completed_at.map(|t| t.to_rfc3339()),
+                            "failure_reason": rec.failure_reason,
+                            "source": "database"
+                        });
+                        return Ok(ToolOutput::success(result, start.elapsed()));
+                    }
+
+                    // Try JobStore (richer record with cost info).
+                    if let Ok(Some(job_ctx)) = store.get_job(parsed_id).await
+                        && job_ctx.user_id == requester_id
+                    {
+                        let result = serde_json::json!({
+                            "job_id": parsed_id.to_string(),
+                            "title": job_ctx.title,
+                            "description": job_ctx.description,
+                            "status": format!("{:?}", job_ctx.state),
+                            "created_at": job_ctx.created_at.to_rfc3339(),
+                            "started_at": job_ctx.started_at.map(|t| t.to_rfc3339()),
+                            "completed_at": job_ctx.completed_at.map(|t| t.to_rfc3339()),
+                            "actual_cost": job_ctx.actual_cost.to_string(),
+                            "source": "database"
+                        });
+                        return Ok(ToolOutput::success(result, start.elapsed()));
+                    }
+                }
+
                 let result = serde_json::json!({
-                    "error": format!("Job not found: {}", e)
+                    "error": "Job not found"
                 });
                 Ok(ToolOutput::success(result, start.elapsed()))
             }
@@ -1281,6 +1363,122 @@ impl Tool for JobPromptTool {
     }
 }
 
+/// Map a sandbox job status string from the DB to a display-friendly state name
+/// that matches the `JobState` debug format used by in-memory jobs.
+fn map_sandbox_status(status: &str) -> &'static str {
+    match status {
+        "creating" => "Pending",
+        "running" => "InProgress",
+        "completed" => "Completed",
+        "failed" => "Failed",
+        "interrupted" => "Failed",
+        _ => "Unknown",
+    }
+}
+
+/// Tool for deleting a completed, failed, or cancelled job from the database.
+pub struct DeleteJobTool {
+    store: Arc<dyn Database>,
+    context_manager: Arc<ContextManager>,
+}
+
+impl DeleteJobTool {
+    pub fn new(store: Arc<dyn Database>, context_manager: Arc<ContextManager>) -> Self {
+        Self {
+            store,
+            context_manager,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for DeleteJobTool {
+    fn name(&self) -> &str {
+        "delete_job"
+    }
+
+    fn description(&self) -> &str {
+        "Delete a completed, failed, or cancelled job from the database. Only terminal-state jobs can be deleted."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "job_id": {
+                    "type": "string",
+                    "description": "The job ID (full UUID) of the job to delete"
+                }
+            },
+            "required": ["job_id"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: &JobContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let start = std::time::Instant::now();
+
+        let job_id_str = require_str(&params, "job_id")?;
+        let job_id = resolve_job_id(job_id_str, &self.context_manager).await?;
+
+        // Verify the job belongs to the requesting user before deleting.
+        let belongs = self
+            .store
+            .sandbox_job_belongs_to_user(job_id, &ctx.user_id)
+            .await
+            .map_err(|e| {
+                ToolError::ExecutionFailed(format!("failed to verify job ownership: {}", e))
+            })?;
+
+        if !belongs {
+            // Also check the JobStore in case it's a non-sandbox job.
+            let owned_via_job_store = match self.store.get_job(job_id).await {
+                Ok(Some(job_ctx)) => job_ctx.user_id == ctx.user_id,
+                _ => false,
+            };
+
+            if !owned_via_job_store {
+                let result = serde_json::json!({
+                    "error": "Job not found or does not belong to current user"
+                });
+                return Ok(ToolOutput::success(result, start.elapsed()));
+            }
+        }
+
+        let deleted = self
+            .store
+            .delete_job(job_id, &ctx.user_id)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("failed to delete job: {}", e)))?;
+
+        if deleted {
+            let result = serde_json::json!({
+                "job_id": job_id.to_string(),
+                "status": "deleted",
+                "message": "Job deleted successfully"
+            });
+            Ok(ToolOutput::success(result, start.elapsed()))
+        } else {
+            let result = serde_json::json!({
+                "job_id": job_id.to_string(),
+                "error": "Job could not be deleted. Only terminal-state jobs (completed, failed, cancelled) can be deleted."
+            });
+            Ok(ToolOutput::success(result, start.elapsed()))
+        }
+    }
+
+    fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+        ApprovalRequirement::Always
+    }
+
+    fn requires_sanitization(&self) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1340,7 +1538,7 @@ mod tests {
         manager.create_job("Job 1", "Desc 1").await.unwrap();
         manager.create_job("Job 2", "Desc 2").await.unwrap();
 
-        let tool = ListJobsTool::new(manager);
+        let tool = ListJobsTool::new(manager, None);
 
         let params = serde_json::json!({});
         let ctx = JobContext::default();
@@ -1355,7 +1553,7 @@ mod tests {
         let manager = Arc::new(ContextManager::new(5));
         let job_id = manager.create_job("Test Job", "Description").await.unwrap();
 
-        let tool = JobStatusTool::new(manager);
+        let tool = JobStatusTool::new(manager, None);
 
         let params = serde_json::json!({
             "job_id": job_id.to_string()

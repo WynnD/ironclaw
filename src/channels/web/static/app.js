@@ -2412,7 +2412,10 @@ function loadJobs() {
   const container = document.querySelector('.jobs-container');
   if (!document.getElementById('jobs-summary')) {
     container.innerHTML =
-      '<div class="jobs-summary" id="jobs-summary"></div>'
+      '<div class="jobs-header">'
+      + '<div class="jobs-summary" id="jobs-summary"></div>'
+      + '<button class="btn-save" id="btn-new-job" onclick="openCreateJobModal()">+ New Job</button>'
+      + '</div>'
       + '<table class="jobs-table" id="jobs-table"><thead><tr>'
       + '<th>ID</th><th>Title</th><th>Status</th><th>Created</th><th>Actions</th>'
       + '</tr></thead><tbody id="jobs-tbody"></tbody></table>'
@@ -2465,6 +2468,9 @@ function renderJobsList(jobs) {
     } else if (job.state === 'failed' || job.state === 'interrupted') {
       actionBtns = '<button class="btn-restart" onclick="event.stopPropagation(); restartJob(\'' + job.id + '\')">Restart</button>';
     }
+    if (['completed', 'failed', 'interrupted', 'cancelled', 'Completed', 'Failed', 'Cancelled'].indexOf(job.state) !== -1) {
+      actionBtns += '<button class="btn-cancel btn-delete" onclick="event.stopPropagation(); deleteJob(\'' + job.id + '\')">Delete</button>';
+    }
 
     return '<tr class="job-row" onclick="openJobDetail(\'' + job.id + '\')">'
       + '<td title="' + escapeHtml(job.id) + '">' + shortId + '</td>'
@@ -2500,6 +2506,108 @@ function restartJob(jobId) {
     });
 }
 
+function deleteJob(jobId) {
+  if (!confirm('Delete this job? This cannot be undone.')) return;
+  apiFetchNoContent('/api/jobs/' + jobId, { method: 'DELETE' })
+    .then(() => {
+      showToast('Job deleted', 'success');
+      if (currentJobId === jobId) closeJobDetail();
+      else loadJobs();
+    })
+    .catch((err) => {
+      showToast('Failed to delete job: ' + err.message, 'error');
+    });
+}
+
+function openCreateJobModal() {
+  closeConfigureModal();
+  const overlay = document.createElement('div');
+  overlay.className = 'configure-overlay';
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) overlay.remove();
+  });
+
+  const modal = document.createElement('div');
+  modal.className = 'configure-modal';
+
+  modal.innerHTML = '<h3>New Job</h3>'
+    + '<div class="configure-form">'
+    + '<div class="configure-field"><label>Title</label>'
+    + '<input type="text" id="new-job-title" placeholder="Job title"></div>'
+    + '<div class="configure-field"><label>Description (optional)</label>'
+    + '<textarea id="new-job-desc" rows="4" placeholder="Describe what needs to be done"></textarea></div>'
+    + '</div>'
+    + '<div class="configure-actions">'
+    + '<button class="btn-cancel" id="new-job-cancel">Cancel</button>'
+    + '<button class="btn-save" id="new-job-submit">Create</button>'
+    + '</div>';
+
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  document.getElementById('new-job-cancel').addEventListener('click', () => overlay.remove());
+  document.getElementById('new-job-submit').addEventListener('click', () => {
+    const title = document.getElementById('new-job-title').value.trim();
+    if (!title) { showToast('Title is required', 'error'); return; }
+    const desc = document.getElementById('new-job-desc').value.trim();
+    apiFetch('/api/jobs', {
+      method: 'POST',
+      body: { title: title, description: desc || null }
+    }).then(() => {
+      showToast('Job dispatched', 'success');
+      overlay.remove();
+      loadJobs();
+    }).catch((err) => {
+      showToast('Failed to create job: ' + err.message, 'error');
+    });
+  });
+
+  document.getElementById('new-job-title').focus();
+}
+
+function editJobTitle(jobId, currentTitle) {
+  closeConfigureModal();
+  const overlay = document.createElement('div');
+  overlay.className = 'configure-overlay';
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) overlay.remove();
+  });
+
+  const modal = document.createElement('div');
+  modal.className = 'configure-modal';
+
+  modal.innerHTML = '<h3>Edit Job Title</h3>'
+    + '<div class="configure-form">'
+    + '<div class="configure-field"><label>Title</label>'
+    + '<input type="text" id="edit-job-title" value="' + escapeHtml(currentTitle) + '"></div>'
+    + '</div>'
+    + '<div class="configure-actions">'
+    + '<button class="btn-cancel" id="edit-title-cancel">Cancel</button>'
+    + '<button class="btn-save" id="edit-title-submit">Save</button>'
+    + '</div>';
+
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  document.getElementById('edit-title-cancel').addEventListener('click', () => overlay.remove());
+  document.getElementById('edit-title-submit').addEventListener('click', () => {
+    const title = document.getElementById('edit-job-title').value.trim();
+    if (!title) { showToast('Title is required', 'error'); return; }
+    apiFetch('/api/jobs/' + jobId, {
+      method: 'PUT',
+      body: { title: title }
+    }).then(() => {
+      showToast('Title updated', 'success');
+      overlay.remove();
+      openJobDetail(jobId);
+    }).catch((err) => {
+      showToast('Failed to update title: ' + err.message, 'error');
+    });
+  });
+
+  document.getElementById('edit-job-title').focus();
+}
+
 function openJobDetail(jobId) {
   currentJobId = jobId;
   currentJobSubTab = 'activity';
@@ -2529,6 +2637,7 @@ function renderJobDetail(job) {
 
   let headerHtml = '<button class="btn-back" onclick="closeJobDetail()">&larr; Back</button>'
     + '<h2>' + escapeHtml(job.title) + '</h2>'
+    + '<button class="btn-edit-title" onclick="editJobTitle(\'' + job.id + '\', \'' + escapeHtml(job.title).replace(/'/g, "\\'") + '\')" title="Edit title">&#9998;</button>'
     + '<span class="badge ' + stateClass + '">' + escapeHtml(job.state) + '</span>';
 
   if (job.state === 'failed' || job.state === 'interrupted') {

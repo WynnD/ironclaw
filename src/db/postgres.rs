@@ -361,6 +361,23 @@ impl SandboxStore for PgBackend {
     ) -> Result<Vec<JobEventRecord>, DatabaseError> {
         self.store.list_job_events(job_id, limit).await
     }
+
+    async fn get_any_job(&self, id: Uuid) -> Result<Option<SandboxJobRecord>, DatabaseError> {
+        self.store.get_any_job(id).await
+    }
+
+    async fn delete_job(&self, id: Uuid, user_id: &str) -> Result<bool, DatabaseError> {
+        self.store.delete_job(id, user_id).await
+    }
+
+    async fn update_job_title(
+        &self,
+        id: Uuid,
+        user_id: &str,
+        title: &str,
+    ) -> Result<bool, DatabaseError> {
+        self.store.update_job_title(id, user_id, title).await
+    }
 }
 
 // ==================== RoutineStore ====================

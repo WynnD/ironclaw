@@ -16,11 +16,11 @@ use crate::skills::catalog::SkillCatalog;
 use crate::skills::registry::SkillRegistry;
 use crate::tools::builder::{BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder};
 use crate::tools::builtin::{
-    ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, HttpTool, JobEventsTool, JobPromptTool,
-    JobStatusTool, JsonTool, ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool,
-    MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool, ShellTool, SkillInstallTool,
-    SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool, ToolActivateTool, ToolAuthTool,
-    ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool, WriteFileTool,
+    ApplyPatchTool, CancelJobTool, CreateJobTool, DeleteJobTool, EchoTool, HttpTool, JobEventsTool,
+    JobPromptTool, JobStatusTool, JsonTool, ListDirTool, ListJobsTool, MemoryReadTool,
+    MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool, ShellTool,
+    SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool, ToolActivateTool,
+    ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool, WriteFileTool,
 };
 use crate::tools::rate_limiter::RateLimiter;
 use crate::tools::tool::{Tool, ToolDomain};
@@ -311,17 +311,29 @@ impl ToolRegistry {
             create_tool = create_tool.with_secrets(secrets);
         }
         self.register_sync(Arc::new(create_tool));
-        self.register_sync(Arc::new(ListJobsTool::new(Arc::clone(&context_manager))));
-        self.register_sync(Arc::new(JobStatusTool::new(Arc::clone(&context_manager))));
+        self.register_sync(Arc::new(ListJobsTool::new(
+            Arc::clone(&context_manager),
+            store.clone(),
+        )));
+        self.register_sync(Arc::new(JobStatusTool::new(
+            Arc::clone(&context_manager),
+            store.clone(),
+        )));
         self.register_sync(Arc::new(CancelJobTool::new(Arc::clone(&context_manager))));
 
         // Base tools: create, list, status, cancel
         let mut job_tool_count = 4;
 
-        // Register event reader if store is available
+        // Register event reader and delete tool if store is available
         if let Some(store) = store {
             self.register_sync(Arc::new(JobEventsTool::new(
-                store,
+                Arc::clone(&store),
+                Arc::clone(&context_manager),
+            )));
+            job_tool_count += 1;
+
+            self.register_sync(Arc::new(DeleteJobTool::new(
+                Arc::clone(&store),
                 Arc::clone(&context_manager),
             )));
             job_tool_count += 1;

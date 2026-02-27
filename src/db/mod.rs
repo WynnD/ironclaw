@@ -245,6 +245,17 @@ pub trait SandboxStore: Send + Sync {
         job_id: Uuid,
         limit: Option<i64>,
     ) -> Result<Vec<JobEventRecord>, DatabaseError>;
+    /// Get any job by ID regardless of source (sandbox, direct, etc.).
+    async fn get_any_job(&self, id: Uuid) -> Result<Option<SandboxJobRecord>, DatabaseError>;
+    /// Delete a job and its events. Only terminal-state jobs can be deleted.
+    async fn delete_job(&self, id: Uuid, user_id: &str) -> Result<bool, DatabaseError>;
+    /// Update a job's title.
+    async fn update_job_title(
+        &self,
+        id: Uuid,
+        user_id: &str,
+        title: &str,
+    ) -> Result<bool, DatabaseError>;
 }
 
 #[async_trait]

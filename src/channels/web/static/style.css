@@ -1420,6 +1420,60 @@ body {
 }
 
 /* Job Detail View */
+.jobs-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  margin-bottom: 0;
+}
+.jobs-header .jobs-summary {
+  flex: 1;
+}
+.jobs-header .btn-save {
+  margin-top: 4px;
+  white-space: nowrap;
+}
+
+.btn-delete {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+.btn-delete:hover {
+  background: var(--danger);
+  color: #fff;
+}
+
+.btn-edit-title {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 14px;
+  transition: color 0.2s, border-color 0.2s;
+}
+.btn-edit-title:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.configure-form textarea {
+  width: 100%;
+  padding: 8px 12px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+}
+.configure-form textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
 .job-detail-header {
   display: flex;
   align-items: center;
