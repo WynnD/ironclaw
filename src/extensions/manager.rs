@@ -139,6 +139,15 @@ impl ExtensionManager {
         }
     }
 
+    /// Seed pre-loaded MCP clients from startup into the extension manager so
+    /// they appear as active in the UI and can be deactivated/managed.
+    pub async fn seed_mcp_clients(&self, clients: Vec<(String, Arc<McpClient>)>) {
+        let mut map = self.mcp_clients.write().await;
+        for (name, client) in clients {
+            map.insert(name, client);
+        }
+    }
+
     /// Configure the channel runtime infrastructure for hot-activating WASM channels.
     ///
     /// Call after construction (and after wrapping in `Arc`) once the channel

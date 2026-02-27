@@ -506,6 +506,8 @@ impl AppBuilder {
             let tools = Arc::clone(tools);
             let mcp_sm = Arc::clone(&mcp_session_manager);
             async move {
+                let mut startup_clients: Vec<(String, Arc<McpClient>)> = Vec::new();
+
                 let servers_result = if let Some(ref d) = db {
                     load_mcp_servers_from_db(d.as_ref(), &app_user_id).await
                 } else {
@@ -547,7 +549,7 @@ impl AppBuilder {
                                          secrets store is available (is SECRETS_MASTER_KEY set?)",
                                         server_name
                                     );
-                                    return;
+                                    return None;
                                 } else {
                                     McpClient::new_with_name(&server_name, &server.url)
                                 };
@@ -565,6 +567,7 @@ impl AppBuilder {
                                                     tool_count,
                                                     server_name
                                                 );
+                                                Some((server_name, Arc::new(client)))
                                             }
                                             Err(e) => {
                                                 tracing::warn!(
@@ -572,6 +575,7 @@ impl AppBuilder {
                                                     server_name,
                                                     e
                                                 );
+                                                None
                                             }
                                         }
                                     }
@@ -593,14 +597,19 @@ impl AppBuilder {
                                                 e
                                             );
                                         }
+                                        None
                                     }
                                 }
                             });
                         }
 
                         while let Some(result) = join_set.join_next().await {
-                            if let Err(e) = result {
-                                tracing::warn!("MCP server loading task panicked: {}", e);
+                            match result {
+                                Ok(Some(entry)) => startup_clients.push(entry),
+                                Ok(None) => {}
+                                Err(e) => {
+                                    tracing::warn!("MCP server loading task panicked: {}", e);
+                                }
                             }
                         }
                     }
@@ -608,10 +617,13 @@ impl AppBuilder {
                         tracing::debug!("No MCP servers configured ({})", e);
                     }
                 }
+
+                startup_clients
             }
         };
 
-        let (dev_loaded_tool_names, _) = tokio::join!(wasm_tools_future, mcp_servers_future);
+        let (dev_loaded_tool_names, startup_mcp_clients) =
+            tokio::join!(wasm_tools_future, mcp_servers_future);
 
         // Load registry catalog entries for extension discovery
         let catalog_entries = match crate::registry::RegistryCatalog::load_or_embedded() {
@@ -661,6 +673,11 @@ impl AppBuilder {
                 self.db.clone(),
                 catalog_entries.clone(),
             ));
+            // Seed MCP clients that were loaded during startup so the
+            // extension manager knows they are active (UI, deactivate, etc.).
+            if !startup_mcp_clients.is_empty() {
+                manager.seed_mcp_clients(startup_mcp_clients).await;
+            }
             tools.register_extension_tools(Arc::clone(&manager));
             tracing::info!("Extension manager initialized with in-chat discovery tools");
             Some(manager)
