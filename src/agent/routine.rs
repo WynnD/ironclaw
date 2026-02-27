@@ -176,6 +176,12 @@ pub enum RoutineAction {
         /// Max reasoning iterations (default: 10).
         #[serde(default = "default_max_iterations")]
         max_iterations: u32,
+        /// Per-job allowlist for tools requiring `UnlessAutoApproved`.
+        #[serde(default)]
+        tool_allowlist: Vec<String>,
+        /// Per-job denylist that overrides allowlist/global approvals.
+        #[serde(default)]
+        tool_denylist: Vec<String>,
     },
 }
 
@@ -249,10 +255,30 @@ impl RoutineAction {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(default_max_iterations() as u64)
                     as u32;
+                let tool_allowlist = config
+                    .get("tool_allowlist")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let tool_denylist = config
+                    .get("tool_denylist")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 Ok(RoutineAction::FullJob {
                     title,
                     description,
                     max_iterations,
+                    tool_allowlist,
+                    tool_denylist,
                 })
             }
             other => Err(RoutineError::UnknownActionType {
@@ -277,10 +303,14 @@ impl RoutineAction {
                 title,
                 description,
                 max_iterations,
+                tool_allowlist,
+                tool_denylist,
             } => serde_json::json!({
                 "title": title,
                 "description": description,
                 "max_iterations": max_iterations,
+                "tool_allowlist": tool_allowlist,
+                "tool_denylist": tool_denylist,
             }),
         }
     }
@@ -476,12 +506,17 @@ mod tests {
             title: "Deploy review".to_string(),
             description: "Review and deploy pending changes".to_string(),
             max_iterations: 5,
+            tool_allowlist: vec!["shell".to_string(), "http".to_string()],
+            tool_denylist: vec!["extension_install".to_string()],
         };
         let json = action.to_config_json();
         let parsed = RoutineAction::from_db("full_job", json).expect("parse full_job");
         assert!(
-            matches!(parsed, RoutineAction::FullJob { title, max_iterations, .. }
-            if title == "Deploy review" && max_iterations == 5)
+            matches!(parsed, RoutineAction::FullJob { title, max_iterations, tool_allowlist, tool_denylist, .. }
+            if title == "Deploy review"
+                && max_iterations == 5
+                && tool_allowlist == vec!["shell".to_string(), "http".to_string()]
+                && tool_denylist == vec!["extension_install".to_string()])
         );
     }
 

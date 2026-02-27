@@ -1,5 +1,6 @@
 //! Per-job worker execution.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +46,81 @@ pub struct Worker {
 /// Result of a tool execution with metadata for context building.
 struct ToolExecResult {
     result: Result<String, Error>,
+}
+
+const AUTO_APPROVED_TOOLS_SETTING_KEY: &str = "agent.auto_approved_tools";
+const GLOBAL_TOOL_ALLOWLIST_META_KEY: &str = "_global_tool_allowlist";
+const PER_JOB_TOOL_ALLOWLIST_META_KEY: &str = "tool_allowlist";
+const PER_JOB_TOOL_DENYLIST_META_KEY: &str = "tool_denylist";
+
+fn parse_tool_list(value: &serde_json::Value) -> HashSet<String> {
+    let Some(items) = value.as_array() else {
+        return HashSet::new();
+    };
+
+    items
+        .iter()
+        .filter_map(|item| item.as_str().map(str::trim))
+        .filter(|name| !name.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn metadata_tool_list(
+    metadata: &serde_json::Value,
+    key: &str,
+    nested_key: &str,
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+
+    if let Some(value) = metadata.get(key) {
+        out.extend(parse_tool_list(value));
+    }
+
+    if let Some(value) = metadata
+        .get("tool_permissions")
+        .and_then(|perms| perms.get(nested_key))
+    {
+        out.extend(parse_tool_list(value));
+    }
+
+    out
+}
+
+async fn global_auto_approved_tools(
+    deps: &WorkerDeps,
+    job_ctx: &crate::context::JobContext,
+) -> HashSet<String> {
+    // Prefer metadata if the dispatcher/scheduler already injected it.
+    let from_metadata = metadata_tool_list(
+        &job_ctx.metadata,
+        GLOBAL_TOOL_ALLOWLIST_META_KEY,
+        "global_allow",
+    );
+    if !from_metadata.is_empty() {
+        return from_metadata;
+    }
+
+    let Some(store) = deps.store.as_ref() else {
+        return HashSet::new();
+    };
+
+    match store
+        .get_setting(&job_ctx.user_id, AUTO_APPROVED_TOOLS_SETTING_KEY)
+        .await
+    {
+        Ok(Some(value)) => parse_tool_list(&value),
+        Ok(None) => HashSet::new(),
+        Err(e) => {
+            tracing::debug!(
+                user_id = %job_ctx.user_id,
+                key = AUTO_APPROVED_TOOLS_SETTING_KEY,
+                "Failed to load global auto-approved tools for worker: {}",
+                e
+            );
+            HashSet::new()
+        }
+    }
 }
 
 impl Worker {
@@ -480,16 +556,45 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     name: tool_name.to_string(),
                 })?;
 
-        // Tools requiring approval are blocked in autonomous jobs
-        if tool.requires_approval(params).is_required() {
-            return Err(crate::error::ToolError::AuthRequired {
-                name: tool_name.to_string(),
-            }
-            .into());
-        }
-
-        // Fetch job context early so we have the real user_id for hooks and rate limiting
+        // Fetch job context early so we have the real user_id for approval checks,
+        // hooks, and rate limiting.
         let job_ctx = deps.context_manager.get_context(job_id).await?;
+
+        // Approval policy for autonomous jobs:
+        // - Never: always allowed
+        // - Always: always blocked (requires interactive human approval)
+        // - UnlessAutoApproved: allowed only when globally or per-job allowlisted
+        use crate::tools::ApprovalRequirement;
+        match tool.requires_approval(params) {
+            ApprovalRequirement::Never => {}
+            ApprovalRequirement::Always => {
+                return Err(crate::error::ToolError::AuthRequired {
+                    name: tool_name.to_string(),
+                }
+                .into());
+            }
+            ApprovalRequirement::UnlessAutoApproved => {
+                let per_job_deny =
+                    metadata_tool_list(&job_ctx.metadata, PER_JOB_TOOL_DENYLIST_META_KEY, "deny");
+                if per_job_deny.contains(tool_name) {
+                    return Err(crate::error::ToolError::AuthRequired {
+                        name: tool_name.to_string(),
+                    }
+                    .into());
+                }
+
+                let per_job_allow =
+                    metadata_tool_list(&job_ctx.metadata, PER_JOB_TOOL_ALLOWLIST_META_KEY, "allow");
+                let global_allow = global_auto_approved_tools(deps, &job_ctx).await;
+
+                if !per_job_allow.contains(tool_name) && !global_allow.contains(tool_name) {
+                    return Err(crate::error::ToolError::AuthRequired {
+                        name: tool_name.to_string(),
+                    }
+                    .into());
+                }
+            }
+        }
 
         // Check per-tool rate limit before running hooks or executing (cheaper check first)
         if let Some(config) = tool.rate_limit_config()
@@ -1267,5 +1372,32 @@ mod tests {
             results[0].result.is_err(),
             "Missing tool should produce an error, not a panic"
         );
+    }
+
+    #[test]
+    fn test_parse_tool_list_filters_invalid_entries() {
+        let value = serde_json::json!(["shell", "", "  ", "http", 42, null]);
+        let parsed = parse_tool_list(&value);
+        assert!(parsed.contains("shell"));
+        assert!(parsed.contains("http"));
+        assert_eq!(parsed.len(), 2);
+
+        let not_array = parse_tool_list(&serde_json::json!({"tool": "shell"}));
+        assert!(not_array.is_empty());
+    }
+
+    #[test]
+    fn test_metadata_tool_list_reads_root_and_nested() {
+        let metadata = serde_json::json!({
+            "tool_allowlist": ["shell"],
+            "tool_permissions": {
+                "allow": ["http"]
+            }
+        });
+
+        let parsed = metadata_tool_list(&metadata, "tool_allowlist", "allow");
+        assert!(parsed.contains("shell"));
+        assert!(parsed.contains("http"));
+        assert_eq!(parsed.len(), 2);
     }
 }

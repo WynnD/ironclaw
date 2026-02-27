@@ -106,6 +106,42 @@ fn parse_schedule_param(value: &serde_json::Value) -> Result<String, ToolError> 
     }
 }
 
+fn parse_string_array_param(
+    params: &serde_json::Value,
+    key: &str,
+) -> Result<Option<Vec<String>>, ToolError> {
+    let Some(value) = params.get(key) else {
+        return Ok(None);
+    };
+
+    let Some(items) = value.as_array() else {
+        return Err(ToolError::InvalidParameters(format!(
+            "'{}' must be an array of strings",
+            key
+        )));
+    };
+
+    let mut out = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        let Some(name) = item.as_str() else {
+            return Err(ToolError::InvalidParameters(format!(
+                "'{}' index {} must be a string",
+                key, idx
+            )));
+        };
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(ToolError::InvalidParameters(format!(
+                "'{}' index {} cannot be empty",
+                key, idx
+            )));
+        }
+        out.push(trimmed.to_string());
+    }
+
+    Ok(Some(out))
+}
+
 // ==================== routine_create ====================
 
 pub struct RoutineCreateTool {
@@ -173,6 +209,20 @@ impl Tool for RoutineCreateTool {
                     "type": "string",
                     "enum": ["lightweight", "full_job"],
                     "description": "Execution mode: 'lightweight' (single LLM call, default) or 'full_job' (multi-turn with tools)"
+                },
+                "max_iterations": {
+                    "type": "integer",
+                    "description": "Maximum iterations for full_job routines (default: 10)"
+                },
+                "tool_allowlist": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Per-job allowlist for approval-gated tools on full_job routines"
+                },
+                "tool_denylist": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Per-job denylist that overrides allowlist/global approvals on full_job routines"
                 },
                 "cooldown_secs": {
                     "type": "integer",
@@ -302,11 +352,24 @@ impl Tool for RoutineCreateTool {
                 context_paths,
                 max_tokens: 4096,
             },
-            "full_job" => RoutineAction::FullJob {
-                title: name.to_string(),
-                description: prompt.to_string(),
-                max_iterations: 10,
-            },
+            "full_job" => {
+                let max_iterations = params
+                    .get("max_iterations")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(10) as u32;
+                let tool_allowlist =
+                    parse_string_array_param(&params, "tool_allowlist")?.unwrap_or_default();
+                let tool_denylist =
+                    parse_string_array_param(&params, "tool_denylist")?.unwrap_or_default();
+
+                RoutineAction::FullJob {
+                    title: name.to_string(),
+                    description: prompt.to_string(),
+                    max_iterations,
+                    tool_allowlist,
+                    tool_denylist,
+                }
+            }
             other => {
                 return Err(ToolError::InvalidParameters(format!(
                     "unknown action_type: {other}"
@@ -496,6 +559,20 @@ impl Tool for RoutineUpdateTool {
                 "description": {
                     "type": "string",
                     "description": "New description"
+                },
+                "max_iterations": {
+                    "type": "integer",
+                    "description": "New max iterations for full_job routines"
+                },
+                "tool_allowlist": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "New per-job allowlist for full_job routines"
+                },
+                "tool_denylist": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "New per-job denylist for full_job routines"
                 }
             },
             "required": ["name"]
@@ -532,6 +609,33 @@ impl Tool for RoutineUpdateTool {
                 RoutineAction::Lightweight { prompt: p, .. } => *p = prompt.to_string(),
                 RoutineAction::FullJob { description: d, .. } => *d = prompt.to_string(),
             }
+        }
+
+        if let Some(max_iterations) = params.get("max_iterations").and_then(|v| v.as_u64())
+            && let RoutineAction::FullJob {
+                max_iterations: current,
+                ..
+            } = &mut routine.action
+        {
+            *current = max_iterations as u32;
+        }
+
+        if let Some(tool_allowlist) = parse_string_array_param(&params, "tool_allowlist")?
+            && let RoutineAction::FullJob {
+                tool_allowlist: current,
+                ..
+            } = &mut routine.action
+        {
+            *current = tool_allowlist;
+        }
+
+        if let Some(tool_denylist) = parse_string_array_param(&params, "tool_denylist")?
+            && let RoutineAction::FullJob {
+                tool_denylist: current,
+                ..
+            } = &mut routine.action
+        {
+            *current = tool_denylist;
         }
 
         if let Some(schedule) = params.get("schedule") {

@@ -342,7 +342,21 @@ async fn execute_routine(ctx: EngineContext, routine: Routine, run: RoutineRun) 
             title,
             description,
             max_iterations,
-        } => execute_full_job(&ctx, &routine, &run, title, description, *max_iterations).await,
+            tool_allowlist,
+            tool_denylist,
+        } => {
+            execute_full_job(
+                &ctx,
+                &routine,
+                &run,
+                title,
+                description,
+                *max_iterations,
+                tool_allowlist,
+                tool_denylist,
+            )
+            .await
+        }
     };
 
     // Decrement running count
@@ -433,6 +447,8 @@ async fn execute_full_job(
     title: &str,
     description: &str,
     max_iterations: u32,
+    tool_allowlist: &[String],
+    tool_denylist: &[String],
 ) -> Result<(RunStatus, Option<String>, Option<i32>), RoutineError> {
     let scheduler = ctx
         .scheduler
@@ -441,7 +457,11 @@ async fn execute_full_job(
             reason: "scheduler not available".to_string(),
         })?;
 
-    let metadata = serde_json::json!({ "max_iterations": max_iterations });
+    let metadata = serde_json::json!({
+        "max_iterations": max_iterations,
+        "tool_allowlist": tool_allowlist,
+        "tool_denylist": tool_denylist,
+    });
 
     let job_id = scheduler
         .dispatch_job(&routine.user_id, title, description, Some(metadata))
