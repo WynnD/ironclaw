@@ -20,6 +20,92 @@ use crate::context::JobContext;
 use crate::db::Database;
 use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
 
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn truncate_for_error(input: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in input.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn summarize_json(value: &serde_json::Value) -> String {
+    let rendered = value.to_string();
+    truncate_for_error(&rendered, 160)
+}
+
+fn params_key_list(params: &serde_json::Value) -> String {
+    if let Some(obj) = params.as_object() {
+        let mut keys: Vec<&str> = obj.keys().map(std::string::String::as_str).collect();
+        keys.sort_unstable();
+        if keys.is_empty() {
+            "<empty object>".to_string()
+        } else {
+            keys.join(", ")
+        }
+    } else {
+        format!("<non-object: {}>", json_type_name(params))
+    }
+}
+
+/// Accept either a cron string or a token array (e.g. ["0", "*/2", "*", "*", "*", "*"]).
+fn parse_schedule_param(value: &serde_json::Value) -> Result<String, ToolError> {
+    match value {
+        serde_json::Value::String(s) => {
+            if s.trim().is_empty() {
+                return Err(ToolError::InvalidParameters(
+                    "cron trigger requires non-empty 'schedule' string".to_string(),
+                ));
+            }
+            Ok(s.clone())
+        }
+        serde_json::Value::Array(parts) => {
+            if parts.is_empty() {
+                return Err(ToolError::InvalidParameters(
+                    "cron trigger requires non-empty 'schedule'; received []".to_string(),
+                ));
+            }
+
+            let mut tokens = Vec::with_capacity(parts.len());
+            for (idx, part) in parts.iter().enumerate() {
+                match part {
+                    serde_json::Value::String(s) => tokens.push(s.trim().to_string()),
+                    serde_json::Value::Number(n) => tokens.push(n.to_string()),
+                    other => {
+                        return Err(ToolError::InvalidParameters(format!(
+                            "cron schedule token at index {} must be string/number, got {} (value={})",
+                            idx,
+                            json_type_name(other),
+                            summarize_json(other)
+                        )));
+                    }
+                }
+            }
+
+            Ok(tokens.join(" "))
+        }
+        other => Err(ToolError::InvalidParameters(format!(
+            "cron trigger requires 'schedule' as string or array of tokens; got {} (value={})",
+            json_type_name(other),
+            summarize_json(other)
+        ))),
+    }
+}
+
 // ==================== routine_create ====================
 
 pub struct RoutineCreateTool {
@@ -118,22 +204,48 @@ impl Tool for RoutineCreateTool {
         // Build trigger
         let trigger = match trigger_type {
             "cron" => {
-                let schedule =
-                    params
-                        .get("schedule")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            ToolError::InvalidParameters(
-                                "cron trigger requires 'schedule'".to_string(),
-                            )
-                        })?;
-                // Validate cron expression
-                self.engine.next_cron_fire(schedule).map_err(|e| {
-                    ToolError::InvalidParameters(format!("invalid cron schedule: {e}"))
+                let Some(schedule_value) = params.get("schedule") else {
+                    let keys = params_key_list(&params);
+                    tracing::warn!(
+                        tool = "routine_create",
+                        trigger_type = "cron",
+                        keys = %keys,
+                        "Missing required cron schedule"
+                    );
+                    return Err(ToolError::InvalidParameters(format!(
+                        "cron trigger requires 'schedule'. Received keys: [{}]. Example: \
+                         schedule=\"0 */2 * * * *\" (6-field: sec min hour day month weekday)",
+                        keys
+                    )));
+                };
+
+                let schedule = parse_schedule_param(schedule_value).map_err(|e| {
+                    tracing::warn!(
+                        tool = "routine_create",
+                        trigger_type = "cron",
+                        schedule_raw = %summarize_json(schedule_value),
+                        error = %e,
+                        "Invalid cron schedule parameter"
+                    );
+                    e
                 })?;
-                Trigger::Cron {
-                    schedule: schedule.to_string(),
-                }
+                // Validate cron expression
+                self.engine.next_cron_fire(&schedule).map_err(|e| {
+                    tracing::warn!(
+                        tool = "routine_create",
+                        trigger_type = "cron",
+                        schedule = %schedule,
+                        error = %e,
+                        "Cron schedule validation failed"
+                    );
+                    ToolError::InvalidParameters(format!(
+                        "invalid cron schedule: {e}. Received schedule={:?}. \
+                         Expected 6-field cron: sec min hour day month weekday \
+                         (example: \"0 */2 * * * *\")",
+                        schedule
+                    ))
+                })?;
+                Trigger::Cron { schedule }
             }
             "event" => {
                 let pattern = params
@@ -422,16 +534,36 @@ impl Tool for RoutineUpdateTool {
             }
         }
 
-        if let Some(schedule) = params.get("schedule").and_then(|v| v.as_str()) {
+        if let Some(schedule) = params.get("schedule") {
+            let schedule = parse_schedule_param(schedule).map_err(|e| {
+                tracing::warn!(
+                    tool = "routine_update",
+                    schedule_raw = %summarize_json(schedule),
+                    error = %e,
+                    "Invalid routine_update schedule parameter"
+                );
+                e
+            })?;
             // Validate
-            self.engine
-                .next_cron_fire(schedule)
-                .map_err(|e| ToolError::InvalidParameters(format!("invalid cron schedule: {e}")))?;
+            self.engine.next_cron_fire(&schedule).map_err(|e| {
+                tracing::warn!(
+                    tool = "routine_update",
+                    schedule = %schedule,
+                    error = %e,
+                    "routine_update cron validation failed"
+                );
+                ToolError::InvalidParameters(format!(
+                    "invalid cron schedule for routine_update: {e}. Received schedule={:?}. \
+                         Expected 6-field cron: sec min hour day month weekday \
+                         (example: \"0 */2 * * * *\")",
+                    schedule
+                ))
+            })?;
 
             routine.trigger = Trigger::Cron {
-                schedule: schedule.to_string(),
+                schedule: schedule.clone(),
             };
-            routine.next_fire_at = self.engine.next_cron_fire(schedule).unwrap_or(None);
+            routine.next_fire_at = self.engine.next_cron_fire(&schedule).unwrap_or(None);
         }
 
         self.store
@@ -631,5 +763,32 @@ impl Tool for RoutineHistoryTool {
 
     fn requires_sanitization(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn parse_schedule_accepts_string() {
+        let value = serde_json::json!("0 */2 * * * *");
+        let parsed = crate::tools::builtin::routine::parse_schedule_param(&value)
+            .expect("string schedule should parse");
+        assert_eq!(parsed, "0 */2 * * * *");
+    }
+
+    #[test]
+    fn parse_schedule_accepts_token_array() {
+        let value = serde_json::json!(["0", "*/2", "*", "*", "*", "*"]);
+        let parsed = crate::tools::builtin::routine::parse_schedule_param(&value)
+            .expect("array schedule should parse");
+        assert_eq!(parsed, "0 */2 * * * *");
+    }
+
+    #[test]
+    fn parse_schedule_rejects_invalid_array_item_type() {
+        let value = serde_json::json!(["0", {"bad": "token"}]);
+        let err = crate::tools::builtin::routine::parse_schedule_param(&value)
+            .expect_err("object token should fail");
+        assert!(err.to_string().contains("must be string/number"));
     }
 }
