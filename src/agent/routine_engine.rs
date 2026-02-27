@@ -623,6 +623,7 @@ async fn send_notification(
     let response = OutgoingResponse {
         content: message,
         thread_id: None,
+        attachments: Vec::new(),
         metadata: serde_json::json!({
             "source": "routine",
             "routine_name": routine_name,
