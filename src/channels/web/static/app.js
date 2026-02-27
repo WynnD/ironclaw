@@ -1114,17 +1114,24 @@ function createNewThread() {
 
 function toggleThreadSidebar() {
   const sidebar = document.getElementById('thread-sidebar');
+  const btn = document.getElementById('thread-toggle-btn');
   const isMobile = window.matchMedia('(max-width: 768px)').matches;
   if (isMobile) {
     sidebar.classList.toggle('expanded-mobile');
-    const btn = document.getElementById('thread-toggle-btn');
-    btn.innerHTML = sidebar.classList.contains('expanded-mobile') ? '&laquo;' : '&raquo;';
+    btn.innerHTML = sidebar.classList.contains('expanded-mobile') ? '&times;' : '&#9776;';
   } else {
     sidebar.classList.toggle('collapsed');
-    const btn = document.getElementById('thread-toggle-btn');
     btn.innerHTML = sidebar.classList.contains('collapsed') ? '&raquo;' : '&laquo;';
   }
 }
+
+// Set correct sidebar toggle icon based on viewport
+(function initSidebarToggle() {
+  var btn = document.getElementById('thread-toggle-btn');
+  if (btn && window.matchMedia('(max-width: 768px)').matches) {
+    btn.innerHTML = '&#9776;';
+  }
+})();
 
 // Chat input auto-resize and keyboard handling
 const chatInput = document.getElementById('chat-input');
