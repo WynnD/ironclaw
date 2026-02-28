@@ -19,6 +19,8 @@ use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
 
 use std::collections::HashSet;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::LlmError;
 use crate::llm::costs;
@@ -152,28 +154,154 @@ fn prune_required_to_defined_properties(obj: &mut serde_json::Map<String, JsonVa
     }
 }
 
-fn should_use_strict_tool_schema(model_name: &str) -> bool {
+fn is_kimi_k2_5_model(model_name: &str) -> bool {
     let model = model_name.to_ascii_lowercase();
+    model.contains("kimi-k2.5")
+        || model.contains("kimi-k2p5")
+        || model.contains("kimi-k2-5")
+        || model.contains("moonshotai/kimi-k2.5")
+}
+
+fn should_use_strict_tool_schema(model_name: &str) -> bool {
     // Gemini (including OpenRouter `google/gemini-*` models) has stricter
     // function-schema validation and is not compatible with our OpenAI strict
     // rewrite in all cases. Keep the original schema shape for Gemini.
     //
     // Kimi K2.5 also rejects or mishandles strict schemas (all-required +
     // additionalProperties: false) — known issue with SGLang-based serving.
-    if model.contains("gemini") {
+    if model_name.to_ascii_lowercase().contains("gemini") {
         return false;
     }
-    if model.contains("kimi-k2.5") || model.contains("kimi-k2p5") || model.contains("kimi-k2-5") {
+    if is_kimi_k2_5_model(model_name) {
         return false;
     }
     true
+}
+
+fn truncate_chars(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    input.chars().take(max_chars).collect()
+}
+
+/// Kimi K2.5 is sensitive to broad JSON-Schema vocabularies on some
+/// OpenAI-compatible gateways. Keep a conservative subset.
+fn simplify_schema_kimi_compat(schema: &JsonValue) -> JsonValue {
+    simplify_schema_kimi_compat_inner(schema, 0)
+}
+
+fn simplify_schema_kimi_compat_inner(schema: &JsonValue, depth: usize) -> JsonValue {
+    // Prevent deep / recursive schemas from causing provider parser issues.
+    if depth > 8 {
+        return JsonValue::Object(serde_json::Map::from_iter([(
+            "type".to_string(),
+            JsonValue::String("object".to_string()),
+        )]));
+    }
+
+    let Some(obj) = schema.as_object() else {
+        return schema.clone();
+    };
+
+    let mut out = serde_json::Map::new();
+
+    if let Some(ty) = obj.get("type") {
+        out.insert("type".to_string(), ty.clone());
+    }
+
+    if let Some(description) = obj.get("description").and_then(|v| v.as_str())
+        && !description.trim().is_empty()
+    {
+        out.insert(
+            "description".to_string(),
+            JsonValue::String(truncate_chars(description.trim(), 256)),
+        );
+    }
+
+    if let Some(enum_values) = obj.get("enum").and_then(|v| v.as_array()) {
+        let mut values = Vec::new();
+        for value in enum_values.iter().take(64) {
+            if value.is_string() || value.is_number() || value.is_boolean() || value.is_null() {
+                values.push(value.clone());
+            }
+        }
+        if !values.is_empty() {
+            out.insert("enum".to_string(), JsonValue::Array(values));
+        }
+    }
+
+    if let Some(properties) = obj.get("properties").and_then(|v| v.as_object()) {
+        let mut simplified_properties = serde_json::Map::new();
+        for (name, value) in properties.iter().take(64) {
+            simplified_properties.insert(
+                name.clone(),
+                simplify_schema_kimi_compat_inner(value, depth + 1),
+            );
+        }
+        out.insert(
+            "properties".to_string(),
+            JsonValue::Object(simplified_properties),
+        );
+        out.entry("type".to_string())
+            .or_insert_with(|| JsonValue::String("object".to_string()));
+
+        if let Some(required) = obj.get("required").and_then(|v| v.as_array()) {
+            let allowed: HashSet<&str> = properties.keys().map(String::as_str).collect();
+            let filtered_required: Vec<JsonValue> = required
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter(|name| allowed.contains(*name))
+                .map(|name| JsonValue::String(name.to_string()))
+                .collect();
+            if !filtered_required.is_empty() {
+                out.insert("required".to_string(), JsonValue::Array(filtered_required));
+            }
+        }
+
+        // Keep object constraints simple for Kimi-compatible gateways.
+        out.insert("additionalProperties".to_string(), JsonValue::Bool(false));
+    }
+
+    if let Some(items) = obj.get("items") {
+        out.insert(
+            "items".to_string(),
+            simplify_schema_kimi_compat_inner(items, depth + 1),
+        );
+        out.entry("type".to_string())
+            .or_insert_with(|| JsonValue::String("array".to_string()));
+    }
+
+    JsonValue::Object(out)
 }
 
 fn normalize_tool_parameters_for_model(model_name: &str, schema: &JsonValue) -> JsonValue {
     if should_use_strict_tool_schema(model_name) {
         normalize_schema_strict(schema)
     } else {
-        normalize_schema_lenient(schema)
+        let lenient = normalize_schema_lenient(schema);
+        if is_kimi_k2_5_model(model_name) {
+            simplify_schema_kimi_compat(&lenient)
+        } else {
+            lenient
+        }
+    }
+}
+
+fn normalize_tool_description_for_model(model_name: &str, name: &str, description: &str) -> String {
+    if is_kimi_k2_5_model(model_name) {
+        let base = if description.trim().is_empty() {
+            name
+        } else {
+            description.trim()
+        };
+        return truncate_chars(base, 512);
+    }
+
+    if description.trim().is_empty() {
+        name.to_string()
+    } else {
+        description.to_string()
     }
 }
 
@@ -411,10 +539,69 @@ fn convert_tools(model_name: &str, tools: &[IronToolDefinition]) -> Vec<RigToolD
         .iter()
         .map(|t| RigToolDefinition {
             name: t.name.clone(),
-            description: t.description.clone(),
+            description: normalize_tool_description_for_model(
+                model_name,
+                t.name.as_str(),
+                t.description.as_str(),
+            ),
             parameters: normalize_tool_parameters_for_model(model_name, &t.parameters),
         })
         .collect()
+}
+
+fn is_server_error_retryable_for_kimi(error: &str) -> bool {
+    let e = error.to_ascii_lowercase();
+    e.contains("status code 500")
+        || e.contains("500 internal server error")
+        || e.contains("\"error\": \"internal server error\"")
+}
+
+fn kimi_reduced_tool_set(tools: &[IronToolDefinition]) -> Vec<IronToolDefinition> {
+    // Keep a small deterministic set first. `discover_tools` lets the model
+    // activate deferred tools later if needed.
+    const KIMI_TOOL_PRIORITY: &[&str] = &[
+        "discover_tools",
+        "time",
+        "read_file",
+        "write_file",
+        "list_dir",
+        "apply_patch",
+        "shell",
+        "http",
+        "memory_search",
+    ];
+
+    const KIMI_MAX_TOOLS: usize = 9;
+
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+
+    for preferred in KIMI_TOOL_PRIORITY {
+        if selected.len() >= KIMI_MAX_TOOLS {
+            break;
+        }
+        if let Some(tool) = tools.iter().find(|t| t.name == *preferred)
+            && seen.insert(tool.name.clone())
+        {
+            selected.push(tool.clone());
+        }
+    }
+
+    if selected.len() < KIMI_MAX_TOOLS {
+        let mut remainder: Vec<IronToolDefinition> = tools
+            .iter()
+            .filter(|t| !seen.contains(&t.name))
+            .cloned()
+            .collect();
+        remainder.sort_by(|a, b| a.name.cmp(&b.name));
+        selected.extend(
+            remainder
+                .into_iter()
+                .take(KIMI_MAX_TOOLS.saturating_sub(selected.len())),
+        );
+    }
+
+    selected
 }
 
 /// Convert IronClaw tool_choice string to rig-core ToolChoice.
@@ -505,6 +692,82 @@ fn build_rig_request(
     })
 }
 
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+fn payload_dump_path(kind: &str) -> PathBuf {
+    if let Ok(path) = std::env::var("IRONCLAW_RIG_PAYLOAD_DUMP_PATH")
+        && !path.trim().is_empty()
+    {
+        return PathBuf::from(path);
+    }
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    PathBuf::from(format!("/tmp/ironclaw_rig_payload_{kind}_{ts}.json"))
+}
+
+/// Dump the exact OpenAI-completions payload rig-core would send.
+///
+/// Enable with `IRONCLAW_RIG_PAYLOAD_DUMP=1`.
+/// Optional fixed output path: `IRONCLAW_RIG_PAYLOAD_DUMP_PATH=/tmp/rig_payload.json`.
+fn maybe_dump_openai_payload(model_name: &str, rig_req: &RigRequest, kind: &str) {
+    if !env_flag_enabled("IRONCLAW_RIG_PAYLOAD_DUMP") {
+        return;
+    }
+
+    let openai_req = match rig::providers::openai::completion::CompletionRequest::try_from((
+        model_name.to_string(),
+        rig_req.clone(),
+    )) {
+        Ok(req) => req,
+        Err(e) => {
+            tracing::warn!(
+                model = %model_name,
+                error = %e,
+                "Failed to convert rig request into OpenAI payload for debug dump"
+            );
+            return;
+        }
+    };
+
+    let payload = match serde_json::to_string_pretty(&openai_req) {
+        Ok(json) => json,
+        Err(e) => {
+            tracing::warn!(
+                model = %model_name,
+                error = %e,
+                "Failed to serialize OpenAI payload for debug dump"
+            );
+            return;
+        }
+    };
+
+    let path = payload_dump_path(kind);
+    match std::fs::write(&path, payload) {
+        Ok(_) => tracing::info!(
+            model = %model_name,
+            path = %path.display(),
+            "Wrote rig OpenAI payload debug dump",
+        ),
+        Err(e) => tracing::warn!(
+            model = %model_name,
+            path = %path.display(),
+            error = %e,
+            "Failed to write rig OpenAI payload debug dump",
+        ),
+    }
+}
+
 #[async_trait]
 impl<M> LlmProvider for RigAdapter<M>
 where
@@ -542,6 +805,7 @@ where
             request.temperature,
             request.max_tokens,
         )?;
+        maybe_dump_openai_payload(&self.model_name, &rig_req, "complete");
 
         let response =
             self.model
@@ -593,15 +857,82 @@ where
             request.temperature,
             request.max_tokens,
         )?;
+        maybe_dump_openai_payload(&self.model_name, &rig_req, "complete_with_tools");
 
-        let response =
-            self.model
-                .completion(rig_req)
-                .await
-                .map_err(|e| LlmError::RequestFailed {
-                    provider: self.model_name.clone(),
-                    reason: e.to_string(),
-                })?;
+        let response = match self.model.completion(rig_req.clone()).await {
+            Ok(resp) => resp,
+            Err(primary_error) => {
+                let primary_reason = primary_error.to_string();
+                if !is_kimi_k2_5_model(&self.model_name)
+                    || !is_server_error_retryable_for_kimi(&primary_reason)
+                {
+                    return Err(LlmError::RequestFailed {
+                        provider: self.model_name.clone(),
+                        reason: primary_reason,
+                    });
+                }
+
+                tracing::warn!(
+                    model = %self.model_name,
+                    tools = request.tools.len(),
+                    "Kimi tool request hit provider 500; retrying with reduced tool set"
+                );
+
+                let reduced_tool_defs = kimi_reduced_tool_set(&request.tools);
+                let reduced_tools = convert_tools(&self.model_name, &reduced_tool_defs);
+                let reduced_req = build_rig_request(
+                    rig_req.preamble.clone(),
+                    rig_req.chat_history.clone().into_iter().collect(),
+                    reduced_tools,
+                    rig_req.tool_choice.clone(),
+                    request.temperature,
+                    request.max_tokens,
+                )?;
+                maybe_dump_openai_payload(
+                    &self.model_name,
+                    &reduced_req,
+                    "complete_with_tools_kimi_reduced",
+                );
+
+                match self.model.completion(reduced_req).await {
+                    Ok(resp) => resp,
+                    Err(reduced_error) => {
+                        let reduced_reason = reduced_error.to_string();
+                        tracing::warn!(
+                            model = %self.model_name,
+                            "Kimi reduced tool request also failed; retrying once without tools"
+                        );
+
+                        let no_tools_req = build_rig_request(
+                            rig_req.preamble.clone(),
+                            rig_req.chat_history.clone().into_iter().collect(),
+                            Vec::new(),
+                            None,
+                            request.temperature,
+                            request.max_tokens,
+                        )?;
+                        maybe_dump_openai_payload(
+                            &self.model_name,
+                            &no_tools_req,
+                            "complete_with_tools_kimi_no_tools",
+                        );
+
+                        match self.model.completion(no_tools_req).await {
+                            Ok(resp) => resp,
+                            Err(no_tools_error) => {
+                                return Err(LlmError::RequestFailed {
+                                    provider: self.model_name.clone(),
+                                    reason: format!(
+                                        "{primary_reason}; reduced_tools_retry={reduced_reason}; no_tools_retry={}",
+                                        no_tools_error
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        };
 
         let (text, mut tool_calls, finish) = extract_response(&response.choice, &response.usage);
 
@@ -837,6 +1168,144 @@ mod tests {
             params["properties"]["optional_field"]["type"],
             serde_json::json!(["integer", "null"])
         );
+    }
+
+    #[test]
+    fn test_convert_tools_kimi_simplifies_schema_subset() {
+        let tools = vec![IronToolDefinition {
+            name: "demo".to_string(),
+            description: "demo".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "title": "Ignored title",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "default": "hello",
+                        "minLength": 1
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" }
+                    }
+                },
+                "required": ["query"],
+                "anyOf": [
+                    { "type": "object" },
+                    { "type": "null" }
+                ]
+            }),
+        }];
+
+        let rig_tools = convert_tools("moonshotai/Kimi-K2.5", &tools);
+        let params = &rig_tools[0].parameters;
+
+        assert_eq!(params["type"], serde_json::json!("object"));
+        assert_eq!(params["required"], serde_json::json!(["query"]));
+        assert_eq!(
+            params["properties"]["query"]["type"],
+            serde_json::json!("string")
+        );
+        assert!(
+            params["properties"]["query"].get("default").is_none(),
+            "Kimi path should drop non-essential schema keywords"
+        );
+        assert!(
+            params["properties"]["limit"].get("minimum").is_none(),
+            "Kimi path should drop min/max constraints that can trigger provider bugs"
+        );
+        assert!(
+            params["properties"]["metadata"]
+                .get("additionalProperties")
+                .is_none(),
+            "Kimi path should drop nested map schemas that some gateways reject"
+        );
+        assert!(
+            params.get("anyOf").is_none(),
+            "Kimi path should drop combinators that can trigger parser bugs"
+        );
+        assert!(
+            params["additionalProperties"] == serde_json::json!(false),
+            "Kimi path should emit simple object constraints"
+        );
+        assert!(
+            params.get("title").is_none(),
+            "Kimi path should drop root-level title"
+        );
+    }
+
+    #[test]
+    fn test_kimi_reduced_tool_set_prefers_core_priority() {
+        let tools = vec![
+            IronToolDefinition {
+                name: "memory_write".to_string(),
+                description: "".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+            IronToolDefinition {
+                name: "time".to_string(),
+                description: "".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+            IronToolDefinition {
+                name: "discover_tools".to_string(),
+                description: "".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+            IronToolDefinition {
+                name: "shell".to_string(),
+                description: "".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+            IronToolDefinition {
+                name: "create_job".to_string(),
+                description: "".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        ];
+
+        let reduced = kimi_reduced_tool_set(&tools);
+        let names: Vec<&str> = reduced.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names[0], "discover_tools");
+        assert_eq!(names[1], "time");
+        assert_eq!(names[2], "shell");
+        assert!(names.contains(&"memory_write"));
+        assert!(names.contains(&"create_job"));
+    }
+
+    #[test]
+    fn test_is_server_error_retryable_for_kimi() {
+        assert!(is_server_error_retryable_for_kimi(
+            "HttpError: Invalid status code 500 Internal Server Error with message: {\"error\": \"Internal Server Error\"}"
+        ));
+        assert!(!is_server_error_retryable_for_kimi(
+            "HttpError: Invalid status code 400 Bad Request"
+        ));
+    }
+
+    #[test]
+    fn test_convert_tools_kimi_description_fallback_and_truncation() {
+        let tools = vec![
+            IronToolDefinition {
+                name: "unnamed_description_tool".to_string(),
+                description: "   ".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            },
+            IronToolDefinition {
+                name: "long_description_tool".to_string(),
+                description: "x".repeat(700),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            },
+        ];
+
+        let rig_tools = convert_tools("moonshotai/Kimi-K2.5", &tools);
+        assert_eq!(rig_tools[0].description, "unnamed_description_tool");
+        assert_eq!(rig_tools[1].description.chars().count(), 512);
     }
 
     #[test]
