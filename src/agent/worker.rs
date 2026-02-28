@@ -494,11 +494,9 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             }
 
             // Track discover_tools calls to expand the tool set.
-            // We check selections (from select_tools) and any respond_with_tools
-            // tool calls by re-scanning the latest messages for tool_call records.
+            // We check executed_selections (from select_tools or respond_with_tools).
             if self.deps.deferred_tool_loading {
-                // Check selections from select_tools path
-                for selection in &selections {
+                for selection in &executed_selections {
                     if selection.tool_name == "discover_tools" {
                         if let Some(q) =
                             selection.parameters.get("query").and_then(|v| v.as_str())

@@ -639,9 +639,11 @@ Respond with a JSON plan in this format:
                 .deferred_tool_catalog
                 .iter()
                 .map(|(name, desc)| {
-                    // Truncate long descriptions to keep system prompt compact
+                    // Truncate long descriptions to keep system prompt compact.
+                    // Use floor_char_boundary to avoid slicing mid-UTF-8 character.
                     let short_desc = if desc.len() > 120 {
-                        format!("{}...", &desc[..117])
+                        let end = crate::util::floor_char_boundary(desc, 117);
+                        format!("{}...", &desc[..end])
                     } else {
                         desc.clone()
                     };
