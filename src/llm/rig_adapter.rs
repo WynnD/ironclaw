@@ -920,6 +920,87 @@ impl<M: CompletionModel + Send + Sync + 'static> RigAdapter<M> {
 
         parse_native_tool_response(&self.model_name, &body)
     }
+
+    /// Send a request via native transport WITHOUT the `tools` parameter.
+    ///
+    /// Used as the final fallback when even reduced-tools requests fail with 500.
+    /// Tools are already injected into the system prompt by the caller; the model
+    /// emits tool calls as section-delimited text that `recover_tool_calls_from_content`
+    /// parses in the reasoning layer.
+    async fn send_kimi_native_text_tool_request(
+        &self,
+        messages: &[ChatMessage],
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> Result<ToolCompletionResponse, LlmError> {
+        let transport = self.native_transport.as_ref().ok_or_else(|| {
+            LlmError::RequestFailed {
+                provider: self.model_name.clone(),
+                reason: "Native transport not configured".to_string(),
+            }
+        })?;
+
+        let json_messages = build_native_messages(messages);
+
+        let mut payload = serde_json::json!({
+            "model": self.model_name,
+            "messages": json_messages,
+        });
+
+        if let Some(t) = temperature {
+            payload["temperature"] = serde_json::json!(t);
+        }
+        if let Some(m) = max_tokens {
+            payload["max_tokens"] = serde_json::json!(m);
+        }
+
+        if env_flag_enabled("IRONCLAW_RIG_PAYLOAD_DUMP") {
+            let path = payload_dump_path("kimi_text_tool_fallback");
+            if let Ok(json) = serde_json::to_string_pretty(&payload) {
+                let _ = std::fs::write(&path, &json);
+                tracing::info!(
+                    model = %self.model_name,
+                    path = %path.display(),
+                    bytes = json.len(),
+                    "Wrote native K2.5 text-tool fallback payload dump",
+                );
+            }
+        }
+
+        let url = format!("{}/chat/completions", transport.base_url);
+        tracing::debug!(
+            model = %self.model_name,
+            url = %url,
+            "Sending K2.5 text-tool fallback via native transport (no tools param)",
+        );
+
+        let response = transport
+            .client
+            .post(&url)
+            .bearer_auth(&transport.api_key)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| LlmError::RequestFailed {
+                provider: self.model_name.clone(),
+                reason: format!("Native text-tool fallback request failed: {e}"),
+            })?;
+
+        let status = response.status();
+        let body = response.text().await.map_err(|e| LlmError::RequestFailed {
+            provider: self.model_name.clone(),
+            reason: format!("Failed to read response body: {e}"),
+        })?;
+
+        if !status.is_success() {
+            return Err(LlmError::RequestFailed {
+                provider: self.model_name.clone(),
+                reason: format!("HTTP {status}: {}", truncate_chars(&body, 512)),
+            });
+        }
+
+        parse_native_tool_response(&self.model_name, &body)
+    }
 }
 
 /// Inject tool definitions into the first system message as plain text.
@@ -1260,53 +1341,31 @@ where
                 Err(e) => return Err(e),
             }
 
-            // Fall back to text-based tool calling via rig-core.
+            // Fall back to text-based tool calling via native transport.
             // Inject tool definitions into the system prompt so the model can
             // still call tools using its native section-delimited format.
             // The reasoning layer's recover_tool_calls_from_content() handles parsing.
+            //
+            // We use the native transport (string content) instead of rig-core
+            // (array content `[{"type":"text","text":"..."}]`) because K2.5 on
+            // vLLM/SGLang produces empty or think-only responses with array content.
             let mut text_tool_messages = messages.clone();
             inject_tools_into_system_prompt(&mut text_tool_messages, &request.tools);
             tracing::info!(
                 model = %self.model_name,
                 tools = request.tools.len(),
-                "K2.5 falling back to text-based tool calling (tools injected into system prompt)"
+                "K2.5 falling back to text-based tool calling via native transport (tools in system prompt)"
             );
 
-            let (preamble, history) = convert_messages(&text_tool_messages);
-            let no_tools_req = build_rig_request(
-                preamble,
-                history,
-                Vec::new(),
-                None,
-                request.temperature,
-                request.max_tokens,
-            )?;
-            maybe_dump_openai_payload(
-                &self.model_name,
-                &no_tools_req,
-                "kimi_text_tool_fallback",
-            );
-
-            let response =
-                self.model
-                    .completion(no_tools_req)
-                    .await
-                    .map_err(|e| LlmError::RequestFailed {
-                        provider: self.model_name.clone(),
-                        reason: e.to_string(),
-                    })?;
-
-            let (text, mut tool_calls, finish) =
-                extract_response(&response.choice, &response.usage);
-            normalize_tool_calls(&mut tool_calls, &known_tool_names);
-
-            return Ok(ToolCompletionResponse {
-                content: text,
-                tool_calls,
-                input_tokens: saturate_u32(response.usage.input_tokens),
-                output_tokens: saturate_u32(response.usage.output_tokens),
-                finish_reason: finish,
-            });
+            let mut resp = self
+                .send_kimi_native_text_tool_request(
+                    &text_tool_messages,
+                    request.temperature,
+                    request.max_tokens,
+                )
+                .await?;
+            normalize_tool_calls(&mut resp.tool_calls, &known_tool_names);
+            return Ok(resp);
         }
 
         // Standard rig-core path (non-K2.5 or K2.5 without native transport)
