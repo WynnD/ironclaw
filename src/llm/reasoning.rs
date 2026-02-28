@@ -1105,6 +1105,7 @@ fn is_inside_code(pos: usize, regions: &[CodeRegion]) -> bool {
 /// - `<tool_call>{"name":"x","arguments":{}}</tool_call>` (JSON)
 /// - `<|tool_call|>...<|/tool_call|>` (pipe-delimited variant)
 /// - `<function_call>...</function_call>` (function_call variant)
+/// - `<|tool_calls_section_begin|>...<|tool_calls_section_end|>` (section-delimited, Kimi K2.5)
 ///
 /// Only returns calls whose name matches an available tool.
 fn recover_tool_calls_from_content(
@@ -1115,6 +1116,7 @@ fn recover_tool_calls_from_content(
         available_tools.iter().map(|t| t.name.as_str()).collect();
     let mut calls = Vec::new();
 
+    // Format 1: paired XML/pipe tags
     for (open, close) in &[
         ("<tool_call>", "</tool_call>"),
         ("<|tool_call|>", "<|/tool_call|>"),
@@ -1164,7 +1166,88 @@ fn recover_tool_calls_from_content(
         }
     }
 
+    // Format 2: section-delimited tool calls (Kimi K2.5 and similar models)
+    //
+    // <|tool_calls_section_begin|>
+    //   <|tool_call_begin|>functions.http:0<|tool_call_argument_begin|>{"method":"GET",...}<|tool_call_end|>
+    //   <|tool_call_begin|>functions.shell:1<|tool_call_argument_begin|>{"command":"ls"}<|tool_call_end|>
+    // <|tool_calls_section_end|>
+    const SECTION_BEGIN: &str = "<|tool_calls_section_begin|>";
+    const SECTION_END: &str = "<|tool_calls_section_end|>";
+    const CALL_BEGIN: &str = "<|tool_call_begin|>";
+    const CALL_END: &str = "<|tool_call_end|>";
+    const ARG_BEGIN: &str = "<|tool_call_argument_begin|>";
+
+    let mut remaining = content;
+    while let Some(sec_start) = remaining.find(SECTION_BEGIN) {
+        let after_sec = &remaining[sec_start + SECTION_BEGIN.len()..];
+        let sec_end = after_sec.find(SECTION_END).unwrap_or(after_sec.len());
+        let section = &after_sec[..sec_end];
+        remaining = if sec_end < after_sec.len() {
+            &after_sec[sec_end + SECTION_END.len()..]
+        } else {
+            ""
+        };
+
+        // Parse individual tool calls within the section
+        let mut section_remaining = section;
+        while let Some(call_start) = section_remaining.find(CALL_BEGIN) {
+            let after_call = &section_remaining[call_start + CALL_BEGIN.len()..];
+            let call_end = match after_call.find(CALL_END) {
+                Some(pos) => pos,
+                None => break,
+            };
+            let call_body = &after_call[..call_end];
+            section_remaining = &after_call[call_end + CALL_END.len()..];
+
+            // Split on <|tool_call_argument_begin|> to get name and arguments
+            let (raw_name, arguments) = if let Some(arg_pos) = call_body.find(ARG_BEGIN) {
+                let name_part = call_body[..arg_pos].trim();
+                let arg_part = call_body[arg_pos + ARG_BEGIN.len()..].trim();
+                let args: serde_json::Value =
+                    serde_json::from_str(arg_part).unwrap_or(serde_json::json!({}));
+                (name_part, args)
+            } else {
+                (call_body.trim(), serde_json::json!({}))
+            };
+
+            // Normalize: "functions.http:0" → "http"
+            let name = normalize_section_tool_name(raw_name);
+
+            if tool_names.contains(name.as_str()) {
+                calls.push(ToolCall {
+                    id: format!("recovered_{}", calls.len()),
+                    name,
+                    arguments,
+                });
+            }
+        }
+    }
+
     calls
+}
+
+/// Normalize a tool name from section-delimited format.
+///
+/// Models like Kimi K2.5 emit names like `functions.http:0` where `functions.`
+/// is a namespace prefix and `:0` is a call index. Strip both to get `http`.
+fn normalize_section_tool_name(raw: &str) -> String {
+    let mut name = raw;
+
+    // Strip "functions." prefix
+    if let Some(stripped) = name.strip_prefix("functions.") {
+        name = stripped;
+    }
+
+    // Strip ":N" suffix (call index)
+    if let Some(colon) = name.rfind(':')
+        && name[colon + 1..].bytes().all(|b| b.is_ascii_digit())
+        && colon + 1 < name.len()
+    {
+        name = &name[..colon];
+    }
+
+    name.to_string()
 }
 
 /// `<tool_call>tool_list</tool_call>` or `<|tool_call|>` in the content field
@@ -1206,6 +1289,10 @@ fn clean_response(text: &str) -> String {
         result = strip_xml_tag(&result, tag);
         result = strip_pipe_tag(&result, tag);
     }
+
+    // 6b. Strip section-delimited tool call blocks
+    // (e.g. <|tool_calls_section_begin|>...<|tool_calls_section_end|>)
+    result = strip_section_tool_calls(&result);
 
     // 7. Collapse triple+ newlines, trim
     collapse_newlines(&result)
@@ -1407,6 +1494,35 @@ fn strip_pipe_tag(text: &str, tag: &str) -> String {
             let end = start + close_offset + close.len();
             remaining = &remaining[end..];
         } else {
+            remaining = "";
+            break;
+        }
+    }
+
+    result.push_str(remaining);
+    result
+}
+
+/// Strip `<|tool_calls_section_begin|>...<|tool_calls_section_end|>` blocks.
+///
+/// These are emitted by Kimi K2.5 and similar models when tool calls appear as
+/// text in the content field. Strips the entire section including all inner
+/// `<|tool_call_begin|>...<|tool_call_end|>` blocks.
+fn strip_section_tool_calls(text: &str) -> String {
+    const SECTION_BEGIN: &str = "<|tool_calls_section_begin|>";
+    const SECTION_END: &str = "<|tool_calls_section_end|>";
+
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+
+    while let Some(start) = remaining.find(SECTION_BEGIN) {
+        result.push_str(&remaining[..start]);
+
+        let after = &remaining[start + SECTION_BEGIN.len()..];
+        if let Some(end_offset) = after.find(SECTION_END) {
+            remaining = &after[end_offset + SECTION_END.len()..];
+        } else {
+            // No closing tag — discard rest (malformed)
             remaining = "";
             break;
         }
@@ -1873,5 +1989,90 @@ That's my plan."#;
         let calls = recover_tool_calls_from_content(content, &tools);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "tool_list");
+    }
+
+    // ---- section-delimited tool call recovery tests ----
+
+    #[test]
+    fn test_recover_section_delimited_single() {
+        let tools = make_tools(&["http"]);
+        let content = r#"I'll fetch that for you. <|tool_calls_section_begin|><|tool_call_begin|>functions.http:0<|tool_call_argument_begin|>{"method": "GET", "url": "https://example.com/rss.xml"}<|tool_call_end|><|tool_calls_section_end|>"#;
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "http");
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"method": "GET", "url": "https://example.com/rss.xml"})
+        );
+    }
+
+    #[test]
+    fn test_recover_section_delimited_multiple() {
+        let tools = make_tools(&["http", "shell"]);
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>functions.http:0<|tool_call_argument_begin|>{\"url\": \"https://example.com\"}<|tool_call_end|><|tool_call_begin|>functions.shell:1<|tool_call_argument_begin|>{\"command\": \"ls\"}<|tool_call_end|><|tool_calls_section_end|>";
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "http");
+        assert_eq!(calls[1].name, "shell");
+        assert_eq!(calls[1].arguments, serde_json::json!({"command": "ls"}));
+    }
+
+    #[test]
+    fn test_recover_section_delimited_no_functions_prefix() {
+        let tools = make_tools(&["time"]);
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>time:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>";
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "time");
+    }
+
+    #[test]
+    fn test_recover_section_delimited_bare_name() {
+        let tools = make_tools(&["time"]);
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>time<|tool_call_end|><|tool_calls_section_end|>";
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "time");
+    }
+
+    #[test]
+    fn test_recover_section_delimited_unknown_tool_ignored() {
+        let tools = make_tools(&["http"]);
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>functions.nonexistent:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>";
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_section_tool_name() {
+        assert_eq!(normalize_section_tool_name("functions.http:0"), "http");
+        assert_eq!(normalize_section_tool_name("functions.shell:12"), "shell");
+        assert_eq!(normalize_section_tool_name("http:0"), "http");
+        assert_eq!(
+            normalize_section_tool_name("functions.memory_search:0"),
+            "memory_search"
+        );
+        assert_eq!(normalize_section_tool_name("time"), "time");
+        assert_eq!(normalize_section_tool_name("functions.time"), "time");
+    }
+
+    // ---- clean_response section stripping tests ----
+
+    #[test]
+    fn test_clean_response_strips_section_tool_calls() {
+        let input = "Here is my response. <|tool_calls_section_begin|><|tool_call_begin|>functions.http:0<|tool_call_argument_begin|>{\"url\": \"https://example.com\"}<|tool_call_end|><|tool_calls_section_end|>";
+        let cleaned = clean_response(input);
+        assert!(!cleaned.contains("tool_calls_section"));
+        assert!(!cleaned.contains("tool_call_begin"));
+        assert!(cleaned.contains("Here is my response."));
+    }
+
+    #[test]
+    fn test_clean_response_strips_section_preserves_text() {
+        let input = "Before section <|tool_calls_section_begin|><|tool_call_begin|>functions.http:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|> After section";
+        let cleaned = clean_response(input);
+        assert!(cleaned.contains("Before section"));
+        assert!(cleaned.contains("After section"));
+        assert!(!cleaned.contains("tool_calls_section"));
     }
 }

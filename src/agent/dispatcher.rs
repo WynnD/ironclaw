@@ -732,13 +732,9 @@ impl Agent {
                                 if let Some(names) =
                                     tc.arguments.get("names").and_then(|v| v.as_array())
                                 {
-                                    let name_strs: Vec<&str> = names
-                                        .iter()
-                                        .filter_map(|v| v.as_str())
-                                        .collect();
-                                    for def in
-                                        self.tools().tool_definitions_for(&name_strs).await
-                                    {
+                                    let name_strs: Vec<&str> =
+                                        names.iter().filter_map(|v| v.as_str()).collect();
+                                    for def in self.tools().tool_definitions_for(&name_strs).await {
                                         discovered_tool_names.insert(def.name);
                                     }
                                 }
