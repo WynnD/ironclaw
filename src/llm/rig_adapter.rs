@@ -230,6 +230,16 @@ fn truncate_chars(input: &str, max_chars: usize) -> String {
     input.chars().take(max_chars).collect()
 }
 
+/// Truncate a string for logging, appending "..." if truncated.
+pub fn truncate_for_log(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    let mut s: String = input.chars().take(max_chars).collect();
+    s.push_str("...");
+    s
+}
+
 /// Kimi K2.5 is sensitive to broad JSON-Schema vocabularies on some
 /// OpenAI-compatible gateways. Keep a conservative subset.
 fn simplify_schema_kimi_compat(schema: &JsonValue) -> JsonValue {
@@ -1053,7 +1063,19 @@ fn inject_tools_into_system_prompt(messages: &mut Vec<ChatMessage>, tools: &[Iro
                         .get("description")
                         .and_then(|d| d.as_str())
                         .unwrap_or("");
-                    format!("    - `{name}` ({ty}{req}): {desc}")
+                    // Include enum values so the model knows valid options
+                    let enum_suffix = schema
+                        .get("enum")
+                        .and_then(|e| e.as_array())
+                        .map(|vals| {
+                            let items: Vec<String> = vals
+                                .iter()
+                                .filter_map(|v| v.as_str().map(|s| format!("\"{s}\"")))
+                                .collect();
+                            format!(" [{}]", items.join(", "))
+                        })
+                        .unwrap_or_default();
+                    format!("    - `{name}` ({ty}{req}): {desc}{enum_suffix}")
                 })
                 .collect();
             if !params.is_empty() {
@@ -2129,5 +2151,27 @@ mod tests {
         let original = messages[0].content.clone();
         inject_tools_into_system_prompt(&mut messages, &[]);
         assert_eq!(messages[0].content, original);
+    }
+
+    #[test]
+    fn test_inject_tools_includes_enum_values() {
+        let mut messages = vec![ChatMessage::system("You are helpful.")];
+        let tools = vec![IronToolDefinition {
+            name: "time".to_string(),
+            description: "Get current time".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["now", "parse", "format"],
+                        "description": "The operation"
+                    }
+                },
+                "required": ["operation"]
+            }),
+        }];
+        inject_tools_into_system_prompt(&mut messages, &tools);
+        assert!(messages[0].content.contains(r#"["now", "parse", "format"]"#));
     }
 }

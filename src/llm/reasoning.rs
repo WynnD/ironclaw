@@ -510,6 +510,11 @@ Respond in JSON format:
             // Some models (e.g. GLM-4.7) emit tool calls as XML tags in content
             // instead of using the structured tool_calls field. Try to recover
             // them before giving up and returning plain text.
+            tracing::debug!(
+                content_len = content.len(),
+                content_preview = %crate::llm::rig_adapter::truncate_for_log(&content, 300),
+                "Attempting tool call recovery from text content",
+            );
             let recovered = recover_tool_calls_from_content(&content, &context.available_tools);
             if !recovered.is_empty() {
                 let cleaned = clean_response(&content);
