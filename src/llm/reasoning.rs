@@ -635,27 +635,20 @@ Respond with a JSON plan in this format:
         let deferred_section = if context.deferred_tool_catalog.is_empty() {
             String::new()
         } else {
-            let mut entries: Vec<String> = context
+            // List only tool names (no descriptions) to keep the system prompt compact.
+            // The model can call `discover_tools` with a keyword to learn about specific tools.
+            // Full descriptions were ~30KB for 150+ tools, causing provider payload limits.
+            let mut names: Vec<&str> = context
                 .deferred_tool_catalog
                 .iter()
-                .map(|(name, desc)| {
-                    // Truncate long descriptions to keep system prompt compact.
-                    // Use floor_char_boundary to avoid slicing mid-UTF-8 character.
-                    let short_desc = if desc.len() > 120 {
-                        let end = crate::util::floor_char_boundary(desc, 117);
-                        format!("{}...", &desc[..end])
-                    } else {
-                        desc.clone()
-                    };
-                    format!("  - {name}: {short_desc}")
-                })
+                .map(|(name, _)| name.as_str())
                 .collect();
-            entries.sort(); // deterministic ordering
+            names.sort();
             format!(
                 "\n\n## Additional Tools (use `discover_tools` to activate)\n\
-                 The following tools are available but not currently loaded. \
-                 Call `discover_tools` with a keyword query or exact names to activate them.\n{}",
-                entries.join("\n")
+                 Call `discover_tools` with a keyword or exact name to activate and learn about these tools.\n\
+                 {}\n",
+                names.join(", ")
             )
         };
 
