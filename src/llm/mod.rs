@@ -210,17 +210,9 @@ fn create_tinfoil_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvider>, L
     Ok(Arc::new(RigAdapter::new(model, &tf.model)))
 }
 
-fn is_kimi_k2_5_model(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    model.contains("kimi-k2.5")
-        || model.contains("kimi-k2p5")
-        || model.contains("kimi-k2-5")
-        || model.contains("moonshotai/kimi-k2.5")
-}
-
 fn create_openai_compatible_provider(
     config: &LlmConfig,
-    session: Arc<SessionManager>,
+    _session: Arc<SessionManager>,
 ) -> Result<Arc<dyn LlmProvider>, LlmError> {
     let compat = config
         .openai_compatible
@@ -228,42 +220,6 @@ fn create_openai_compatible_provider(
         .ok_or_else(|| LlmError::AuthFailed {
             provider: "openai_compatible".to_string(),
         })?;
-
-    // Kimi K2.5 is brittle with rig-core's Chat Completions shape (typed content
-    // blocks + strict tool schemas). Use the simpler IronClaw chat-completions
-    // transport to preserve tool calling while matching provider expectations.
-    //
-    // No api_key guard: if the key is missing, NearAiChatProvider will surface a
-    // clear auth error rather than a confusing 500 from strict schema rejection.
-    if is_kimi_k2_5_model(&compat.model) {
-        let near_like = NearAiConfig {
-            model: compat.model.clone(),
-            cheap_model: None,
-            base_url: compat.base_url.clone(),
-            auth_base_url: compat.base_url.clone(),
-            session_path: config.nearai.session_path.clone(),
-            api_key: compat.api_key.clone(),
-            fallback_model: None,
-            max_retries: config.nearai.max_retries,
-            circuit_breaker_threshold: config.nearai.circuit_breaker_threshold,
-            circuit_breaker_recovery_secs: config.nearai.circuit_breaker_recovery_secs,
-            response_cache_enabled: config.nearai.response_cache_enabled,
-            response_cache_ttl_secs: config.nearai.response_cache_ttl_secs,
-            response_cache_max_entries: config.nearai.response_cache_max_entries,
-            failover_cooldown_secs: config.nearai.failover_cooldown_secs,
-            failover_cooldown_threshold: config.nearai.failover_cooldown_threshold,
-            smart_routing_cascade: config.nearai.smart_routing_cascade,
-        };
-
-        tracing::info!(
-            "Using OpenAI-compatible endpoint via native chat transport (base_url: {}, model: {})",
-            near_like.base_url,
-            near_like.model
-        );
-        return Ok(Arc::new(NearAiChatProvider::new_with_flatten(
-            near_like, session, false,
-        )?));
-    }
 
     use rig::providers::openai;
 
