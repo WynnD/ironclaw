@@ -922,6 +922,83 @@ impl<M: CompletionModel + Send + Sync + 'static> RigAdapter<M> {
     }
 }
 
+/// Inject tool definitions into the first system message as plain text.
+///
+/// When the LLM endpoint doesn't support the structured `tools` parameter
+/// (returns HTTP 500), we embed tool descriptions in the system prompt instead.
+/// K2.5 is trained to emit tool calls using section-delimited format
+/// (`<|tool_calls_section_begin|>...`) which `recover_tool_calls_from_content`
+/// in the reasoning layer parses automatically.
+fn inject_tools_into_system_prompt(messages: &mut Vec<ChatMessage>, tools: &[IronToolDefinition]) {
+    if tools.is_empty() {
+        return;
+    }
+
+    // Build tool descriptions
+    let mut tool_section = String::from(
+        "\n\n## Tool Calling\n\
+         You have access to the following tools. To call a tool, output EXACTLY this format:\n\
+         <|tool_calls_section_begin|><|tool_call_begin|>functions.TOOL_NAME:INDEX\
+         <|tool_call_argument_begin|>{\"arg\": \"value\"}<|tool_call_end|>\
+         <|tool_calls_section_end|>\n\n\
+         Available tools:\n",
+    );
+
+    for tool in tools {
+        tool_section.push_str(&format!("- **{}**: {}\n", tool.name, tool.description));
+        // Include parameter schema in compact form
+        if let Some(props) = tool.parameters.get("properties")
+            && let Some(obj) = props.as_object()
+        {
+            let required: Vec<&str> = tool
+                .parameters
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            let params: Vec<String> = obj
+                .iter()
+                .map(|(name, schema)| {
+                    let ty = schema
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("any");
+                    let req = if required.contains(&name.as_str()) {
+                        " (required)"
+                    } else {
+                        ""
+                    };
+                    let desc = schema
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("");
+                    format!("    - `{name}` ({ty}{req}): {desc}")
+                })
+                .collect();
+            if !params.is_empty() {
+                tool_section.push_str(&format!("  Parameters:\n{}\n", params.join("\n")));
+            }
+        }
+    }
+
+    // Find the first system message and append the tool section
+    if let Some(sys_msg) = messages.iter_mut().find(|m| m.role == crate::llm::Role::System) {
+        sys_msg.content.push_str(&tool_section);
+    } else {
+        // No system message — prepend one
+        messages.insert(
+            0,
+            ChatMessage {
+                role: crate::llm::Role::System,
+                content: tool_section,
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+            },
+        );
+    }
+}
+
 /// Build OpenAI-format messages with plain string content (not array).
 fn build_native_messages(messages: &[ChatMessage]) -> Vec<JsonValue> {
     let mut out = Vec::new();
@@ -1183,8 +1260,19 @@ where
                 Err(e) => return Err(e),
             }
 
-            // Fall back to rig-core without tools (known working path)
-            let (preamble, history) = convert_messages(&messages);
+            // Fall back to text-based tool calling via rig-core.
+            // Inject tool definitions into the system prompt so the model can
+            // still call tools using its native section-delimited format.
+            // The reasoning layer's recover_tool_calls_from_content() handles parsing.
+            let mut text_tool_messages = messages.clone();
+            inject_tools_into_system_prompt(&mut text_tool_messages, &request.tools);
+            tracing::info!(
+                model = %self.model_name,
+                tools = request.tools.len(),
+                "K2.5 falling back to text-based tool calling (tools injected into system prompt)"
+            );
+
+            let (preamble, history) = convert_messages(&text_tool_messages);
             let no_tools_req = build_rig_request(
                 preamble,
                 history,
@@ -1196,7 +1284,7 @@ where
             maybe_dump_openai_payload(
                 &self.model_name,
                 &no_tools_req,
-                "kimi_native_no_tools_fallback",
+                "kimi_text_tool_fallback",
             );
 
             let response =
@@ -1930,5 +2018,57 @@ mod tests {
     fn test_normalize_tool_name_unknown_passthrough() {
         let known = HashSet::from(["echo".to_string()]);
         assert_eq!(normalize_tool_name("other_tool", &known), "other_tool");
+    }
+
+    #[test]
+    fn test_inject_tools_into_system_prompt_appends() {
+        let mut messages = vec![
+            ChatMessage::system("You are helpful."),
+            ChatMessage::user("Hello"),
+        ];
+        let tools = vec![IronToolDefinition {
+            name: "time".to_string(),
+            description: "Get current time".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tz": {"type": "string", "description": "Timezone"}
+                },
+                "required": ["tz"]
+            }),
+        }];
+        inject_tools_into_system_prompt(&mut messages, &tools);
+        assert!(messages[0].content.contains("Tool Calling"));
+        assert!(messages[0].content.contains("time"));
+        assert!(messages[0].content.contains("Get current time"));
+        assert!(messages[0].content.contains("tool_calls_section_begin"));
+        assert!(messages[0].content.contains("tz"));
+        assert!(messages[0].content.contains("(required)"));
+        // Original system prompt is still there
+        assert!(messages[0].content.starts_with("You are helpful."));
+        // Message count unchanged
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn test_inject_tools_into_system_prompt_creates_system_msg() {
+        let mut messages = vec![ChatMessage::user("Hello")];
+        let tools = vec![IronToolDefinition {
+            name: "echo".to_string(),
+            description: "Echo text".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }];
+        inject_tools_into_system_prompt(&mut messages, &tools);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, crate::llm::Role::System);
+        assert!(messages[0].content.contains("echo"));
+    }
+
+    #[test]
+    fn test_inject_tools_empty_tools_noop() {
+        let mut messages = vec![ChatMessage::system("You are helpful.")];
+        let original = messages[0].content.clone();
+        inject_tools_into_system_prompt(&mut messages, &[]);
+        assert_eq!(messages[0].content, original);
     }
 }
