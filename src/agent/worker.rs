@@ -379,6 +379,9 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             // Select next tool(s) to use
             let selections = reasoning.select_tools(reason_ctx).await?;
 
+            // Collect all executed selections for discover_tools tracking below
+            let mut executed_selections: Vec<ToolSelection> = Vec::new();
+
             if selections.is_empty() {
                 // No tools from select_tools, ask LLM directly (may still return tool calls)
                 let respond_output = reasoning.respond_with_tools(reason_ctx).await?;
@@ -442,7 +445,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                             ));
 
                         // Convert ToolCalls to ToolSelections and execute in parallel
-                        let selections: Vec<ToolSelection> = tool_calls
+                        let respond_selections: Vec<ToolSelection> = tool_calls
                             .iter()
                             .map(|tc| ToolSelection {
                                 tool_name: tc.name.clone(),
@@ -453,11 +456,12 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                             })
                             .collect();
 
-                        let results = self.execute_tools_parallel(&selections).await;
-                        for (selection, result) in selections.iter().zip(results) {
+                        let results = self.execute_tools_parallel(&respond_selections).await;
+                        for (selection, result) in respond_selections.iter().zip(results) {
                             self.process_tool_result(reason_ctx, selection, result.result)
                                 .await?;
                         }
+                        executed_selections = respond_selections;
                     }
                 }
             } else if selections.len() == 1 {
@@ -476,6 +480,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
 
                 self.process_tool_result(reason_ctx, selection, result)
                     .await?;
+                executed_selections = selections;
             } else {
                 // Multiple tools: execute in parallel
                 tracing::debug!(
@@ -491,22 +496,26 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     self.process_tool_result(reason_ctx, selection, result.result)
                         .await?;
                 }
+                executed_selections = selections;
             }
 
             // Track discover_tools calls to expand the tool set.
-            // We check executed_selections (from select_tools or respond_with_tools).
             if self.deps.deferred_tool_loading {
                 for selection in &executed_selections {
                     if selection.tool_name == "discover_tools" {
-                        if let Some(q) =
-                            selection.parameters.get("query").and_then(|v| v.as_str())
+                        if let Some(q) = selection
+                            .parameters
+                            .get("query")
+                            .and_then(|v: &serde_json::Value| v.as_str())
                         {
                             for def in self.tools().search_tools(q).await {
                                 discovered_tool_names.insert(def.name);
                             }
                         }
-                        if let Some(names) =
-                            selection.parameters.get("names").and_then(|v| v.as_array())
+                        if let Some(names) = selection
+                            .parameters
+                            .get("names")
+                            .and_then(|v: &serde_json::Value| v.as_array())
                         {
                             let name_strs: Vec<&str> =
                                 names.iter().filter_map(|v| v.as_str()).collect();
