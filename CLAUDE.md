@@ -4,6 +4,29 @@
 
 **IronClaw** is a secure personal AI assistant that protects your data and expands its capabilities on the fly.
 
+This is **Wynn's fork** (`WynnD/ironclaw`) of `nearai/ironclaw`.
+
+### Git Remotes
+- **origin** — `WynnD/ironclaw` (this fork, push here)
+- **upstream** — `nearai/ironclaw` (pull upstream changes from here)
+
+### Deployment
+
+IronClaw is deployed to Wynn's home Kubernetes cluster as **`accountability-agent`** via ArgoCD GitOps.
+
+- **Deployment repo**: `../home-cluster` (`WynnD/home-cluster`, private)
+- **Cluster access**: `kubectl` (direct) and ArgoCD MCP server (available in this session)
+- **ArgoCD app**: `../home-cluster/argo/accountability-agent/accountability-agent.yaml`
+- **Kustomize overlay**: `../home-cluster/kustomize/accountability-agent/`
+- **Namespace**: `accountability-agent`
+- **Image**: `registry.wynndrahorad.com/ironclaw:<tag>` (tag set in `kustomization.yaml`)
+- **Database**: CNPG cluster `accountability-agent-db` (secret `accountability-agent-db-app` has URI)
+- **Secrets**: `accountability-agent-secrets` (LLM key, Telegram tokens, gateway auth, OpenAI key, etc.)
+- **Ingress**: Traefik with local-only middleware on `wynndrahorad.com`
+- **Cluster nodes**: `morningstar` (primary, GPU), `rocinante`, `pi1`, `pi2`
+
+**Deploy workflow**: build image, push to `registry.wynndrahorad.com/ironclaw:<tag>`, update `newTag` in `kustomization.yaml`, push `home-cluster` — ArgoCD auto-syncs.
+
 ### Core Philosophy
 - **User-first security** - Your data stays yours, encrypted and local
 - **Self-expanding** - Build new tools dynamically without vendor dependency

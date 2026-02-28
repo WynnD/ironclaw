@@ -1,9 +1,21 @@
 name: Run Tests
 on:
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE*'
+      - '.github/workflows/release*.yml'
+      - '.github/workflows/pr-label*.yml'
   push:
     branches:
       - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE*'
+      - '.github/workflows/release*.yml'
+      - '.github/workflows/pr-label*.yml'
   workflow_dispatch:
 
 jobs:
