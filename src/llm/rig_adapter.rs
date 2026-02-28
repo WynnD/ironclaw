@@ -1029,9 +1029,11 @@ fn inject_tools_into_system_prompt(messages: &mut Vec<ChatMessage>, tools: &[Iro
     let mut tool_section = String::from(
         "\n\n## Tool Calling\n\
          You have access to the following tools. To call a tool, output EXACTLY this format:\n\
-         <|tool_calls_section_begin|><|tool_call_begin|>functions.TOOL_NAME:INDEX\
+         <|tool_calls_section_begin|><|tool_call_begin|>functions.TOOL_NAME:0\
          <|tool_call_argument_begin|>{\"arg\": \"value\"}<|tool_call_end|>\
          <|tool_calls_section_end|>\n\n\
+         IMPORTANT: Use the EXACT tool name as listed below (e.g. `time`, not `time_get_current_time`). \
+         The tool name must match exactly.\n\n\
          Available tools:\n",
     );
 

@@ -1212,10 +1212,18 @@ fn recover_tool_calls_from_content(
             // Normalize: "functions.http:0" → "http"
             let name = normalize_section_tool_name(raw_name);
 
-            if tool_names.contains(name.as_str()) {
+            let matched_name = if tool_names.contains(name.as_str()) {
+                Some(name)
+            } else {
+                // Fuzzy match: model may invent a more specific name like
+                // "time_get_current_time" for tool "time". Try prefix match.
+                fuzzy_match_tool_name(&name, &tool_names)
+            };
+
+            if let Some(matched) = matched_name {
                 calls.push(ToolCall {
                     id: format!("recovered_{}", calls.len()),
-                    name,
+                    name: matched,
                     arguments,
                 });
             }
@@ -1246,6 +1254,39 @@ fn normalize_section_tool_name(raw: &str) -> String {
     }
 
     name.to_string()
+}
+
+/// Fuzzy-match a model-generated tool name against known tool names.
+///
+/// Models sometimes invent more specific names like `time_get_current_time` for
+/// a tool registered as `time`. Try matching by prefix: if `time` is a prefix
+/// of `time_get_current_time` (followed by `_`), it's a match.
+///
+/// Picks the longest matching tool name to avoid ambiguity (e.g., `memory_search`
+/// should match `memory_search`, not `memory`).
+fn fuzzy_match_tool_name(
+    model_name: &str,
+    tool_names: &std::collections::HashSet<&str>,
+) -> Option<String> {
+    let mut best: Option<&str> = None;
+    for &tool in tool_names {
+        // Check if the model name starts with the tool name followed by '_'
+        if model_name.starts_with(tool)
+            && (model_name.len() == tool.len()
+                || model_name.as_bytes().get(tool.len()) == Some(&b'_'))
+            && best.is_none_or(|b| tool.len() > b.len())
+        {
+            best = Some(tool);
+        }
+    }
+    if let Some(matched) = best {
+        tracing::info!(
+            model_name = model_name,
+            matched_tool = matched,
+            "Fuzzy-matched model tool name to registered tool",
+        );
+    }
+    best.map(|s| s.to_string())
 }
 
 /// `<tool_call>tool_list</tool_call>` or `<|tool_call|>` in the content field
@@ -2052,6 +2093,38 @@ That's my plan."#;
         );
         assert_eq!(normalize_section_tool_name("time"), "time");
         assert_eq!(normalize_section_tool_name("functions.time"), "time");
+    }
+
+    #[test]
+    fn test_fuzzy_match_tool_name() {
+        let tools: std::collections::HashSet<&str> =
+            ["time", "memory_search", "http", "shell"].into();
+
+        // Exact match returns None (handled by exact check before fuzzy)
+        // But fuzzy also works for exact since exact prefix + length match
+        assert_eq!(
+            fuzzy_match_tool_name("time", &tools),
+            Some("time".to_string())
+        );
+
+        // Model invents longer name
+        assert_eq!(
+            fuzzy_match_tool_name("time_get_current_time", &tools),
+            Some("time".to_string())
+        );
+
+        // Longer prefix wins: "memory_search" beats "memory" (if both existed)
+        assert_eq!(
+            fuzzy_match_tool_name("memory_search_documents", &tools),
+            Some("memory_search".to_string())
+        );
+
+        // No match
+        assert_eq!(fuzzy_match_tool_name("unknown_tool", &tools), None);
+
+        // Partial overlap but not at `_` boundary shouldn't match
+        // "timer" doesn't start with "time_"
+        assert_eq!(fuzzy_match_tool_name("timer", &tools), None);
     }
 
     // ---- clean_response section stripping tests ----
