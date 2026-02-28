@@ -242,16 +242,16 @@ fn create_openai_compatible_provider(
         extra_headers.insert(name, val);
     }
 
+    let api_key_str = compat
+        .api_key
+        .as_ref()
+        .map(|k| k.expose_secret().to_string())
+        .unwrap_or_else(|| "no-key".to_string());
+
     let client: openai::CompletionsClient = openai::Client::builder()
         .base_url(&compat.base_url)
-        .api_key(
-            compat
-                .api_key
-                .as_ref()
-                .map(|k| k.expose_secret().to_string())
-                .unwrap_or_else(|| "no-key".to_string()),
-        )
-        .http_headers(extra_headers)
+        .api_key(&api_key_str)
+        .http_headers(extra_headers.clone())
         .build()
         .map_err(|e| LlmError::RequestFailed {
             provider: "openai_compatible".to_string(),
@@ -265,7 +265,13 @@ fn create_openai_compatible_provider(
         compat.base_url,
         compat.model
     );
-    Ok(Arc::new(RigAdapter::new(model, &compat.model)))
+
+    let adapter = RigAdapter::new(model, &compat.model).with_native_transport(
+        &compat.base_url,
+        api_key_str,
+        extra_headers,
+    );
+    Ok(Arc::new(adapter))
 }
 
 /// Create a cheap/fast LLM provider for lightweight tasks (heartbeat, routing, evaluation).

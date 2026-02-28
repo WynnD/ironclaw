@@ -30,12 +30,25 @@ use crate::llm::provider::{
     ToolDefinition as IronToolDefinition,
 };
 
+/// Optional native HTTP transport for bypassing rig-core's serialization.
+///
+/// rig-core always serializes message content as `[{"type":"text","text":"..."}]` (array),
+/// which vLLM/SGLang endpoints choke on when tools are present. The native transport
+/// sends requests with plain string content, matching curl/SDK format.
+struct NativeTransport {
+    client: reqwest::Client,
+    base_url: String,
+    api_key: String,
+}
+
 /// Adapter that wraps a rig-core `CompletionModel` and implements `LlmProvider`.
 pub struct RigAdapter<M: CompletionModel> {
     model: M,
     model_name: String,
     input_cost: Decimal,
     output_cost: Decimal,
+    /// Native HTTP transport for K2.5 tool requests that bypass rig-core serialization.
+    native_transport: Option<NativeTransport>,
 }
 
 impl<M: CompletionModel> RigAdapter<M> {
@@ -49,7 +62,39 @@ impl<M: CompletionModel> RigAdapter<M> {
             model_name: name,
             input_cost,
             output_cost,
+            native_transport: None,
         }
+    }
+
+    /// Enable native HTTP transport for K2.5 tool requests.
+    ///
+    /// This bypasses rig-core's message serialization (which uses array content format)
+    /// and sends requests with plain string content, matching what curl sends.
+    pub fn with_native_transport(
+        mut self,
+        base_url: &str,
+        api_key: String,
+        extra_headers: reqwest::header::HeaderMap,
+    ) -> Self {
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        default_headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        default_headers.extend(extra_headers);
+
+        let client = reqwest::Client::builder()
+            .default_headers(default_headers)
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap_or_default();
+
+        self.native_transport = Some(NativeTransport {
+            client,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            api_key,
+        });
+        self
     }
 }
 
@@ -259,8 +304,8 @@ fn simplify_schema_kimi_compat_inner(schema: &JsonValue, depth: usize) -> JsonVa
             }
         }
 
-        // Keep object constraints simple for Kimi-compatible gateways.
-        out.insert("additionalProperties".to_string(), JsonValue::Bool(false));
+        // Do NOT add additionalProperties: false — vLLM/SGLang K2.5 endpoints
+        // choke on this constraint during guided decoding.
     }
 
     if let Some(items) = obj.get("items") {
@@ -768,6 +813,244 @@ fn maybe_dump_openai_payload(model_name: &str, rig_req: &RigRequest, kind: &str)
     }
 }
 
+// -- K2.5 native transport helpers --
+
+impl<M: CompletionModel + Send + Sync + 'static> RigAdapter<M> {
+    /// Send a K2.5 tool request using native HTTP transport with string content format.
+    ///
+    /// rig-core serializes content as `[{"type":"text","text":"..."}]` which vLLM/SGLang
+    /// rejects when tools are present. This sends plain string content matching curl.
+    async fn send_kimi_native_tool_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[IronToolDefinition],
+        tool_choice: Option<&str>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> Result<ToolCompletionResponse, LlmError> {
+        let transport = self.native_transport.as_ref().ok_or_else(|| {
+            LlmError::RequestFailed {
+                provider: self.model_name.clone(),
+                reason: "Native transport not configured".to_string(),
+            }
+        })?;
+
+        // Build messages with string content (matching curl format)
+        let json_messages = build_native_messages(messages);
+
+        // Build tool definitions with kimi-compat schemas
+        let tools_json: Vec<JsonValue> = tools
+            .iter()
+            .map(|t| {
+                let params =
+                    simplify_schema_kimi_compat(&normalize_schema_lenient(&t.parameters));
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": normalize_tool_description_for_model(
+                            &self.model_name, &t.name, &t.description,
+                        ),
+                        "parameters": params,
+                    }
+                })
+            })
+            .collect();
+
+        let mut payload = serde_json::json!({
+            "model": self.model_name,
+            "messages": json_messages,
+            "tools": tools_json,
+            "tool_choice": tool_choice.unwrap_or("auto"),
+        });
+
+        if let Some(t) = temperature {
+            payload["temperature"] = serde_json::json!(t);
+        }
+        if let Some(m) = max_tokens {
+            payload["max_tokens"] = serde_json::json!(m);
+        }
+
+        // Dump payload if enabled
+        if env_flag_enabled("IRONCLAW_RIG_PAYLOAD_DUMP") {
+            let path = payload_dump_path("kimi_native");
+            if let Ok(json) = serde_json::to_string_pretty(&payload) {
+                let _ = std::fs::write(&path, &json);
+                tracing::info!(
+                    model = %self.model_name,
+                    path = %path.display(),
+                    bytes = json.len(),
+                    "Wrote native K2.5 payload debug dump",
+                );
+            }
+        }
+
+        let url = format!("{}/chat/completions", transport.base_url);
+        tracing::debug!(
+            model = %self.model_name,
+            url = %url,
+            tools = tools.len(),
+            "Sending K2.5 request via native chat transport",
+        );
+
+        let response = transport
+            .client
+            .post(&url)
+            .bearer_auth(&transport.api_key)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| LlmError::RequestFailed {
+                provider: self.model_name.clone(),
+                reason: format!("Native transport request failed: {e}"),
+            })?;
+
+        let status = response.status();
+        let body = response.text().await.map_err(|e| LlmError::RequestFailed {
+            provider: self.model_name.clone(),
+            reason: format!("Failed to read response body: {e}"),
+        })?;
+
+        if !status.is_success() {
+            return Err(LlmError::RequestFailed {
+                provider: self.model_name.clone(),
+                reason: format!("HTTP {status}: {}", truncate_chars(&body, 512)),
+            });
+        }
+
+        parse_native_tool_response(&self.model_name, &body)
+    }
+}
+
+/// Build OpenAI-format messages with plain string content (not array).
+fn build_native_messages(messages: &[ChatMessage]) -> Vec<JsonValue> {
+    let mut out = Vec::new();
+    for msg in messages {
+        match msg.role {
+            crate::llm::Role::System => {
+                out.push(serde_json::json!({
+                    "role": "system",
+                    "content": msg.content,
+                }));
+            }
+            crate::llm::Role::User => {
+                out.push(serde_json::json!({
+                    "role": "user",
+                    "content": msg.content,
+                }));
+            }
+            crate::llm::Role::Assistant => {
+                if let Some(ref tool_calls) = msg.tool_calls {
+                    let tc_json: Vec<JsonValue> = tool_calls
+                        .iter()
+                        .map(|tc| {
+                            // OpenAI API expects arguments as a JSON string
+                            let args_str = if tc.arguments.is_string() {
+                                tc.arguments.as_str().unwrap_or("{}").to_string()
+                            } else {
+                                serde_json::to_string(&tc.arguments).unwrap_or_default()
+                            };
+                            serde_json::json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": args_str,
+                                }
+                            })
+                        })
+                        .collect();
+                    let content: JsonValue = if msg.content.is_empty() {
+                        JsonValue::Null
+                    } else {
+                        JsonValue::String(msg.content.clone())
+                    };
+                    out.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": content,
+                        "tool_calls": tc_json,
+                    }));
+                } else {
+                    out.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": msg.content,
+                    }));
+                }
+            }
+            crate::llm::Role::Tool => {
+                out.push(serde_json::json!({
+                    "role": "tool",
+                    "content": msg.content,
+                    "tool_call_id": msg.tool_call_id.as_deref().unwrap_or(""),
+                }));
+            }
+        }
+    }
+    out
+}
+
+/// Parse an OpenAI chat completion response into a `ToolCompletionResponse`.
+fn parse_native_tool_response(
+    model_name: &str,
+    body: &str,
+) -> Result<ToolCompletionResponse, LlmError> {
+    let resp: JsonValue = serde_json::from_str(body).map_err(|e| LlmError::RequestFailed {
+        provider: model_name.to_string(),
+        reason: format!("Failed to parse response JSON: {e}"),
+    })?;
+
+    let choice = resp["choices"]
+        .as_array()
+        .and_then(|c| c.first())
+        .ok_or_else(|| LlmError::RequestFailed {
+            provider: model_name.to_string(),
+            reason: format!(
+                "No choices in response: {}",
+                truncate_chars(body, 256)
+            ),
+        })?;
+
+    let message = &choice["message"];
+    let content = message["content"].as_str().map(String::from);
+
+    let mut tool_calls = Vec::new();
+    if let Some(tcs) = message["tool_calls"].as_array() {
+        for tc in tcs {
+            let id = tc["id"].as_str().unwrap_or("").to_string();
+            let name = tc["function"]["name"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let arguments = match tc["function"]["arguments"].as_str() {
+                Some(s) => serde_json::from_str(s).unwrap_or(JsonValue::Object(Default::default())),
+                None => tc["function"]["arguments"].clone(),
+            };
+            tool_calls.push(IronToolCall {
+                id,
+                name,
+                arguments,
+            });
+        }
+    }
+
+    let finish_reason = if !tool_calls.is_empty() {
+        FinishReason::ToolUse
+    } else {
+        FinishReason::Stop
+    };
+
+    let input_tokens = resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+    let output_tokens = resp["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+
+    Ok(ToolCompletionResponse {
+        content,
+        tool_calls,
+        input_tokens: saturate_u32(input_tokens),
+        output_tokens: saturate_u32(output_tokens),
+        finish_reason,
+    })
+}
+
 #[async_trait]
 impl<M> LlmProvider for RigAdapter<M>
 where
@@ -845,6 +1128,100 @@ where
 
         let mut messages = request.messages;
         crate::llm::provider::sanitize_tool_messages(&mut messages);
+
+        // K2.5 with native transport: bypass rig-core's array content serialization.
+        // vLLM/SGLang choke on [{"type":"text","text":"..."}] when tools are present.
+        if is_kimi_k2_5_model(&self.model_name) && self.native_transport.is_some() {
+            // Try full tools via native transport
+            match self
+                .send_kimi_native_tool_request(
+                    &messages,
+                    &request.tools,
+                    request.tool_choice.as_deref(),
+                    request.temperature,
+                    request.max_tokens,
+                )
+                .await
+            {
+                Ok(mut resp) => {
+                    normalize_tool_calls(&mut resp.tool_calls, &known_tool_names);
+                    return Ok(resp);
+                }
+                Err(e) if is_server_error_retryable_for_kimi(&e.to_string()) => {
+                    tracing::warn!(
+                        model = %self.model_name,
+                        tools = request.tools.len(),
+                        error = %e,
+                        "K2.5 native transport hit 500; trying reduced tools"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+
+            // Try reduced tools via native transport
+            let reduced_tools = kimi_reduced_tool_set(&request.tools);
+            match self
+                .send_kimi_native_tool_request(
+                    &messages,
+                    &reduced_tools,
+                    request.tool_choice.as_deref(),
+                    request.temperature,
+                    request.max_tokens,
+                )
+                .await
+            {
+                Ok(mut resp) => {
+                    normalize_tool_calls(&mut resp.tool_calls, &known_tool_names);
+                    return Ok(resp);
+                }
+                Err(e) if is_server_error_retryable_for_kimi(&e.to_string()) => {
+                    tracing::warn!(
+                        model = %self.model_name,
+                        "K2.5 native reduced tools also failed; falling back to no tools"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+
+            // Fall back to rig-core without tools (known working path)
+            let (preamble, history) = convert_messages(&messages);
+            let no_tools_req = build_rig_request(
+                preamble,
+                history,
+                Vec::new(),
+                None,
+                request.temperature,
+                request.max_tokens,
+            )?;
+            maybe_dump_openai_payload(
+                &self.model_name,
+                &no_tools_req,
+                "kimi_native_no_tools_fallback",
+            );
+
+            let response =
+                self.model
+                    .completion(no_tools_req)
+                    .await
+                    .map_err(|e| LlmError::RequestFailed {
+                        provider: self.model_name.clone(),
+                        reason: e.to_string(),
+                    })?;
+
+            let (text, mut tool_calls, finish) =
+                extract_response(&response.choice, &response.usage);
+            normalize_tool_calls(&mut tool_calls, &known_tool_names);
+
+            return Ok(ToolCompletionResponse {
+                content: text,
+                tool_calls,
+                input_tokens: saturate_u32(response.usage.input_tokens),
+                output_tokens: saturate_u32(response.usage.output_tokens),
+                finish_reason: finish,
+            });
+        }
+
+        // Standard rig-core path (non-K2.5 or K2.5 without native transport)
         let (preamble, history) = convert_messages(&messages);
         let tools = convert_tools(&self.model_name, &request.tools);
         let tool_choice = convert_tool_choice(request.tool_choice.as_deref());
@@ -937,17 +1314,7 @@ where
         let (text, mut tool_calls, finish) = extract_response(&response.choice, &response.usage);
 
         // Normalize tool call names: some proxies prepend "proxy_" prefixes.
-        for tc in &mut tool_calls {
-            let normalized = normalize_tool_name(&tc.name, &known_tool_names);
-            if normalized != tc.name {
-                tracing::debug!(
-                    original = %tc.name,
-                    normalized = %normalized,
-                    "Normalized tool call name from provider",
-                );
-                tc.name = normalized;
-            }
-        }
+        normalize_tool_calls(&mut tool_calls, &known_tool_names);
 
         Ok(ToolCompletionResponse {
             content: text,
@@ -995,6 +1362,21 @@ fn normalize_tool_name(name: &str, known_tools: &HashSet<String>) -> String {
     }
 
     name.to_string()
+}
+
+/// Normalize tool call names in-place using the known tool set.
+fn normalize_tool_calls(tool_calls: &mut [IronToolCall], known_tools: &HashSet<String>) {
+    for tc in tool_calls {
+        let normalized = normalize_tool_name(&tc.name, known_tools);
+        if normalized != tc.name {
+            tracing::debug!(
+                original = %tc.name,
+                normalized = %normalized,
+                "Normalized tool call name from provider",
+            );
+            tc.name = normalized;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1230,8 +1612,8 @@ mod tests {
             "Kimi path should drop combinators that can trigger parser bugs"
         );
         assert!(
-            params["additionalProperties"] == serde_json::json!(false),
-            "Kimi path should emit simple object constraints"
+            params.get("additionalProperties").is_none(),
+            "Kimi path should NOT emit additionalProperties (vLLM/SGLang choke on it)"
         );
         assert!(
             params.get("title").is_none(),
