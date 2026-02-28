@@ -255,6 +255,17 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Whether this tool is a core tool that should always be sent to the LLM.
+    ///
+    /// When deferred tool loading is enabled, only core tools are included in
+    /// every LLM request. Non-core (deferred) tools are discoverable via the
+    /// `discover_tools` tool and activated on demand.
+    ///
+    /// Default: `false` (deferred). Override to `true` for essential tools.
+    fn is_core(&self) -> bool {
+        false
+    }
+
     /// Get the tool schema for LLM function calling.
     fn schema(&self) -> ToolSchema {
         ToolSchema {

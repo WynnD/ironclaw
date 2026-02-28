@@ -220,6 +220,10 @@ impl Tool for MessageTool {
     fn requires_sanitization(&self) -> bool {
         false
     }
+
+    fn is_core(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

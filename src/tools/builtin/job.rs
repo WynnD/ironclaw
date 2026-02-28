@@ -757,6 +757,10 @@ impl Tool for CreateJobTool {
     fn requires_sanitization(&self) -> bool {
         false
     }
+
+    fn is_core(&self) -> bool {
+        true
+    }
 }
 
 /// Tool for listing jobs.

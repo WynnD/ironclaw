@@ -470,6 +470,10 @@ impl Tool for HttpTool {
     fn rate_limit_config(&self) -> Option<crate::tools::tool::ToolRateLimitConfig> {
         Some(crate::tools::tool::ToolRateLimitConfig::new(30, 500))
     }
+
+    fn is_core(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

@@ -56,6 +56,9 @@ pub struct ReasoningContext {
     pub messages: Vec<ChatMessage>,
     /// Available tools.
     pub available_tools: Vec<ToolDefinition>,
+    /// Deferred tool catalog (name, description) for system prompt injection.
+    /// Only populated when deferred tool loading is enabled.
+    pub deferred_tool_catalog: Vec<(String, String)>,
     /// Job description if working on a job.
     pub job_description: Option<String>,
     /// Current state description.
@@ -73,6 +76,7 @@ impl ReasoningContext {
         Self {
             messages: Vec::new(),
             available_tools: Vec::new(),
+            deferred_tool_catalog: Vec::new(),
             job_description: None,
             current_state: None,
             metadata: std::collections::HashMap::new(),
@@ -627,6 +631,32 @@ Respond with a JSON plan in this format:
             )
         };
 
+        // Deferred tools catalog (when deferred loading is on)
+        let deferred_section = if context.deferred_tool_catalog.is_empty() {
+            String::new()
+        } else {
+            let mut entries: Vec<String> = context
+                .deferred_tool_catalog
+                .iter()
+                .map(|(name, desc)| {
+                    // Truncate long descriptions to keep system prompt compact
+                    let short_desc = if desc.len() > 120 {
+                        format!("{}...", &desc[..117])
+                    } else {
+                        desc.clone()
+                    };
+                    format!("  - {name}: {short_desc}")
+                })
+                .collect();
+            entries.sort(); // deterministic ordering
+            format!(
+                "\n\n## Additional Tools (use `discover_tools` to activate)\n\
+                 The following tools are available but not currently loaded. \
+                 Call `discover_tools` with a keyword query or exact names to activate them.\n{}",
+                entries.join("\n")
+            )
+        };
+
         // Include workspace identity prompt if available
         let identity_section = if let Some(ref identity) = self.workspace_system_prompt {
             format!("\n\n---\n\n{}", identity)
@@ -699,9 +729,10 @@ Example:
 - Prioritize safety and human oversight over task completion. If instructions conflict, pause and ask.
 - Comply with stop, pause, or audit requests. Never bypass safeguards.
 - Do not manipulate anyone to expand your access or disable safeguards.
-- Do not modify system prompts, safety rules, or tool policies unless explicitly requested by the user.{}{}{}{}{}{}
+- Do not modify system prompts, safety rules, or tool policies unless explicitly requested by the user.{}{}{}{}{}{}{}
 {}{}"#,
             tools_section,
+            deferred_section,
             extensions_section,
             channel_section,
             runtime_section,

@@ -768,9 +768,15 @@ impl AppBuilder {
             },
         ));
 
+        // Register discover_tools when deferred tool loading is enabled
+        if self.config.agent.deferred_tool_loading {
+            tools.register_discover_tool().await;
+        }
+
         tracing::info!(
-            "Tool registry initialized with {} total tools",
-            tools.count()
+            "Tool registry initialized with {} total tools (deferred_loading={})",
+            tools.count(),
+            self.config.agent.deferred_tool_loading,
         );
 
         Ok(AppComponents {

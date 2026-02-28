@@ -169,6 +169,7 @@ impl Scheduler {
                 hooks: self.hooks.clone(),
                 timeout: self.config.job_timeout,
                 use_planning: self.config.use_planning,
+                deferred_tool_loading: self.config.deferred_tool_loading,
             };
             let worker = Worker::new(job_id, deps);
 

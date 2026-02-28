@@ -3,6 +3,7 @@
 //! Extracted from `agent_loop.rs` to keep the core agentic tool execution
 //! loop (LLM call -> tool calls -> repeat) in its own focused module.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -140,12 +141,16 @@ impl Agent {
         let job_ctx = JobContext::with_user(&message.user_id, "chat", "Interactive chat session");
 
         let max_tool_iterations = self.config.max_tool_iterations;
+        let deferred_tool_loading = self.config.deferred_tool_loading;
         // Force a text-only response on the last iteration to guarantee termination
         // instead of hard-erroring. The penultimate iteration also gets a nudge
         // message so the LLM knows it should wrap up.
         let force_text_at = max_tool_iterations;
         let nudge_at = max_tool_iterations.saturating_sub(1);
         let mut iteration = 0;
+
+        // Track tools activated via discover_tools (only used when deferred_tool_loading is on)
+        let mut discovered_tool_names: HashSet<String> = HashSet::new();
         loop {
             iteration += 1;
             // Hard ceiling one past the forced-text iteration (should never be reached
@@ -194,8 +199,19 @@ impl Agent {
 
             let force_text = iteration >= force_text_at;
 
-            // Refresh tool definitions each iteration so newly built tools become visible
-            let tool_defs = self.tools().tool_definitions().await;
+            // Refresh tool definitions each iteration so newly built tools become visible.
+            // When deferred loading is on, only send core + previously-discovered tools.
+            let tool_defs = if deferred_tool_loading {
+                let mut defs = self.tools().core_tool_definitions().await;
+                if !discovered_tool_names.is_empty() {
+                    let names: Vec<&str> =
+                        discovered_tool_names.iter().map(|s| s.as_str()).collect();
+                    defs.extend(self.tools().tool_definitions_for(&names).await);
+                }
+                defs
+            } else {
+                self.tools().tool_definitions().await
+            };
 
             // Apply trust-based tool attenuation if skills are active.
             let tool_defs = if !active_skills.is_empty() {
@@ -250,6 +266,12 @@ impl Agent {
                     m
                 });
             context.force_text = force_text;
+
+            // Inject deferred tool catalog into system prompt (only on first iteration
+            // to avoid repeating it every turn — the LLM sees it once and remembers)
+            if deferred_tool_loading && iteration == 1 {
+                context.deferred_tool_catalog = self.tools().deferred_tool_catalog().await;
+            }
 
             if force_text {
                 tracing::info!(
@@ -695,6 +717,35 @@ impl Agent {
                         }
                     }
 
+                    // Track discover_tools calls to expand the tool set
+                    if deferred_tool_loading {
+                        for tc in &tool_calls {
+                            if tc.name == "discover_tools" {
+                                // Search by query
+                                if let Some(q) = tc.arguments.get("query").and_then(|v| v.as_str())
+                                {
+                                    for def in self.tools().search_tools(q).await {
+                                        discovered_tool_names.insert(def.name);
+                                    }
+                                }
+                                // Resolve exact names
+                                if let Some(names) =
+                                    tc.arguments.get("names").and_then(|v| v.as_array())
+                                {
+                                    let name_strs: Vec<&str> = names
+                                        .iter()
+                                        .filter_map(|v| v.as_str())
+                                        .collect();
+                                    for def in
+                                        self.tools().tool_definitions_for(&name_strs).await
+                                    {
+                                        discovered_tool_names.insert(def.name);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Return auth response after all results are recorded
                     if let Some(instructions) = deferred_auth {
                         return Ok(AgenticLoopResult::Response(instructions));
@@ -1033,6 +1084,7 @@ mod tests {
                 context_limit_override: None,
                 context_output_reserve_tokens: 4096,
                 max_tool_output_tokens: 4096,
+                deferred_tool_loading: false,
             },
             deps,
             Arc::new(ChannelManager::new()),

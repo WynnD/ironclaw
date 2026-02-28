@@ -1,5 +1,6 @@
 //! Built-in tools that come with the agent.
 
+mod discover;
 mod echo;
 pub mod extension_tools;
 mod file;
@@ -14,6 +15,7 @@ pub(crate) mod shell;
 pub mod skill_tools;
 mod time;
 
+pub use discover::DiscoverToolsTool;
 pub use echo::EchoTool;
 pub use extension_tools::{
     ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool,

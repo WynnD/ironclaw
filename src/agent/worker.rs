@@ -35,6 +35,7 @@ pub struct WorkerDeps {
     pub hooks: Arc<HookRegistry>,
     pub timeout: Duration,
     pub use_planning: bool,
+    pub deferred_tool_loading: bool,
 }
 
 /// Worker that executes a single job.
@@ -211,6 +212,11 @@ impl Worker {
         // Build initial reasoning context (tool definitions refreshed each iteration in execution_loop)
         let mut reason_ctx = ReasoningContext::new().with_job(&job_ctx.description);
 
+        // Inject deferred tool catalog into system prompt when deferred loading is on
+        if self.deps.deferred_tool_loading {
+            reason_ctx.deferred_tool_catalog = self.tools().deferred_tool_catalog().await;
+        }
+
         // Add system message
         reason_ctx.messages.push(ChatMessage::system(format!(
             r#"You are an autonomous agent working on a job.
@@ -265,8 +271,15 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         let max_iterations = max_iterations.min(MAX_WORKER_ITERATIONS);
         let mut iteration = 0;
 
+        // Track tools activated via discover_tools (only used when deferred loading is on)
+        let mut discovered_tool_names: HashSet<String> = HashSet::new();
+
         // Initial tool definitions for planning (will be refreshed in loop)
-        reason_ctx.available_tools = self.tools().tool_definitions().await;
+        reason_ctx.available_tools = if self.deps.deferred_tool_loading {
+            self.tools().core_tool_definitions().await
+        } else {
+            self.tools().tool_definitions().await
+        };
 
         // Generate plan if planning is enabled
         let plan = if self.use_planning() {
@@ -349,8 +362,19 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 return Ok(());
             }
 
-            // Refresh tool definitions so newly built tools become visible
-            reason_ctx.available_tools = self.tools().tool_definitions().await;
+            // Refresh tool definitions so newly built tools become visible.
+            // When deferred loading is on, only send core + previously-discovered tools.
+            reason_ctx.available_tools = if self.deps.deferred_tool_loading {
+                let mut defs = self.tools().core_tool_definitions().await;
+                if !discovered_tool_names.is_empty() {
+                    let names: Vec<&str> =
+                        discovered_tool_names.iter().map(|s| s.as_str()).collect();
+                    defs.extend(self.tools().tool_definitions_for(&names).await);
+                }
+                defs
+            } else {
+                self.tools().tool_definitions().await
+            };
 
             // Select next tool(s) to use
             let selections = reasoning.select_tools(reason_ctx).await?;
@@ -466,6 +490,33 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 for (selection, result) in selections.iter().zip(results) {
                     self.process_tool_result(reason_ctx, selection, result.result)
                         .await?;
+                }
+            }
+
+            // Track discover_tools calls to expand the tool set.
+            // We check selections (from select_tools) and any respond_with_tools
+            // tool calls by re-scanning the latest messages for tool_call records.
+            if self.deps.deferred_tool_loading {
+                // Check selections from select_tools path
+                for selection in &selections {
+                    if selection.tool_name == "discover_tools" {
+                        if let Some(q) =
+                            selection.parameters.get("query").and_then(|v| v.as_str())
+                        {
+                            for def in self.tools().search_tools(q).await {
+                                discovered_tool_names.insert(def.name);
+                            }
+                        }
+                        if let Some(names) =
+                            selection.parameters.get("names").and_then(|v| v.as_array())
+                        {
+                            let name_strs: Vec<&str> =
+                                names.iter().filter_map(|v| v.as_str()).collect();
+                            for def in self.tools().tool_definitions_for(&name_strs).await {
+                                discovered_tool_names.insert(def.name);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1177,6 +1228,7 @@ mod tests {
             hooks: Arc::new(crate::hooks::HookRegistry::new()),
             timeout: Duration::from_secs(30),
             use_planning: false,
+            deferred_tool_loading: false,
         };
 
         Worker::new(job_id, deps)

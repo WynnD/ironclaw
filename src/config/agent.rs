@@ -33,6 +33,10 @@ pub struct AgentConfig {
     pub context_output_reserve_tokens: usize,
     /// Maximum estimated tokens from a single tool result allowed into LLM context.
     pub max_tool_output_tokens: usize,
+    /// When true, only core tools are sent with each LLM request.
+    /// Non-core tools are discoverable via `discover_tools` on demand.
+    /// Reduces payload size for providers with request size limits.
+    pub deferred_tool_loading: bool,
 }
 
 impl AgentConfig {
@@ -81,6 +85,7 @@ impl AgentConfig {
                 4096usize,
             )?,
             max_tool_output_tokens: parse_optional_env("MAX_TOOL_OUTPUT_TOKENS", 4096usize)?,
+            deferred_tool_loading: parse_bool_env("DEFERRED_TOOL_LOADING", false)?,
         })
     }
 }

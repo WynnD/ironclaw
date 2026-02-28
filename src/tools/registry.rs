@@ -16,11 +16,12 @@ use crate::skills::catalog::SkillCatalog;
 use crate::skills::registry::SkillRegistry;
 use crate::tools::builder::{BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder};
 use crate::tools::builtin::{
-    ApplyPatchTool, CancelJobTool, CreateJobTool, DeleteJobTool, EchoTool, HttpTool, JobEventsTool,
-    JobPromptTool, JobStatusTool, JsonTool, ListDirTool, ListJobsTool, MemoryReadTool,
-    MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool, ShellTool,
-    SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool, ToolActivateTool,
-    ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool, WriteFileTool,
+    ApplyPatchTool, CancelJobTool, CreateJobTool, DeleteJobTool, DiscoverToolsTool, EchoTool,
+    HttpTool, JobEventsTool, JobPromptTool, JobStatusTool, JsonTool, ListDirTool, ListJobsTool,
+    MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool,
+    ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool,
+    ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool,
+    WriteFileTool,
 };
 use crate::tools::rate_limiter::RateLimiter;
 use crate::tools::tool::{Tool, ToolDomain};
@@ -68,6 +69,7 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "skill_install",
     "skill_remove",
     "message",
+    "discover_tools",
 ];
 
 /// Registry of available tools.
@@ -204,6 +206,77 @@ impl ToolRegistry {
                 parameters: tool.parameters_schema(),
             })
             .collect()
+    }
+
+    /// Get tool definitions for only core tools (those with `is_core() == true`).
+    ///
+    /// Used when deferred tool loading is enabled to reduce payload size.
+    pub async fn core_tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.tools
+            .read()
+            .await
+            .values()
+            .filter(|tool| tool.is_core())
+            .map(|tool| ToolDefinition {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                parameters: tool.parameters_schema(),
+            })
+            .collect()
+    }
+
+    /// Get the catalog of deferred (non-core) tools as (name, description) pairs.
+    ///
+    /// This is injected into the system prompt so the LLM knows what's available
+    /// to discover via `discover_tools`.
+    pub async fn deferred_tool_catalog(&self) -> Vec<(String, String)> {
+        self.tools
+            .read()
+            .await
+            .values()
+            .filter(|tool| !tool.is_core())
+            .map(|tool| (tool.name().to_string(), tool.description().to_string()))
+            .collect()
+    }
+
+    /// Search tools by keyword, matching against name and description.
+    ///
+    /// Returns tool definitions for all matching tools (case-insensitive).
+    pub async fn search_tools(&self, query: &str) -> Vec<ToolDefinition> {
+        let query_lower = query.to_lowercase();
+        let keywords: Vec<&str> = query_lower.split_whitespace().collect();
+
+        self.tools
+            .read()
+            .await
+            .values()
+            .filter(|tool| {
+                let name = tool.name().to_lowercase();
+                let desc = tool.description().to_lowercase();
+                keywords
+                    .iter()
+                    .any(|kw| name.contains(kw) || desc.contains(kw))
+            })
+            .map(|tool| ToolDefinition {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                parameters: tool.parameters_schema(),
+            })
+            .collect()
+    }
+
+    /// Register the discover_tools tool (requires Arc<Self>).
+    ///
+    /// Must be called after other tool registrations so the registry
+    /// reference captures the full set.
+    pub async fn register_discover_tool(self: &Arc<Self>) {
+        let tool = DiscoverToolsTool::new(Arc::clone(self));
+        self.register(Arc::new(tool)).await;
+        self.builtin_names
+            .write()
+            .await
+            .insert("discover_tools".to_string());
+        tracing::info!("Registered discover_tools tool");
     }
 
     /// Register all built-in tools.
