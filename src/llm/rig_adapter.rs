@@ -153,10 +153,20 @@ fn prune_required_to_defined_properties(obj: &mut serde_json::Map<String, JsonVa
 }
 
 fn should_use_strict_tool_schema(model_name: &str) -> bool {
+    let model = model_name.to_ascii_lowercase();
     // Gemini (including OpenRouter `google/gemini-*` models) has stricter
     // function-schema validation and is not compatible with our OpenAI strict
     // rewrite in all cases. Keep the original schema shape for Gemini.
-    !model_name.to_ascii_lowercase().contains("gemini")
+    //
+    // Kimi K2.5 also rejects or mishandles strict schemas (all-required +
+    // additionalProperties: false) — known issue with SGLang-based serving.
+    if model.contains("gemini") {
+        return false;
+    }
+    if model.contains("kimi-k2.5") || model.contains("kimi-k2p5") || model.contains("kimi-k2-5") {
+        return false;
+    }
+    true
 }
 
 fn normalize_tool_parameters_for_model(model_name: &str, schema: &JsonValue) -> JsonValue {
