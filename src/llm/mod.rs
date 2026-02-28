@@ -27,8 +27,9 @@ pub use provider::{
     Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse, ToolDefinition, ToolResult,
 };
 pub use reasoning::{
-    ActionPlan, Reasoning, ReasoningContext, RespondOutput, RespondResult, SILENT_REPLY_TOKEN,
-    TokenUsage, ToolSelection, is_silent_reply,
+    ActionPlan, EmptyResponseRecoverySnapshot, Reasoning, ReasoningContext, RespondOutput,
+    RespondResult, SILENT_REPLY_TOKEN, TokenUsage, ToolSelection, empty_response_recovery_snapshot,
+    is_silent_reply,
 };
 pub use response_cache::{CachedProvider, ResponseCacheConfig};
 pub use retry::{RetryConfig, RetryProvider};

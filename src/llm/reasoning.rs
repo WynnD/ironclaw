@@ -1,5 +1,6 @@
 //! LLM reasoning capabilities for planning, tool selection, and evaluation.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use regex::Regex;
@@ -15,6 +16,63 @@ use crate::safety::SafetyLayer;
 /// Token the agent returns when it has nothing to say (e.g. in group chats).
 /// The dispatcher should check for this and suppress the message.
 pub const SILENT_REPLY_TOKEN: &str = "NO_REPLY";
+const EMPTY_RESPONSE_FALLBACK: &str = "I'm not sure how to respond to that.";
+
+/// Process-wide counters for empty-response recovery observability.
+struct EmptyResponseRecoveryStats {
+    recovery_attempts: AtomicU64,
+    recovery_successes: AtomicU64,
+    fallback_emitted: AtomicU64,
+}
+
+impl EmptyResponseRecoveryStats {
+    const fn new() -> Self {
+        Self {
+            recovery_attempts: AtomicU64::new(0),
+            recovery_successes: AtomicU64::new(0),
+            fallback_emitted: AtomicU64::new(0),
+        }
+    }
+}
+
+static EMPTY_RESPONSE_RECOVERY_STATS: EmptyResponseRecoveryStats =
+    EmptyResponseRecoveryStats::new();
+
+/// Snapshot of empty-response recovery telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyResponseRecoverySnapshot {
+    pub recovery_attempts: u64,
+    pub recovery_successes: u64,
+    pub fallback_emitted: u64,
+}
+
+/// Return current process-wide counters for empty-response handling.
+pub fn empty_response_recovery_snapshot() -> EmptyResponseRecoverySnapshot {
+    EmptyResponseRecoverySnapshot {
+        recovery_attempts: EMPTY_RESPONSE_RECOVERY_STATS
+            .recovery_attempts
+            .load(Ordering::Relaxed),
+        recovery_successes: EMPTY_RESPONSE_RECOVERY_STATS
+            .recovery_successes
+            .load(Ordering::Relaxed),
+        fallback_emitted: EMPTY_RESPONSE_RECOVERY_STATS
+            .fallback_emitted
+            .load(Ordering::Relaxed),
+    }
+}
+
+#[cfg(test)]
+fn reset_empty_response_recovery_stats_for_tests() {
+    EMPTY_RESPONSE_RECOVERY_STATS
+        .recovery_attempts
+        .store(0, Ordering::Relaxed);
+    EMPTY_RESPONSE_RECOVERY_STATS
+        .recovery_successes
+        .store(0, Ordering::Relaxed);
+    EMPTY_RESPONSE_RECOVERY_STATS
+        .fallback_emitted
+        .store(0, Ordering::Relaxed);
+}
 
 /// Check if a response is a silent reply (the agent has nothing to say).
 ///
@@ -471,6 +529,7 @@ Respond in JSON format:
 
         let mut messages = vec![ChatMessage::system(system_prompt)];
         messages.extend(context.messages.clone());
+        let messages_for_recovery = messages.clone();
 
         let effective_tools = if context.force_text {
             Vec::new()
@@ -487,7 +546,7 @@ Respond in JSON format:
             request.metadata = context.metadata.clone();
 
             let response = self.llm.complete_with_tools(request).await?;
-            let usage = TokenUsage {
+            let mut usage = TokenUsage {
                 input_tokens: response.input_tokens,
                 output_tokens: response.output_tokens,
             };
@@ -503,9 +562,7 @@ Respond in JSON format:
                 });
             }
 
-            let content = response
-                .content
-                .unwrap_or_else(|| "I'm not sure how to respond to that.".to_string());
+            let content = response.content.unwrap_or_default();
 
             // Some models (e.g. GLM-4.7) emit tool calls as XML tags in content
             // instead of using the structured tool_calls field. Try to recover
@@ -542,7 +599,21 @@ Respond in JSON format:
                     "LLM response was empty after cleaning (original len={}), using fallback",
                     content.len()
                 );
-                "I'm not sure how to respond to that.".to_string()
+                let (retry_text, retry_usage) = self
+                    .recover_empty_visible_response(&messages_for_recovery, &context.metadata)
+                    .await?;
+                usage.input_tokens = usage.input_tokens.saturating_add(retry_usage.input_tokens);
+                usage.output_tokens = usage
+                    .output_tokens
+                    .saturating_add(retry_usage.output_tokens);
+                if let Some(text) = retry_text {
+                    text
+                } else {
+                    EMPTY_RESPONSE_RECOVERY_STATS
+                        .fallback_emitted
+                        .fetch_add(1, Ordering::Relaxed);
+                    EMPTY_RESPONSE_FALLBACK.to_string()
+                }
             } else {
                 cleaned
             };
@@ -558,23 +629,84 @@ Respond in JSON format:
             request.metadata = context.metadata.clone();
 
             let response = self.llm.complete(request).await?;
+            let mut usage = TokenUsage {
+                input_tokens: response.input_tokens,
+                output_tokens: response.output_tokens,
+            };
             let cleaned = clean_response(&response.content);
             let final_text = if cleaned.trim().is_empty() {
                 tracing::warn!(
                     "LLM response was empty after cleaning (original len={}), using fallback",
                     response.content.len()
                 );
-                "I'm not sure how to respond to that.".to_string()
+                let (retry_text, retry_usage) = self
+                    .recover_empty_visible_response(&messages_for_recovery, &context.metadata)
+                    .await?;
+                usage.input_tokens = usage.input_tokens.saturating_add(retry_usage.input_tokens);
+                usage.output_tokens = usage
+                    .output_tokens
+                    .saturating_add(retry_usage.output_tokens);
+                if let Some(text) = retry_text {
+                    text
+                } else {
+                    EMPTY_RESPONSE_RECOVERY_STATS
+                        .fallback_emitted
+                        .fetch_add(1, Ordering::Relaxed);
+                    EMPTY_RESPONSE_FALLBACK.to_string()
+                }
             } else {
                 cleaned
             };
             Ok(RespondOutput {
                 result: RespondResult::Text(final_text),
-                usage: TokenUsage {
-                    input_tokens: response.input_tokens,
-                    output_tokens: response.output_tokens,
-                },
+                usage,
             })
+        }
+    }
+
+    /// Try once more when the model produced no user-visible text.
+    ///
+    /// Some providers occasionally return empty or reasoning-only content for a turn.
+    /// This recovery call forces a plain text completion from the same context
+    /// before falling back to a generic message.
+    async fn recover_empty_visible_response(
+        &self,
+        base_messages: &[ChatMessage],
+        metadata: &std::collections::HashMap<String, String>,
+    ) -> Result<(Option<String>, TokenUsage), LlmError> {
+        EMPTY_RESPONSE_RECOVERY_STATS
+            .recovery_attempts
+            .fetch_add(1, Ordering::Relaxed);
+
+        let mut retry_messages = base_messages.to_vec();
+        retry_messages.push(ChatMessage::system(
+            "Your previous response had no user-visible final answer. \
+             Reply now with a concise final response for the user. \
+             Do not call tools in this reply.",
+        ));
+
+        let mut retry_request = CompletionRequest::new(retry_messages)
+            .with_max_tokens(1024)
+            .with_temperature(0.2);
+        retry_request.metadata = metadata.clone();
+
+        let retry = self.llm.complete(retry_request).await?;
+        let retry_usage = TokenUsage {
+            input_tokens: retry.input_tokens,
+            output_tokens: retry.output_tokens,
+        };
+        let retry_cleaned = clean_response(&retry.content);
+        if retry_cleaned.trim().is_empty() {
+            tracing::warn!(
+                "Empty response recovery also produced no user-visible text (original len={})",
+                retry.content.len()
+            );
+            Ok((None, retry_usage))
+        } else {
+            EMPTY_RESPONSE_RECOVERY_STATS
+                .recovery_successes
+                .fetch_add(1, Ordering::Relaxed);
+            Ok((Some(retry_cleaned), retry_usage))
         }
     }
 
@@ -1582,9 +1714,229 @@ fn collapse_newlines(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    use async_trait::async_trait;
+    use rust_decimal::Decimal;
+    use tokio::sync::Mutex as AsyncMutex;
+
     use super::*;
+    use crate::config::SafetyConfig;
+    use crate::error::LlmError;
+    use crate::llm::{CompletionResponse, FinishReason, LlmProvider, ToolCompletionResponse};
+    use crate::safety::SafetyLayer;
+
+    static EMPTY_RESPONSE_TEST_GUARD: LazyLock<AsyncMutex<()>> =
+        LazyLock::new(|| AsyncMutex::new(()));
+
+    struct SequencedLlm {
+        model_name: String,
+        completions: Mutex<VecDeque<CompletionResponse>>,
+        tool_completions: Mutex<VecDeque<ToolCompletionResponse>>,
+    }
+
+    impl SequencedLlm {
+        fn new(
+            completions: Vec<CompletionResponse>,
+            tool_completions: Vec<ToolCompletionResponse>,
+        ) -> Self {
+            Self {
+                model_name: "sequenced-llm".to_string(),
+                completions: Mutex::new(VecDeque::from(completions)),
+                tool_completions: Mutex::new(VecDeque::from(tool_completions)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for SequencedLlm {
+        fn model_name(&self) -> &str {
+            &self.model_name
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            let mut queue = self.completions.lock().expect("completions lock poisoned");
+            queue.pop_front().ok_or_else(|| LlmError::InvalidResponse {
+                provider: self.model_name.clone(),
+                reason: "No queued completion response".to_string(),
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, LlmError> {
+            let mut queue = self
+                .tool_completions
+                .lock()
+                .expect("tool_completions lock poisoned");
+            queue.pop_front().ok_or_else(|| LlmError::InvalidResponse {
+                provider: self.model_name.clone(),
+                reason: "No queued tool completion response".to_string(),
+            })
+        }
+    }
 
     // ---- Utility / structural tests ----
+
+    #[tokio::test]
+    async fn test_respond_with_tools_recovers_when_tool_response_content_is_none() {
+        let _guard = EMPTY_RESPONSE_TEST_GUARD.lock().await;
+        reset_empty_response_recovery_stats_for_tests();
+        let llm: Arc<dyn LlmProvider> = Arc::new(SequencedLlm::new(
+            vec![CompletionResponse {
+                content: "<think>reasoning</think><final>Recovered answer.</final>".to_string(),
+                input_tokens: 2,
+                output_tokens: 3,
+                finish_reason: FinishReason::Stop,
+            }],
+            vec![ToolCompletionResponse {
+                content: None,
+                tool_calls: Vec::new(),
+                input_tokens: 10,
+                output_tokens: 5,
+                finish_reason: FinishReason::Stop,
+            }],
+        ));
+        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: false,
+        }));
+        let reasoning = Reasoning::new(llm, safety);
+        let context = ReasoningContext::new()
+            .with_message(ChatMessage::user("Hello"))
+            .with_tools(vec![ToolDefinition {
+                name: "time".to_string(),
+                description: "Get current time".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            }]);
+
+        let output = reasoning
+            .respond_with_tools(&context)
+            .await
+            .expect("respond_with_tools should succeed");
+        match output.result {
+            RespondResult::Text(text) => assert_eq!(text, "Recovered answer."),
+            _ => panic!("Expected text response"),
+        }
+        assert_eq!(output.usage.input_tokens, 12);
+        assert_eq!(output.usage.output_tokens, 8);
+        assert_eq!(
+            empty_response_recovery_snapshot(),
+            EmptyResponseRecoverySnapshot {
+                recovery_attempts: 1,
+                recovery_successes: 1,
+                fallback_emitted: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_respond_with_tools_recovers_when_text_response_is_empty_after_cleaning() {
+        let _guard = EMPTY_RESPONSE_TEST_GUARD.lock().await;
+        reset_empty_response_recovery_stats_for_tests();
+        let llm: Arc<dyn LlmProvider> = Arc::new(SequencedLlm::new(
+            vec![
+                CompletionResponse {
+                    content: "<think>hidden reasoning only</think>".to_string(),
+                    input_tokens: 4,
+                    output_tokens: 6,
+                    finish_reason: FinishReason::Stop,
+                },
+                CompletionResponse {
+                    content: "<final>Recovered from empty response.</final>".to_string(),
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+            Vec::new(),
+        ));
+        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: false,
+        }));
+        let reasoning = Reasoning::new(llm, safety);
+        let context = ReasoningContext::new().with_message(ChatMessage::user("Hi"));
+
+        let output = reasoning
+            .respond_with_tools(&context)
+            .await
+            .expect("respond_with_tools should succeed");
+        match output.result {
+            RespondResult::Text(text) => assert_eq!(text, "Recovered from empty response."),
+            _ => panic!("Expected text response"),
+        }
+        assert_eq!(output.usage.input_tokens, 5);
+        assert_eq!(output.usage.output_tokens, 8);
+        assert_eq!(
+            empty_response_recovery_snapshot(),
+            EmptyResponseRecoverySnapshot {
+                recovery_attempts: 1,
+                recovery_successes: 1,
+                fallback_emitted: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_respond_with_tools_emits_fallback_when_recovery_is_still_empty() {
+        let _guard = EMPTY_RESPONSE_TEST_GUARD.lock().await;
+        reset_empty_response_recovery_stats_for_tests();
+        let llm: Arc<dyn LlmProvider> = Arc::new(SequencedLlm::new(
+            vec![
+                CompletionResponse {
+                    content: "<think>still hidden</think>".to_string(),
+                    input_tokens: 3,
+                    output_tokens: 4,
+                    finish_reason: FinishReason::Stop,
+                },
+                CompletionResponse {
+                    content: "<think>also hidden</think>".to_string(),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+            Vec::new(),
+        ));
+        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: false,
+        }));
+        let reasoning = Reasoning::new(llm, safety);
+        let context = ReasoningContext::new().with_message(ChatMessage::user("Hi"));
+
+        let output = reasoning
+            .respond_with_tools(&context)
+            .await
+            .expect("respond_with_tools should succeed");
+        match output.result {
+            RespondResult::Text(text) => assert_eq!(text, EMPTY_RESPONSE_FALLBACK),
+            _ => panic!("Expected text response"),
+        }
+        assert_eq!(output.usage.input_tokens, 4);
+        assert_eq!(output.usage.output_tokens, 5);
+        assert_eq!(
+            empty_response_recovery_snapshot(),
+            EmptyResponseRecoverySnapshot {
+                recovery_attempts: 1,
+                recovery_successes: 0,
+                fallback_emitted: 1,
+            }
+        );
+    }
 
     #[test]
     fn test_extract_json() {
