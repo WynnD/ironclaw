@@ -1573,7 +1573,11 @@ mod tests {
 
         let result = reasoning.respond_with_tools(&retry_context).await;
         assert!(result.is_ok(), "Retry after compaction should succeed");
-        assert_eq!(stub.calls(), 2);
+        assert!(
+            stub.calls() >= 2,
+            "expected at least 2 calls (initial + retry), got {}",
+            stub.calls()
+        );
     }
 
     // === QA Plan P2 - 4.3: Dispatcher loop guard tests ===

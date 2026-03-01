@@ -1589,7 +1589,27 @@ fn extract_final_content(text: &str, code_regions: &[CodeRegion]) -> Option<Stri
         parts.push(normalized.to_string());
     }
 
-    Some(parts.join("\n\n"))
+    Some(stitch_final_parts(&parts))
+}
+
+fn stitch_final_parts(parts: &[String]) -> String {
+    let mut out = String::new();
+    for part in parts {
+        if out.is_empty() {
+            out.push_str(part);
+            continue;
+        }
+
+        let prev = out.chars().rev().find(|c| !c.is_whitespace());
+        let join_with_paragraph = prev.is_some_and(|c| matches!(c, '.' | '!' | '?' | ':' | ';'));
+        if join_with_paragraph {
+            out.push_str("\n\n");
+        } else {
+            out.push(' ');
+        }
+        out.push_str(part);
+    }
+    out
 }
 
 /// Strip pipe-delimited reasoning tags, respecting code regions.
