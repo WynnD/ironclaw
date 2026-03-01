@@ -160,6 +160,11 @@ impl Agent {
 
     // Convenience accessors
 
+    /// Get the scheduler (for external wiring, e.g. CreateJobTool).
+    pub fn scheduler(&self) -> Arc<Scheduler> {
+        Arc::clone(&self.scheduler)
+    }
+
     pub(super) fn store(&self) -> Option<&Arc<dyn Database>> {
         self.deps.store.as_ref()
     }
@@ -528,7 +533,7 @@ impl Agent {
                     // Load initial event cache
                     engine.refresh_event_cache().await;
 
-                    // Spawn notification forwarder
+                    // Spawn notification forwarder (mirrors heartbeat pattern)
                     let channels = self.channels.clone();
                     tokio::spawn(async move {
                         while let Some(response) = notify_rx.recv().await {
@@ -544,6 +549,8 @@ impl Agent {
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string());
 
+                            // Try the configured channel first, fall back to
+                            // broadcasting on all channels.
                             tracing::info!(
                                 notify_channel = ?notify_channel,
                                 user = %user,
@@ -852,6 +859,13 @@ impl Agent {
             Submission::Heartbeat => self.process_heartbeat().await,
             Submission::Summarize => self.process_summarize(session, thread_id).await,
             Submission::Suggest => self.process_suggest(session, thread_id).await,
+            Submission::JobStatus { job_id } => {
+                self.process_job_status(&message.user_id, job_id.as_deref())
+                    .await
+            }
+            Submission::JobCancel { job_id } => {
+                self.process_job_cancel(&message.user_id, &job_id).await
+            }
             Submission::Quit => return Ok(None),
             Submission::SwitchThread { thread_id: target } => {
                 self.process_switch_thread(message, target).await

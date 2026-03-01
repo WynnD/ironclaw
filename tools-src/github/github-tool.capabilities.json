@@ -20,7 +20,15 @@
     }
   },
   "secrets": {
-    "allowed_names": ["github_token", "github_*"]
+    "allowed_names": ["github_token"]
+  },
+  "setup": {
+    "required_secrets": [
+      {
+        "name": "github_token",
+        "prompt": "GitHub Personal Access Token (from github.com/settings/tokens)"
+      }
+    ]
   },
   "auth": {
     "secret_name": "github_token",
@@ -35,5 +43,9 @@
       "method": "GET",
       "success_status": 200
     }
+  },
+  "config": {
+    "default_limit": 30,
+    "max_limit": 100
   }
 }
