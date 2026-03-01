@@ -71,8 +71,8 @@ jobs:
           context: .
           file: Dockerfile
           push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=registry,ref=registry.wynndrahorad.com/ironclaw:buildcache
+          cache-to: type=registry,ref=registry.wynndrahorad.com/ironclaw:buildcache,mode=max
 
   # Rebuilds from GHA cache (near-instant) and pushes.
   # Only runs on main after tests AND docker-build both succeed.
@@ -98,7 +98,7 @@ jobs:
           tags: |
             registry.wynndrahorad.com/ironclaw:latest
             registry.wynndrahorad.com/ironclaw:${{ steps.meta.outputs.tag }}
-          cache-from: type=gha
+          cache-from: type=registry,ref=registry.wynndrahorad.com/ironclaw:buildcache
 
   # Roll-up job for branch protection
   run-tests:
