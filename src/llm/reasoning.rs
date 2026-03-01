@@ -88,6 +88,18 @@ pub fn is_silent_reply(text: &str) -> bool {
                 .all(|c| c.is_whitespace() || c.is_ascii_punctuation())
 }
 
+/// Simple `<think>...</think>` stripping for preprocessing raw LLM output.
+/// Unlike `clean_response`, this only removes `<think>` blocks without
+/// code-region awareness — suitable for early-stage content before it
+/// reaches the full cleaning pipeline.
+pub fn strip_think_tags(text: &str) -> String {
+    static THINK_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)<\s*think(?:ing)?\b[^>]*>.*?<\s*/\s*think(?:ing)?\s*>")
+            .expect("THINK_BLOCK_RE")
+    });
+    THINK_BLOCK_RE.replace_all(text, "").to_string()
+}
+
 /// Quick-check: bail early if no reasoning/final tags are present at all.
 static QUICK_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)<\s*/?\s*(?:think(?:ing)?|thought|thoughts|antthinking|reasoning|reflection|scratchpad|inner_monologue|final)\b").expect("QUICK_TAG_RE")
@@ -596,8 +608,9 @@ Respond in JSON format:
             let cleaned = clean_response(&content);
             let final_text = if cleaned.trim().is_empty() {
                 tracing::warn!(
-                    "LLM response was empty after cleaning (original len={}), using fallback",
-                    content.len()
+                    "LLM response was empty after cleaning (original len={}, first 200 chars={:?}), using fallback",
+                    content.len(),
+                    &content[..content.len().min(200)]
                 );
                 let (retry_text, retry_usage) = self
                     .recover_empty_visible_response(&messages_for_recovery, &context.metadata)
@@ -1741,7 +1754,7 @@ fn collapse_exact_duplicate_response(text: &str) -> String {
         return trimmed.to_string();
     }
 
-    // Try split points at whitespace boundaries and check `left == right`.
+    // Pass 1: exact / whitespace-normalized duplicate at any split point.
     for (idx, ch) in trimmed.char_indices() {
         if !ch.is_whitespace() {
             continue;
@@ -1754,6 +1767,35 @@ fn collapse_exact_duplicate_response(text: &str) -> String {
 
         if left == right || normalized_whitespace_eq(left, right) {
             return left.to_string();
+        }
+    }
+
+    // Pass 2: near-duplicate detection via repeated prefix — O(n).
+    // GLM5 pattern: the answer appears twice with minor differences (extra
+    // trailing sentence or small preamble). We find positions where
+    // words[0] recurs, then verify the match length from that anchor.
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    if words.len() >= 14 {
+        let first_word = words[0];
+        let limit = words.len() * 2 / 3;
+        for start in 1..limit {
+            if !words[start].eq_ignore_ascii_case(first_word) {
+                continue;
+            }
+            // Anchor found — count matching prefix length
+            let prefix_len = words[start..]
+                .iter()
+                .zip(words.iter())
+                .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
+                .count();
+            let shorter_side = start.min(words.len() - start);
+            if prefix_len >= 7 && prefix_len * 10 >= shorter_side * 6 {
+                if start <= words.len() - start {
+                    return words[..start].join(" ");
+                } else {
+                    return words[start..].join(" ");
+                }
+            }
         }
     }
 
@@ -2583,6 +2625,55 @@ That's my plan."#;
             "Thanks for the link. Let me read the docs to understand how the Codex \
              MCP is supposed to work, then retry properly."
         );
+    }
+
+    #[test]
+    fn test_clean_response_dedupes_near_duplicate_via_substring() {
+        // GLM5 pattern: answer appears twice, second copy has a trailing sentence
+        let input = "The fix is to update the config file and restart the service. \
+                     The fix is to update the config file and restart the service. \
+                     Let me know if you need more help.";
+        let cleaned = clean_response(input);
+        assert_eq!(
+            cleaned,
+            "The fix is to update the config file and restart the service."
+        );
+    }
+
+    #[test]
+    fn test_collapse_near_duplicate_with_preamble_difference() {
+        // Near-duplicate where the second copy has a short preamble ("So,").
+        // The algorithm detects the repeat and keeps the shorter copy.
+        let input = "Here is my analysis of the situation and the recommended fix. \
+                     So, here is my analysis of the situation and the recommended fix.";
+        let cleaned = collapse_exact_duplicate_response(input);
+        assert_eq!(
+            cleaned,
+            "here is my analysis of the situation and the recommended fix."
+        );
+    }
+
+    #[test]
+    fn test_collapse_does_not_catch_distant_substring_match() {
+        // Two distinct paragraphs where one is much longer — NOT a near-duplicate.
+        // The short part happens to be a substring of the long part but the split
+        // point would be far from the midpoint, so it should NOT collapse.
+        let input = "You should update the configuration. \
+                     The configuration file is located at /etc/app/config.yaml \
+                     and you should update the configuration to include the new \
+                     database credentials before restarting the service.";
+        let result = collapse_exact_duplicate_response(input);
+        assert_eq!(result, input.trim());
+    }
+
+    #[test]
+    fn test_collapse_does_not_catch_coincidental_repetition() {
+        // Legitimate content that has some repeated phrases but is NOT a duplicate
+        let input = "The error occurs when the server starts. Check the server logs \
+                     for details about why the server starts failing. The server logs \
+                     are in /var/log/app.log and will show the exact error message.";
+        let result = collapse_exact_duplicate_response(input);
+        assert_eq!(result, input.trim());
     }
 
     #[test]

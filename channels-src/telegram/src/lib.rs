@@ -285,8 +285,12 @@ fn classify_status_update(update: &StatusUpdate) -> Option<TelegramStatusAction>
     match update.status {
         StatusType::Thinking => Some(TelegramStatusAction::Typing),
         StatusType::Done | StatusType::Interrupted => None,
-        // Tool telemetry can be noisy in chat; keep it as typing-only UX.
-        StatusType::ToolStarted | StatusType::ToolCompleted | StatusType::ToolResult => None,
+        // Show tool start/completion as brief notifications so users see progress.
+        // ToolResult is omitted — results feed into the LLM and the final response covers it.
+        StatusType::ToolStarted | StatusType::ToolCompleted => {
+            status_message_for_user(update).map(TelegramStatusAction::Notify)
+        }
+        StatusType::ToolResult => None,
         StatusType::Status => {
             let msg = update.message.trim();
             if msg.eq_ignore_ascii_case("Done")
