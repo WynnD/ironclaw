@@ -398,8 +398,8 @@ mod tests {
 
         let tools: Vec<Box<dyn Tool>> = vec![
             Box::new(CreateJobTool::new(Arc::clone(&ctx_mgr))),
-            Box::new(ListJobsTool::new(Arc::clone(&ctx_mgr))),
-            Box::new(JobStatusTool::new(Arc::clone(&ctx_mgr))),
+            Box::new(ListJobsTool::new(Arc::clone(&ctx_mgr), None)),
+            Box::new(JobStatusTool::new(Arc::clone(&ctx_mgr), None)),
             Box::new(CancelJobTool::new(Arc::clone(&ctx_mgr))),
         ];
 
