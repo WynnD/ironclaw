@@ -1542,25 +1542,35 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_status_update_tool_started_ignored() {
+    fn test_classify_status_update_tool_started_notify() {
         let update = StatusUpdate {
             status: StatusType::ToolStarted,
             message: "Tool started: http_request".to_string(),
             metadata_json: "{}".to_string(),
         };
 
-        assert_eq!(classify_status_update(&update), None);
+        assert_eq!(
+            classify_status_update(&update),
+            Some(TelegramStatusAction::Notify(
+                "Tool started: http_request".to_string()
+            ))
+        );
     }
 
     #[test]
-    fn test_classify_status_update_tool_completed_ignored() {
+    fn test_classify_status_update_tool_completed_notify() {
         let update = StatusUpdate {
             status: StatusType::ToolCompleted,
             message: "Tool completed: http_request (ok)".to_string(),
             metadata_json: "{}".to_string(),
         };
 
-        assert_eq!(classify_status_update(&update), None);
+        assert_eq!(
+            classify_status_update(&update),
+            Some(TelegramStatusAction::Notify(
+                "Tool completed: http_request (ok)".to_string()
+            ))
+        );
     }
 
     #[test]
