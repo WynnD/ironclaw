@@ -838,12 +838,13 @@ impl<M: CompletionModel + Send + Sync + 'static> RigAdapter<M> {
         temperature: Option<f32>,
         max_tokens: Option<u32>,
     ) -> Result<ToolCompletionResponse, LlmError> {
-        let transport = self.native_transport.as_ref().ok_or_else(|| {
-            LlmError::RequestFailed {
+        let transport = self
+            .native_transport
+            .as_ref()
+            .ok_or_else(|| LlmError::RequestFailed {
                 provider: self.model_name.clone(),
                 reason: "Native transport not configured".to_string(),
-            }
-        })?;
+            })?;
 
         // Build messages with string content (matching curl format)
         let json_messages = build_native_messages(messages);
@@ -852,8 +853,7 @@ impl<M: CompletionModel + Send + Sync + 'static> RigAdapter<M> {
         let tools_json: Vec<JsonValue> = tools
             .iter()
             .map(|t| {
-                let params =
-                    simplify_schema_kimi_compat(&normalize_schema_lenient(&t.parameters));
+                let params = simplify_schema_kimi_compat(&normalize_schema_lenient(&t.parameters));
                 serde_json::json!({
                     "type": "function",
                     "function": {
@@ -943,12 +943,13 @@ impl<M: CompletionModel + Send + Sync + 'static> RigAdapter<M> {
         temperature: Option<f32>,
         max_tokens: Option<u32>,
     ) -> Result<ToolCompletionResponse, LlmError> {
-        let transport = self.native_transport.as_ref().ok_or_else(|| {
-            LlmError::RequestFailed {
+        let transport = self
+            .native_transport
+            .as_ref()
+            .ok_or_else(|| LlmError::RequestFailed {
                 provider: self.model_name.clone(),
                 reason: "Native transport not configured".to_string(),
-            }
-        })?;
+            })?;
 
         let json_messages = build_native_messages(messages);
 
@@ -1052,10 +1053,7 @@ fn inject_tools_into_system_prompt(messages: &mut Vec<ChatMessage>, tools: &[Iro
             let params: Vec<String> = obj
                 .iter()
                 .map(|(name, schema)| {
-                    let ty = schema
-                        .get("type")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("any");
+                    let ty = schema.get("type").and_then(|t| t.as_str()).unwrap_or("any");
                     let req = if required.contains(&name.as_str()) {
                         " (required)"
                     } else {
@@ -1087,7 +1085,10 @@ fn inject_tools_into_system_prompt(messages: &mut Vec<ChatMessage>, tools: &[Iro
     }
 
     // Find the first system message and append the tool section
-    if let Some(sys_msg) = messages.iter_mut().find(|m| m.role == crate::llm::Role::System) {
+    if let Some(sys_msg) = messages
+        .iter_mut()
+        .find(|m| m.role == crate::llm::Role::System)
+    {
         sys_msg.content.push_str(&tool_section);
     } else {
         // No system message — prepend one
@@ -1186,10 +1187,7 @@ fn parse_native_tool_response(
         .and_then(|c| c.first())
         .ok_or_else(|| LlmError::RequestFailed {
             provider: model_name.to_string(),
-            reason: format!(
-                "No choices in response: {}",
-                truncate_chars(body, 256)
-            ),
+            reason: format!("No choices in response: {}", truncate_chars(body, 256)),
         })?;
 
     let message = &choice["message"];
@@ -1199,10 +1197,7 @@ fn parse_native_tool_response(
     if let Some(tcs) = message["tool_calls"].as_array() {
         for tc in tcs {
             let id = tc["id"].as_str().unwrap_or("").to_string();
-            let name = tc["function"]["name"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+            let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
             let arguments = match tc["function"]["arguments"].as_str() {
                 Some(s) => serde_json::from_str(s).unwrap_or(JsonValue::Object(Default::default())),
                 None => tc["function"]["arguments"].clone(),
@@ -2174,6 +2169,10 @@ mod tests {
             }),
         }];
         inject_tools_into_system_prompt(&mut messages, &tools);
-        assert!(messages[0].content.contains(r#"["now", "parse", "format"]"#));
+        assert!(
+            messages[0]
+                .content
+                .contains(r#"["now", "parse", "format"]"#)
+        );
     }
 }
