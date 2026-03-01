@@ -24,7 +24,7 @@ use crate::db::Database;
 use crate::history::SandboxJobRecord;
 use crate::orchestrator::auth::CredentialGrant;
 use crate::orchestrator::job_manager::{ContainerJobManager, JobMode};
-use crate::secrets::SecretsStore;
+use crate::secrets::{CreateSecretParams, SecretsStore};
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput, require_str};
 
 /// Lazy scheduler reference, filled after Agent::new creates the Scheduler.
@@ -213,6 +213,74 @@ impl CreateJobTool {
         }
 
         Ok(grants)
+    }
+
+    /// Ensure Claude Code subscription credentials are granted when running in
+    /// `claude_code` mode.
+    ///
+    /// The credentials are stored encrypted in the SecretsStore. If missing,
+    /// this attempts a one-time import from the local `claude login` session.
+    async fn attach_claude_subscription_credentials(
+        &self,
+        user_id: &str,
+        grants: &mut Vec<CredentialGrant>,
+    ) -> Result<(), ToolError> {
+        let required_env_var = crate::config::CLAUDE_CODE_CREDENTIALS_ENV_VAR;
+        if grants.iter().any(|g| g.env_var == required_env_var) {
+            return Ok(());
+        }
+
+        let secret_name = crate::config::CLAUDE_CODE_SUBSCRIPTION_SECRET_NAME;
+        let secrets = self.secrets_store.as_ref().ok_or_else(|| {
+            ToolError::ExecutionFailed(
+                "Claude Code subscription mode requires a configured secrets store. \
+                 Set SECRETS_MASTER_KEY and re-run."
+                    .to_string(),
+            )
+        })?;
+
+        let exists = secrets.exists(user_id, secret_name).await.map_err(|e| {
+            ToolError::ExecutionFailed(format!(
+                "failed to check Claude Code subscription secret '{}': {}",
+                secret_name, e
+            ))
+        })?;
+
+        if !exists {
+            let imported = crate::config::ClaudeCodeConfig::extract_subscription_credentials_json()
+                .ok_or_else(|| {
+                    ToolError::ExecutionFailed(
+                        "Claude Code subscription is not configured. Run `claude login` \
+                         on the host, then create the job again."
+                            .to_string(),
+                    )
+                })?;
+
+            secrets
+                .create(
+                    user_id,
+                    CreateSecretParams::new(secret_name, imported).with_provider("claude_code"),
+                )
+                .await
+                .map_err(|e| {
+                    ToolError::ExecutionFailed(format!(
+                        "failed to store Claude Code subscription credentials: {}",
+                        e
+                    ))
+                })?;
+
+            tracing::info!(
+                user_id = %user_id,
+                "Imported Claude Code subscription credentials into encrypted secrets store"
+            );
+        }
+
+        grants.push(CredentialGrant {
+            secret_name: secret_name.to_string(),
+            env_var: required_env_var.to_string(),
+        });
+
+        Ok(())
     }
 
     /// Persist a sandbox job record (fire-and-forget).
@@ -790,7 +858,11 @@ impl Tool for CreateJobTool {
                 .map(PathBuf::from);
 
             // Parse and validate credential grants
-            let credential_grants = self.parse_credentials(&params, &ctx.user_id).await?;
+            let mut credential_grants = self.parse_credentials(&params, &ctx.user_id).await?;
+            if mode == JobMode::ClaudeCode {
+                self.attach_claude_subscription_credentials(&ctx.user_id, &mut credential_grants)
+                    .await?;
+            }
 
             // Combine title and description into the task prompt for the sub-agent.
             let task = format!("{}\n\n{}", title, description);
@@ -1822,6 +1894,90 @@ mod tests {
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].secret_name, "github_token");
         assert_eq!(grants[0].env_var, "GITHUB_TOKEN");
+    }
+
+    #[tokio::test]
+    async fn test_attach_claude_subscription_requires_secrets_store() {
+        let manager = Arc::new(ContextManager::new(5));
+        let tool = CreateJobTool::new(manager);
+        let mut grants = Vec::new();
+
+        let err = tool
+            .attach_claude_subscription_credentials("user1", &mut grants)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("requires a configured secrets store"),
+            "expected missing secrets-store error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_attach_claude_subscription_adds_grant_when_secret_exists() {
+        use crate::secrets::{CreateSecretParams, InMemorySecretsStore, SecretsCrypto};
+        use secrecy::SecretString;
+
+        let manager = Arc::new(ContextManager::new(5));
+        let key = "0123456789abcdef0123456789abcdef";
+        let crypto = Arc::new(SecretsCrypto::new(SecretString::from(key.to_string())).unwrap());
+        let secrets: Arc<dyn SecretsStore + Send + Sync> =
+            Arc::new(InMemorySecretsStore::new(Arc::clone(&crypto)));
+
+        secrets
+            .create(
+                "user1",
+                CreateSecretParams::new(
+                    crate::config::CLAUDE_CODE_SUBSCRIPTION_SECRET_NAME,
+                    r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-test"}}"#,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let tool = CreateJobTool::new(manager).with_secrets(Arc::clone(&secrets));
+        let mut grants = Vec::new();
+        tool.attach_claude_subscription_credentials("user1", &mut grants)
+            .await
+            .unwrap();
+
+        assert_eq!(grants.len(), 1);
+        assert_eq!(
+            grants[0].secret_name,
+            crate::config::CLAUDE_CODE_SUBSCRIPTION_SECRET_NAME
+        );
+        assert_eq!(
+            grants[0].env_var,
+            crate::config::CLAUDE_CODE_CREDENTIALS_ENV_VAR
+        );
+    }
+
+    #[tokio::test]
+    async fn test_attach_claude_subscription_no_duplicate_required_env_var() {
+        use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
+        use secrecy::SecretString;
+
+        let manager = Arc::new(ContextManager::new(5));
+        let key = "0123456789abcdef0123456789abcdef";
+        let crypto = Arc::new(SecretsCrypto::new(SecretString::from(key.to_string())).unwrap());
+        let secrets: Arc<dyn SecretsStore + Send + Sync> =
+            Arc::new(InMemorySecretsStore::new(Arc::clone(&crypto)));
+        let tool = CreateJobTool::new(manager).with_secrets(Arc::clone(&secrets));
+
+        let mut grants = vec![CredentialGrant {
+            secret_name: "already_set".to_string(),
+            env_var: crate::config::CLAUDE_CODE_CREDENTIALS_ENV_VAR.to_string(),
+        }];
+
+        tool.attach_claude_subscription_credentials("user1", &mut grants)
+            .await
+            .unwrap();
+        assert_eq!(
+            grants.len(),
+            1,
+            "should not duplicate required env-var grant"
+        );
     }
 
     fn test_prompt_tool(queue: PromptQueue) -> JobPromptTool {

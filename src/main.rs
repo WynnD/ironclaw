@@ -260,14 +260,18 @@ async fn async_main() -> anyhow::Result<()> {
 
     let container_job_manager: Option<Arc<ContainerJobManager>> =
         if config.sandbox.enabled && docker_status.is_ok() {
+            let orchestrator_user_id = config
+                .channels
+                .gateway
+                .as_ref()
+                .map(|g| g.user_id.clone())
+                .unwrap_or_else(|| "default".to_string());
             let token_store = TokenStore::new();
             let job_config = ContainerJobConfig {
                 image: config.sandbox.image.clone(),
                 memory_limit_mb: config.sandbox.memory_limit_mb,
                 cpu_shares: config.sandbox.cpu_shares,
                 orchestrator_port: 50051,
-                claude_code_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
-                claude_code_oauth_token: ironclaw::config::ClaudeCodeConfig::extract_oauth_token(),
                 claude_code_model: config.claude_code.model.clone(),
                 claude_code_max_turns: config.claude_code.max_turns,
                 claude_code_memory_limit_mb: config.claude_code.memory_limit_mb,
@@ -284,7 +288,7 @@ async fn async_main() -> anyhow::Result<()> {
                 prompt_queue: Arc::clone(&prompt_queue),
                 store: components.db.clone(),
                 secrets_store: components.secrets_store.clone(),
-                user_id: "default".to_string(),
+                user_id: orchestrator_user_id,
             };
 
             tokio::spawn(async move {

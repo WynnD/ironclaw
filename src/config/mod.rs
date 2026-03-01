@@ -42,7 +42,10 @@ pub use self::llm::{
 };
 pub use self::routines::{RoutineConfig, RoutineCronTimezone};
 pub use self::safety::SafetyConfig;
-pub use self::sandbox::{ClaudeCodeConfig, SandboxModeConfig};
+pub use self::sandbox::{
+    CLAUDE_CODE_CREDENTIALS_ENV_VAR, CLAUDE_CODE_SUBSCRIPTION_SECRET_NAME, ClaudeCodeConfig,
+    SandboxModeConfig,
+};
 pub use self::secrets::SecretsConfig;
 pub use self::skills::SkillsConfig;
 pub use self::tunnel::TunnelConfig;
