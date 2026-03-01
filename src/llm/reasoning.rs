@@ -1466,7 +1466,11 @@ fn clean_response(text: &str) -> String {
     result = strip_section_tool_calls(&result);
 
     // 7. Collapse triple+ newlines, trim
-    collapse_newlines(&result)
+    let collapsed = collapse_newlines(&result);
+
+    // Some providers occasionally duplicate the exact same final response
+    // back-to-back in one completion. Collapse that case.
+    collapse_exact_duplicate_response(&collapsed)
 }
 
 /// Tool-related tags stripped with simple string matching (no code-awareness needed).
@@ -1724,6 +1728,42 @@ fn collapse_newlines(text: &str) -> String {
         result = result.replace("\n\n\n", "\n\n");
     }
     result.trim().to_string()
+}
+
+/// Collapse exact duplicated full responses (`X X`) while preserving the first copy.
+///
+/// Conservative guardrails:
+/// - only consider longer outputs (to avoid touching intentional short repetition)
+/// - require exact string match after optional whitespace normalization
+fn collapse_exact_duplicate_response(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.len() < 80 {
+        return trimmed.to_string();
+    }
+
+    // Try split points at whitespace boundaries and check `left == right`.
+    for (idx, ch) in trimmed.char_indices() {
+        if !ch.is_whitespace() {
+            continue;
+        }
+        let left = trimmed[..idx].trim_end();
+        let right = trimmed[idx..].trim_start();
+        if left.len() < 40 || right.len() < 40 {
+            continue;
+        }
+
+        if left == right || normalized_whitespace_eq(left, right) {
+            return left.to_string();
+        }
+    }
+
+    trimmed.to_string()
+}
+
+fn normalized_whitespace_eq(a: &str, b: &str) -> bool {
+    let a_parts: Vec<&str> = a.split_whitespace().collect();
+    let b_parts: Vec<&str> = b.split_whitespace().collect();
+    a_parts == b_parts
 }
 
 #[cfg(test)]
@@ -2529,5 +2569,26 @@ That's my plan."#;
         let input = "<final>First line.</final><final>Second line.</final>";
         let cleaned = clean_response(input);
         assert_eq!(cleaned, "First line.\n\nSecond line.");
+    }
+
+    #[test]
+    fn test_clean_response_dedupes_plain_exact_duplicate_response() {
+        let input = "Thanks for the link. Let me read the docs to understand how \
+                     the Codex MCP is supposed to work, then retry properly. \
+                     Thanks for the link. Let me read the docs to understand how \
+                     the Codex MCP is supposed to work, then retry properly.";
+        let cleaned = clean_response(input);
+        assert_eq!(
+            cleaned,
+            "Thanks for the link. Let me read the docs to understand how the Codex \
+             MCP is supposed to work, then retry properly."
+        );
+    }
+
+    #[test]
+    fn test_clean_response_keeps_short_repetition() {
+        let input = "ok ok";
+        let cleaned = clean_response(input);
+        assert_eq!(cleaned, "ok ok");
     }
 }
