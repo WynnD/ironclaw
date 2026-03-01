@@ -9,10 +9,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::RwLock;
+use wasmtime::Store;
+use wasmtime::component::Linker;
 use wasmtime::{Config, Engine, OptLevel};
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 
 use crate::tools::wasm::error::WasmError;
 use crate::tools::wasm::limits::{FuelConfig, ResourceLimits};
+
+// Generate component model bindings from the shared tool WIT contract so we can
+// call `description()` and `schema()` during module preparation.
+wasmtime::component::bindgen!({
+    path: "wit/tool.wit",
+    world: "sandboxed-tool",
+    async: false,
+    with: {},
+});
 
 /// Default epoch tick interval. Each tick increments the engine's epoch counter,
 /// which causes any store with an expired epoch deadline to trap.
@@ -206,11 +218,18 @@ impl WasmToolRuntime {
             let component = wasmtime::component::Component::new(&engine, &wasm_bytes)
                 .map_err(|e| WasmError::CompilationFailed(e.to_string()))?;
 
-            // We need to instantiate briefly to extract metadata.
-            // In a full implementation, we'd use WIT bindgen to get typed access.
-            // For now, we extract what we can from the component.
-            let description = extract_tool_description(&engine, &component)?;
-            let schema = extract_tool_schema(&engine, &component)?;
+            // Instantiate once to read metadata from exports (`description`, `schema`).
+            let (description, schema) = match extract_tool_metadata(&engine, &component) {
+                Ok(metadata) => metadata,
+                Err(e) => {
+                    tracing::warn!(
+                        name = %name,
+                        error = %e,
+                        "Failed to extract WASM tool metadata; using fallback description/schema"
+                    );
+                    (default_tool_description(), default_tool_schema())
+                }
+            };
 
             Ok::<_, WasmError>(PreparedModule {
                 name: name.clone(),
@@ -262,34 +281,135 @@ impl WasmToolRuntime {
     }
 }
 
-/// Extract tool description from a compiled component.
+/// Minimal store data for metadata extraction.
 ///
-/// In a full implementation, this would use WIT bindgen to call the description() export.
-/// For now, we return a placeholder since we can't easily introspect without more setup.
-fn extract_tool_description(
-    _engine: &Engine,
-    _component: &wasmtime::component::Component,
-) -> Result<String, WasmError> {
-    // TODO: Use WIT bindgen to properly extract description
-    // This requires instantiating with a linker, which needs host functions.
-    // For now, tools should have their description set externally.
-    Ok("WASM sandboxed tool".to_string())
+/// Metadata methods should be pure, but the world imports host+WASI interfaces,
+/// so instantiation still requires these to be wired.
+struct MetadataStoreData {
+    wasi: WasiCtx,
+    table: ResourceTable,
 }
 
-/// Extract tool schema from a compiled component.
-///
-/// In a full implementation, this would use WIT bindgen to call the schema() export.
-fn extract_tool_schema(
-    _engine: &Engine,
-    _component: &wasmtime::component::Component,
-) -> Result<serde_json::Value, WasmError> {
-    // TODO: Use WIT bindgen to properly extract schema
-    // For now, return a minimal schema that accepts any object.
-    Ok(serde_json::json!({
+impl MetadataStoreData {
+    fn new() -> Self {
+        Self {
+            wasi: WasiCtxBuilder::new().build(),
+            table: ResourceTable::new(),
+        }
+    }
+}
+
+impl WasiView for MetadataStoreData {
+    fn ctx(&mut self) -> &mut WasiCtx {
+        &mut self.wasi
+    }
+
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.table
+    }
+}
+
+impl near::agent::host::Host for MetadataStoreData {
+    fn log(&mut self, _level: near::agent::host::LogLevel, _message: String) {}
+
+    fn now_millis(&mut self) -> u64 {
+        0
+    }
+
+    fn workspace_read(&mut self, _path: String) -> Option<String> {
+        None
+    }
+
+    fn http_request(
+        &mut self,
+        _method: String,
+        _url: String,
+        _headers_json: String,
+        _body: Option<Vec<u8>>,
+        _timeout_ms: Option<u32>,
+    ) -> Result<near::agent::host::HttpResponse, String> {
+        Err("http_request is unavailable during metadata extraction".to_string())
+    }
+
+    fn tool_invoke(&mut self, _alias: String, _params_json: String) -> Result<String, String> {
+        Err("tool_invoke is unavailable during metadata extraction".to_string())
+    }
+
+    fn secret_exists(&mut self, _name: String) -> bool {
+        false
+    }
+}
+
+fn default_tool_description() -> String {
+    "WASM sandboxed tool".to_string()
+}
+
+fn default_tool_schema() -> serde_json::Value {
+    serde_json::json!({
         "type": "object",
         "properties": {},
         "additionalProperties": true
-    }))
+    })
+}
+
+fn normalize_tool_description(description: String) -> String {
+    let trimmed = description.trim();
+    if trimmed.is_empty() {
+        default_tool_description()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Parse and validate the schema string exported by a WASM tool.
+pub(crate) fn parse_tool_schema(schema_json: &str) -> Result<serde_json::Value, WasmError> {
+    let schema: serde_json::Value = serde_json::from_str(schema_json).map_err(|e| {
+        WasmError::InvalidResponseJson(format!("Tool schema export is not valid JSON: {}", e))
+    })?;
+
+    if !schema.is_object() {
+        return Err(WasmError::InvalidResponseJson(
+            "Tool schema export must be a JSON object".to_string(),
+        ));
+    }
+
+    Ok(schema)
+}
+
+/// Extract description + parameter schema from a compiled component by calling
+/// the exported metadata methods in the WIT `tool` interface.
+fn extract_tool_metadata(
+    engine: &Engine,
+    component: &wasmtime::component::Component,
+) -> Result<(String, serde_json::Value), WasmError> {
+    let mut linker = Linker::new(engine);
+    wasmtime_wasi::add_to_linker_sync(&mut linker)
+        .map_err(|e| WasmError::ConfigError(format!("Failed to add WASI linker: {}", e)))?;
+    near::agent::host::add_to_linker(&mut linker, |state| state).map_err(|e| {
+        WasmError::ConfigError(format!(
+            "Failed to add host linker for metadata extraction: {}",
+            e
+        ))
+    })?;
+
+    let mut store = Store::new(engine, MetadataStoreData::new());
+    let instance = SandboxedTool::instantiate(&mut store, component, &linker).map_err(|e| {
+        WasmError::InstantiationFailed(format!(
+            "Failed to instantiate WASM component for metadata extraction: {}",
+            e
+        ))
+    })?;
+
+    let tool_iface = instance.near_agent_tool();
+    let description = tool_iface.call_description(&mut store).map_err(|e| {
+        WasmError::InvalidResponseJson(format!("WASM description() export call failed: {}", e))
+    })?;
+    let schema_json = tool_iface.call_schema(&mut store).map_err(|e| {
+        WasmError::InvalidResponseJson(format!("WASM schema() export call failed: {}", e))
+    })?;
+    let schema = parse_tool_schema(&schema_json)?;
+
+    Ok((normalize_tool_description(description), schema))
 }
 
 impl std::fmt::Debug for WasmToolRuntime {
@@ -303,8 +423,12 @@ impl std::fmt::Debug for WasmToolRuntime {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use crate::tools::wasm::limits::ResourceLimits;
-    use crate::tools::wasm::runtime::{WasmRuntimeConfig, WasmToolRuntime};
+    use crate::tools::wasm::runtime::{
+        WasmRuntimeConfig, WasmToolRuntime, normalize_tool_description, parse_tool_schema,
+    };
 
     #[test]
     fn test_runtime_config_default() {
@@ -360,5 +484,39 @@ mod tests {
         // Runtime should succeed even though no tools directory exists.
         let runtime = WasmToolRuntime::new(config).expect("runtime should init without tools dir");
         assert!(runtime.config().fuel_config.enabled);
+    }
+
+    #[test]
+    fn test_parse_tool_schema_valid_object() {
+        let schema =
+            parse_tool_schema(r#"{"type":"object","properties":{"action":{"type":"string"}}}"#)
+                .expect("schema parse should succeed");
+        assert_eq!(schema["type"], json!("object"));
+        assert!(schema["properties"]["action"].is_object());
+    }
+
+    #[test]
+    fn test_parse_tool_schema_invalid_json() {
+        let err = parse_tool_schema("{not-json").expect_err("invalid json should be rejected");
+        assert!(err.to_string().contains("not valid JSON"));
+    }
+
+    #[test]
+    fn test_parse_tool_schema_rejects_non_object() {
+        let err =
+            parse_tool_schema(r#"["array"]"#).expect_err("non-object schemas should be rejected");
+        assert!(err.to_string().contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn test_normalize_tool_description_fallback() {
+        assert_eq!(
+            normalize_tool_description("  ".to_string()),
+            "WASM sandboxed tool"
+        );
+        assert_eq!(
+            normalize_tool_description("  Google Calendar tool  ".to_string()),
+            "Google Calendar tool"
+        );
     }
 }
