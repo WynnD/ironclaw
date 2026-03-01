@@ -718,12 +718,12 @@ async fn auth_tool(name: String, dir: Option<PathBuf>, user_id: String) -> anyho
         .clone()
         .or_else(|| infer_legacy_auth_config(&name, &caps))
         .ok_or_else(|| {
-        anyhow::anyhow!(
-            "Tool '{}' has no auth configuration.\n\
+            anyhow::anyhow!(
+                "Tool '{}' has no auth configuration.\n\
              The tool may not require authentication, or auth setup is not defined.",
-            name
-        )
-    })?;
+                name
+            )
+        })?;
 
     let display_name = auth.display_name.as_deref().unwrap_or(&name);
 
