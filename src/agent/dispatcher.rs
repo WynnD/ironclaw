@@ -457,16 +457,18 @@ impl Agent {
                         }
 
                         // Check if tool requires approval on the final (post-hook)
-                        // parameters. Skipped when auto_approve_tools is set.
-                        if !self.config.auto_approve_tools
-                            && let Some(tool) = self.tools().get(&tc.name).await
-                        {
+                        // parameters.
+                        if let Some(tool) = self.tools().get(&tc.name).await {
                             use crate::tools::ApprovalRequirement;
                             let needs_approval = match tool.requires_approval(&tc.arguments) {
                                 ApprovalRequirement::Never => false,
                                 ApprovalRequirement::UnlessAutoApproved => {
-                                    let sess = session.lock().await;
-                                    !sess.is_tool_auto_approved(&tc.name)
+                                    if self.config.auto_approve_tools {
+                                        false
+                                    } else {
+                                        let sess = session.lock().await;
+                                        !sess.is_tool_auto_approved(&tc.name)
+                                    }
                                 }
                                 ApprovalRequirement::Always => true,
                             };

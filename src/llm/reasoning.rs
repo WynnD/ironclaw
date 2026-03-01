@@ -1519,7 +1519,7 @@ fn strip_thinking_tags_regex(text: &str, code_regions: &[CodeRegion]) -> String 
 /// When `<final>` tags are present, ONLY content inside them reaches the user.
 /// This discards any untagged reasoning that leaked outside `<think>` tags.
 fn extract_final_content(text: &str, code_regions: &[CodeRegion]) -> Option<String> {
-    let mut parts: Vec<&str> = Vec::new();
+    let mut raw_parts: Vec<&str> = Vec::new();
     let mut in_final = false;
     let mut last_index = 0;
     let mut found_any = false;
@@ -1543,7 +1543,7 @@ fn extract_final_content(text: &str, code_regions: &[CodeRegion]) -> Option<Stri
             last_index = m.end();
         } else if in_final && is_close {
             // Closing </final>
-            parts.push(&text[last_index..idx]);
+            raw_parts.push(&text[last_index..idx]);
             in_final = false;
             last_index = m.end();
         }
@@ -1555,10 +1555,24 @@ fn extract_final_content(text: &str, code_regions: &[CodeRegion]) -> Option<Stri
 
     // Unclosed <final> — include trailing content
     if in_final {
-        parts.push(&text[last_index..]);
+        raw_parts.push(&text[last_index..]);
     }
 
-    Some(parts.join(""))
+    // Some models emit duplicate adjacent <final> blocks. Deduplicate exact
+    // repeats to avoid doubled user-visible text.
+    let mut parts: Vec<String> = Vec::new();
+    for part in raw_parts {
+        let normalized = part.trim();
+        if normalized.is_empty() {
+            continue;
+        }
+        if parts.last().is_some_and(|prev| prev == normalized) {
+            continue;
+        }
+        parts.push(normalized.to_string());
+    }
+
+    Some(parts.join("\n\n"))
 }
 
 /// Strip pipe-delimited reasoning tags, respecting code regions.
@@ -2497,5 +2511,23 @@ That's my plan."#;
         assert!(cleaned.contains("Before section"));
         assert!(cleaned.contains("After section"));
         assert!(!cleaned.contains("tool_calls_section"));
+    }
+
+    #[test]
+    fn test_clean_response_dedupes_duplicate_final_blocks() {
+        let input = "<final>I need to discover the Codex tool first. Let me do that.</final>\
+                     <final>I need to discover the Codex tool first. Let me do that.</final>";
+        let cleaned = clean_response(input);
+        assert_eq!(
+            cleaned,
+            "I need to discover the Codex tool first. Let me do that."
+        );
+    }
+
+    #[test]
+    fn test_clean_response_keeps_distinct_final_blocks() {
+        let input = "<final>First line.</final><final>Second line.</final>";
+        let cleaned = clean_response(input);
+        assert_eq!(cleaned, "First line.\n\nSecond line.");
     }
 }

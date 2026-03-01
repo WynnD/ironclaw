@@ -23,14 +23,18 @@ use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput};
 const DEFAULT_MCP_TIMEOUT_SECS: u64 = 30;
 const LONG_RUNNING_MCP_TIMEOUT_SECS: u64 = 300;
 
-fn request_timeout_for_server(server_name: &str, server_url: &str) -> Duration {
+fn is_high_risk_mcp_server(server_name: &str, server_url: &str) -> bool {
     let server_id = format!(
         "{} {}",
         server_name.to_ascii_lowercase(),
         server_url.to_ascii_lowercase()
     );
 
-    if server_id.contains("gemini") || server_id.contains("codex") {
+    server_id.contains("gemini") || server_id.contains("codex")
+}
+
+fn request_timeout_for_server(server_name: &str, server_url: &str) -> Duration {
+    if is_high_risk_mcp_server(server_name, server_url) {
         Duration::from_secs(LONG_RUNNING_MCP_TIMEOUT_SECS)
     } else {
         Duration::from_secs(DEFAULT_MCP_TIMEOUT_SECS)
@@ -474,6 +478,7 @@ impl McpClient {
                 Arc::new(McpToolWrapper {
                     tool: t,
                     prefixed_name,
+                    server_name: self.server_name.clone(),
                     client: client.clone(),
                 }) as Arc<dyn Tool>
             })
@@ -518,6 +523,8 @@ struct McpToolWrapper {
     tool: McpTool,
     /// Prefixed name (server_name_tool_name) for unique identification.
     prefixed_name: String,
+    /// Source MCP server name (used for policy and timeout tuning).
+    server_name: String,
     client: Arc<McpClient>,
 }
 
@@ -564,18 +571,37 @@ impl Tool for McpToolWrapper {
         true // MCP tools are external, always sanitize
     }
 
+    fn execution_timeout(&self) -> Duration {
+        // Keep the default 60s floor for normal MCP servers, but honor the
+        // long-running timeout for known heavy servers (e.g., codex/gemini).
+        std::cmp::max(
+            Duration::from_secs(60),
+            request_timeout_for_server(&self.server_name, self.client.server_url()),
+        )
+    }
+
     fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
-        // Delegate to the MCP protocol type's own requires_approval() bool method
-        if self.tool.requires_approval() {
-            ApprovalRequirement::UnlessAutoApproved
-        } else {
-            ApprovalRequirement::Never
+        // High-risk MCP servers (codex/gemini) always require per-call approval.
+        // This prevents "always approve" bypass for delegated code-exec agents.
+        if is_high_risk_mcp_server(&self.server_name, self.client.server_url()) {
+            return ApprovalRequirement::Always;
+        }
+
+        // Map MCP hints to IronClaw approval levels.
+        match self.tool.annotations.as_ref() {
+            Some(a) if a.destructive_hint || a.side_effects_hint => ApprovalRequirement::Always,
+            Some(a) if a.read_only_hint && !a.side_effects_hint && !a.destructive_hint => {
+                ApprovalRequirement::Never
+            }
+            Some(_) | None => ApprovalRequirement::UnlessAutoApproved,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
@@ -624,5 +650,90 @@ mod tests {
             request_timeout_for_server("mcp-firecrawl", "http://example.com").as_secs(),
             30
         );
+    }
+
+    #[test]
+    fn test_is_high_risk_mcp_server() {
+        assert!(is_high_risk_mcp_server(
+            "mcp-codex-cli",
+            "http://example.com"
+        ));
+        assert!(is_high_risk_mcp_server(
+            "foo",
+            "https://gemini.example.com/mcp"
+        ));
+        assert!(!is_high_risk_mcp_server(
+            "mcp-firecrawl",
+            "http://example.com"
+        ));
+    }
+
+    #[test]
+    fn test_mcp_wrapper_approval_policy_and_timeout() {
+        let client = Arc::new(McpClient::new("http://localhost:8080"));
+        let readonly_tool = McpTool {
+            name: "readonly".to_string(),
+            description: "Read only".to_string(),
+            input_schema: serde_json::json!({"type":"object","properties":{}}),
+            annotations: Some(crate::tools::mcp::protocol::McpToolAnnotations {
+                read_only_hint: true,
+                ..Default::default()
+            }),
+        };
+
+        let readonly_wrapper = McpToolWrapper {
+            tool: readonly_tool,
+            prefixed_name: "localhost_readonly".to_string(),
+            server_name: "localhost".to_string(),
+            client: client.clone(),
+        };
+        assert_eq!(
+            readonly_wrapper.requires_approval(&serde_json::json!({})),
+            ApprovalRequirement::Never
+        );
+        // Default MCP timeout is 30s, but wrapper keeps a 60s execution floor.
+        assert_eq!(readonly_wrapper.execution_timeout().as_secs(), 60);
+
+        let side_effect_tool = McpTool {
+            name: "write".to_string(),
+            description: "Writes".to_string(),
+            input_schema: serde_json::json!({"type":"object","properties":{}}),
+            annotations: Some(crate::tools::mcp::protocol::McpToolAnnotations {
+                side_effects_hint: true,
+                ..Default::default()
+            }),
+        };
+        let side_effect_wrapper = McpToolWrapper {
+            tool: side_effect_tool,
+            prefixed_name: "localhost_write".to_string(),
+            server_name: "localhost".to_string(),
+            client: client.clone(),
+        };
+        assert_eq!(
+            side_effect_wrapper.requires_approval(&serde_json::json!({})),
+            ApprovalRequirement::Always
+        );
+
+        let codex_tool = McpTool {
+            name: "codex".to_string(),
+            description: "Codex delegation".to_string(),
+            input_schema: serde_json::json!({"type":"object","properties":{}}),
+            annotations: Some(crate::tools::mcp::protocol::McpToolAnnotations {
+                read_only_hint: true,
+                ..Default::default()
+            }),
+        };
+        let codex_wrapper = McpToolWrapper {
+            tool: codex_tool,
+            prefixed_name: "mcp_codex_cli_codex".to_string(),
+            server_name: "mcp-codex-cli".to_string(),
+            client,
+        };
+        // High-risk server override wins, even if tool claims read-only.
+        assert_eq!(
+            codex_wrapper.requires_approval(&serde_json::json!({})),
+            ApprovalRequirement::Always
+        );
+        assert_eq!(codex_wrapper.execution_timeout().as_secs(), 300);
     }
 }
