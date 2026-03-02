@@ -36,6 +36,7 @@ body {
   background: var(--bg);
   color: var(--text);
   height: 100vh;
+  height: 100dvh;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -47,6 +48,7 @@ body {
   align-items: center;
   justify-content: center;
   height: 100vh;
+  height: 100dvh;
 }
 
 .auth-card-login {
@@ -147,6 +149,8 @@ body {
   display: none;
   flex-direction: column;
   height: 100vh;
+  height: 100dvh;
+  min-height: 0;
 }
 
 /* Tab Bar */
@@ -371,6 +375,7 @@ body {
   display: none;
   flex: 1;
   overflow: hidden;
+  min-height: 0;
 }
 
 .tab-panel.active {
@@ -384,6 +389,8 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  min-height: 0;
+  min-width: 0;
 }
 
 .chat-messages {
@@ -393,6 +400,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  min-height: 0;
 }
 
 .message {
@@ -1009,6 +1017,7 @@ body {
   gap: 8px;
   background: var(--bg-secondary);
   border-top: 1px solid var(--border);
+  flex-shrink: 0;
 }
 
 .chat-input textarea {
@@ -2925,6 +2934,7 @@ mark {
 
 #tab-chat {
   flex-direction: row;
+  min-height: 0;
 }
 
 .thread-sidebar {
@@ -3622,6 +3632,16 @@ mark {
   /* Thread sidebar: collapsed by default, overlay when expanded */
   #tab-chat {
     position: relative;
+    min-height: 0;
+  }
+
+  .chat-container,
+  .chat-messages {
+    min-height: 0;
+  }
+
+  .chat-input {
+    padding-bottom: calc(8px + env(safe-area-inset-bottom));
   }
 
   .thread-sidebar {
