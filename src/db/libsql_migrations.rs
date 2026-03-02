@@ -459,7 +459,7 @@ CREATE TABLE IF NOT EXISTS routine_runs (
     status TEXT NOT NULL DEFAULT 'running',
     result_summary TEXT,
     tokens_used INTEGER,
-    job_id TEXT REFERENCES agent_jobs(id),
+    job_id TEXT REFERENCES agent_jobs(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

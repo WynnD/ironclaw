@@ -1076,11 +1076,39 @@ impl Store {
 
     /// Delete a terminal-state job and its events. Returns true if a row was deleted.
     pub async fn delete_job(&self, id: Uuid, user_id: &str) -> Result<bool, DatabaseError> {
-        let conn = self.conn().await?;
-        // Delete events first (no FK cascade in all schemas).
-        conn.execute("DELETE FROM job_events WHERE job_id = $1", &[&id])
+        let mut conn = self.conn().await?;
+        let tx = conn.transaction().await?;
+
+        // Guard against deleting running jobs and avoid side effects when not eligible.
+        let eligible = tx
+            .query_opt(
+                r#"
+                SELECT 1
+                FROM agent_jobs
+                WHERE id = $1 AND user_id = $2
+                  AND status NOT IN ('running', 'creating', 'in_progress', 'pending')
+                LIMIT 1
+                "#,
+                &[&id, &user_id],
+            )
+            .await?
+            .is_some();
+
+        if !eligible {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        // Preserve routine run history while allowing terminal job deletion.
+        tx.execute(
+            "UPDATE routine_runs SET job_id = NULL WHERE job_id = $1",
+            &[&id],
+        )
+        .await?;
+        tx.execute("DELETE FROM job_events WHERE job_id = $1", &[&id])
             .await?;
-        let count = conn
+
+        let count = tx
             .execute(
                 r#"
                 DELETE FROM agent_jobs
@@ -1090,6 +1118,13 @@ impl Store {
                 &[&id, &user_id],
             )
             .await?;
+
+        if count == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+
+        tx.commit().await?;
         Ok(count > 0)
     }
 

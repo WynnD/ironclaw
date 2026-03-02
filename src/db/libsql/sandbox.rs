@@ -556,6 +556,17 @@ impl SandboxStore for LibSqlBackend {
 
         if let Err(e) = conn
             .execute(
+                "UPDATE routine_runs SET job_id = NULL WHERE job_id = ?1",
+                params![id.to_string()],
+            )
+            .await
+        {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            return Err(DatabaseError::Query(e.to_string()));
+        }
+
+        if let Err(e) = conn
+            .execute(
                 "DELETE FROM job_events WHERE job_id = ?1",
                 params![id.to_string()],
             )
@@ -765,6 +776,67 @@ mod tests {
         let events = backend.list_job_events(job_id, None).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "progress");
+    }
+
+    #[tokio::test]
+    async fn delete_job_clears_routine_run_reference_for_terminal_jobs() {
+        let (backend, _tempdir) = test_backend().await;
+        let conn = backend.connect().await.unwrap();
+
+        let job_id = Uuid::new_v4();
+        backend
+            .save_sandbox_job(&sandbox_job(job_id, "u1", "completed"))
+            .await
+            .unwrap();
+        backend
+            .save_job_event(job_id, "done", &serde_json::json!({"ok": true}))
+            .await
+            .unwrap();
+
+        let routine_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+
+        conn.execute(
+            "INSERT INTO routines (id, name, description, user_id, enabled, trigger_type, trigger_config, action_type, action_config) VALUES (?1, ?2, ?3, ?4, 1, 'manual', '{}', 'full_job', ?5)",
+            libsql::params![
+                routine_id.to_string(),
+                "test-routine",
+                "desc",
+                "u1",
+                "{\"title\":\"t\",\"description\":\"d\"}"
+            ],
+        )
+        .await
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO routine_runs (id, routine_id, trigger_type, status, job_id) VALUES (?1, ?2, 'manual', 'ok', ?3)",
+            libsql::params![run_id.to_string(), routine_id.to_string(), job_id.to_string()],
+        )
+        .await
+        .unwrap();
+
+        let deleted = backend.delete_job(job_id, "u1").await.unwrap();
+        assert!(deleted);
+        assert!(backend.get_sandbox_job(job_id).await.unwrap().is_none());
+        assert!(
+            backend
+                .list_job_events(job_id, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut rows = conn
+            .query(
+                "SELECT job_id FROM routine_runs WHERE id = ?1",
+                libsql::params![run_id.to_string()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let linked_job: Option<String> = row.get(0).unwrap_or(None);
+        assert!(linked_job.is_none());
     }
 
     #[tokio::test]
