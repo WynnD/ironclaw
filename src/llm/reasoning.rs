@@ -5,6 +5,7 @@ use std::sync::{Arc, LazyLock};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
 use crate::error::LlmError;
 
@@ -584,7 +585,19 @@ Respond in JSON format:
                 content_preview = %crate::llm::rig_adapter::truncate_for_log(&content, 300),
                 "Attempting tool call recovery from text content",
             );
-            let recovered = recover_tool_calls_from_content(&content, &context.available_tools);
+            let (recovered, recovery_stats) =
+                recover_tool_calls_from_content_with_stats(&content, &context.available_tools);
+            if recovery_stats.section_blocks > 0 && recovered.is_empty() {
+                tracing::warn!(
+                    section_blocks = recovery_stats.section_blocks,
+                    section_calls_seen = recovery_stats.section_calls_seen,
+                    placeholder_names_seen = recovery_stats.placeholder_names_seen,
+                    placeholder_names_repaired = recovery_stats.placeholder_names_repaired,
+                    unknown_calls_dropped = recovery_stats.unknown_calls_dropped,
+                    content_preview = %crate::llm::rig_adapter::truncate_for_log(&content, 300),
+                    "Detected section-delimited tool calls but recovered zero executable tool calls",
+                );
+            }
             if !recovered.is_empty() {
                 let cleaned = clean_response(&content);
                 return Ok(RespondOutput {
@@ -727,12 +740,7 @@ Respond in JSON format:
         let tools_desc = if context.available_tools.is_empty() {
             "No tools available.".to_string()
         } else {
-            context
-                .available_tools
-                .iter()
-                .map(|t| format!("- {}: {}", t.name, t.description))
-                .collect::<Vec<_>>()
-                .join("\n")
+            render_tools_for_prompt(&context.available_tools, "")
         };
 
         format!(
@@ -770,14 +778,9 @@ Respond with a JSON plan in this format:
         let tools_section = if context.available_tools.is_empty() {
             String::new()
         } else {
-            let tool_list: Vec<String> = context
-                .available_tools
-                .iter()
-                .map(|t| format!("  - {}: {}", t.name, t.description))
-                .collect();
             format!(
                 "\n\n## Available Tools\nYou have access to these tools:\n{}\n\nCall tools when they would help accomplish the task.",
-                tool_list.join("\n")
+                render_tools_for_prompt(&context.available_tools, "  ")
             )
         };
 
@@ -1030,6 +1033,117 @@ Examples (tool calls use JSON format):\n\
     }
 }
 
+fn render_tools_for_prompt(tools: &[ToolDefinition], indent: &str) -> String {
+    tools
+        .iter()
+        .map(|tool| render_tool_for_prompt(tool, indent))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_tool_for_prompt(tool: &ToolDefinition, indent: &str) -> String {
+    let mut lines = vec![format!("{}- {}: {}", indent, tool.name, tool.description)];
+    let params = summarize_parameters_for_prompt(&tool.parameters);
+
+    if params.is_empty() {
+        lines.push(format!("{}  Parameters: none", indent));
+    } else {
+        lines.push(format!("{}  Parameters:", indent));
+        for param in params {
+            lines.push(format!("{}    - {}", indent, param));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn summarize_parameters_for_prompt(schema: &JsonValue) -> Vec<String> {
+    let required_names: std::collections::HashSet<String> = schema
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut lines = Vec::new();
+
+    if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+        let mut names: Vec<&String> = props.keys().collect();
+        names.sort();
+
+        for name in names {
+            let prop_schema = &props[name];
+            let required = if required_names.contains(name.as_str()) {
+                "required"
+            } else {
+                "optional"
+            };
+            let ty = schema_type_label(prop_schema);
+            let mut line = format!("`{}` ({}, {})", name, ty, required);
+
+            if let Some(desc) = prop_schema.get("description").and_then(|v| v.as_str())
+                && !desc.trim().is_empty()
+            {
+                line.push_str(": ");
+                line.push_str(desc.trim());
+            }
+
+            if let Some(enum_vals) = prop_schema.get("enum").and_then(|v| v.as_array()) {
+                let values = enum_vals
+                    .iter()
+                    .map(compact_json_value)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if !values.is_empty() {
+                    line.push_str(" (allowed: ");
+                    line.push_str(&values);
+                    line.push(')');
+                }
+            }
+
+            if let Some(default_val) = prop_schema.get("default") {
+                line.push_str(" (default: ");
+                line.push_str(&compact_json_value(default_val));
+                line.push(')');
+            }
+
+            lines.push(line);
+        }
+    }
+
+    lines
+}
+
+fn schema_type_label(schema: &JsonValue) -> String {
+    match schema.get("type") {
+        Some(JsonValue::String(ty)) => ty.clone(),
+        Some(JsonValue::Array(types)) => {
+            let mut names: Vec<String> = types
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            names.sort();
+            names.dedup();
+            if names.is_empty() {
+                "any".to_string()
+            } else {
+                names.join("|")
+            }
+        }
+        _ => "any".to_string(),
+    }
+}
+
+fn compact_json_value(v: &JsonValue) -> String {
+    match v {
+        JsonValue::String(s) => format!("\"{}\"", s),
+        _ => v.to_string(),
+    }
+}
+
 /// Result of success evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SuccessEvaluation {
@@ -1251,13 +1365,31 @@ fn is_inside_code(pos: usize, regions: &[CodeRegion]) -> bool {
 /// - `<|tool_calls_section_begin|>...<|tool_calls_section_end|>` (section-delimited, Kimi K2.5)
 ///
 /// Only returns calls whose name matches an available tool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ToolCallRecoveryStats {
+    section_blocks: usize,
+    section_calls_seen: usize,
+    placeholder_names_seen: usize,
+    placeholder_names_repaired: usize,
+    unknown_calls_dropped: usize,
+}
+
+#[cfg(test)]
 fn recover_tool_calls_from_content(
     content: &str,
     available_tools: &[ToolDefinition],
 ) -> Vec<ToolCall> {
+    recover_tool_calls_from_content_with_stats(content, available_tools).0
+}
+
+fn recover_tool_calls_from_content_with_stats(
+    content: &str,
+    available_tools: &[ToolDefinition],
+) -> (Vec<ToolCall>, ToolCallRecoveryStats) {
     let tool_names: std::collections::HashSet<&str> =
         available_tools.iter().map(|t| t.name.as_str()).collect();
     let mut calls = Vec::new();
+    let mut stats = ToolCallRecoveryStats::default();
 
     // Format 1: paired XML/pipe tags
     for (open, close) in &[
@@ -1323,6 +1455,7 @@ fn recover_tool_calls_from_content(
 
     let mut remaining = content;
     while let Some(sec_start) = remaining.find(SECTION_BEGIN) {
+        stats.section_blocks += 1;
         let after_sec = &remaining[sec_start + SECTION_BEGIN.len()..];
         let sec_end = after_sec.find(SECTION_END).unwrap_or(after_sec.len());
         let section = &after_sec[..sec_end];
@@ -1342,6 +1475,7 @@ fn recover_tool_calls_from_content(
             };
             let call_body = &after_call[..call_end];
             section_remaining = &after_call[call_end + CALL_END.len()..];
+            stats.section_calls_seen += 1;
 
             // Split on <|tool_call_argument_begin|> to get name and arguments
             let (raw_name, arguments) = if let Some(arg_pos) = call_body.find(ARG_BEGIN) {
@@ -1357,13 +1491,33 @@ fn recover_tool_calls_from_content(
             // Normalize: "functions.http:0" → "http"
             let name = normalize_section_tool_name(raw_name);
 
-            let matched_name = if tool_names.contains(name.as_str()) {
-                Some(name)
+            let mut matched_name = if tool_names.contains(name.as_str()) {
+                Some(name.clone())
             } else {
                 // Fuzzy match: model may invent a more specific name like
                 // "time_get_current_time" for tool "time". Try prefix match.
                 fuzzy_match_tool_name(&name, &tool_names)
             };
+
+            if matched_name.is_none() && is_placeholder_tool_name(&name) {
+                stats.placeholder_names_seen += 1;
+                matched_name = infer_placeholder_tool_name(&name, &arguments, available_tools);
+                if let Some(ref repaired) = matched_name {
+                    stats.placeholder_names_repaired += 1;
+                    tracing::warn!(
+                        placeholder_tool = %name,
+                        repaired_tool = %repaired,
+                        argument_keys = %argument_keys_for_log(&arguments),
+                        "Recovered placeholder tool name emitted by model"
+                    );
+                } else {
+                    tracing::warn!(
+                        placeholder_tool = %name,
+                        argument_keys = %argument_keys_for_log(&arguments),
+                        "Model emitted placeholder tool name that could not be mapped to an available tool"
+                    );
+                }
+            }
 
             if let Some(matched) = matched_name {
                 calls.push(ToolCall {
@@ -1371,11 +1525,119 @@ fn recover_tool_calls_from_content(
                     name: matched,
                     arguments,
                 });
+            } else {
+                stats.unknown_calls_dropped += 1;
             }
         }
     }
 
-    calls
+    (calls, stats)
+}
+
+fn is_placeholder_tool_name(name: &str) -> bool {
+    has_numeric_suffix(name, "recovered_") || has_numeric_suffix(name, "generated_tool_call_")
+}
+
+fn has_numeric_suffix(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn infer_placeholder_tool_name(
+    placeholder_name: &str,
+    arguments: &serde_json::Value,
+    available_tools: &[ToolDefinition],
+) -> Option<String> {
+    let args_obj = arguments.as_object()?;
+    if args_obj.is_empty() {
+        tracing::warn!(
+            placeholder_tool = %placeholder_name,
+            "Placeholder tool name had empty arguments; refusing to infer tool mapping"
+        );
+        return None;
+    }
+
+    let arg_keys: std::collections::HashSet<&str> =
+        args_obj.keys().map(std::string::String::as_str).collect();
+    let mut candidates: Vec<(String, usize, usize, usize)> = Vec::new();
+
+    for tool in available_tools {
+        let Some(props) = tool
+            .parameters
+            .get("properties")
+            .and_then(|v| v.as_object())
+        else {
+            continue;
+        };
+        if props.is_empty() {
+            continue;
+        }
+
+        let prop_keys: std::collections::HashSet<&str> =
+            props.keys().map(std::string::String::as_str).collect();
+        if !arg_keys.iter().all(|k| prop_keys.contains(k)) {
+            continue;
+        }
+
+        let required: std::collections::HashSet<&str> = tool
+            .parameters
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        if !required.iter().all(|k| arg_keys.contains(k)) {
+            continue;
+        }
+
+        candidates.push((
+            tool.name.clone(),
+            required.len(),
+            arg_keys.len(),
+            prop_keys.len(),
+        ));
+    }
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    candidates.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.3.cmp(&b.3))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let best = &candidates[0];
+    if candidates.len() > 1 {
+        let second = &candidates[1];
+        if best.1 == second.1 && best.2 == second.2 && best.3 == second.3 {
+            tracing::warn!(
+                placeholder_tool = %placeholder_name,
+                first_candidate = %best.0,
+                second_candidate = %second.0,
+                argument_keys = %argument_keys_for_log(arguments),
+                "Placeholder tool name mapping was ambiguous; refusing to guess"
+            );
+            return None;
+        }
+    }
+
+    Some(best.0.clone())
+}
+
+fn argument_keys_for_log(arguments: &serde_json::Value) -> String {
+    if let Some(obj) = arguments.as_object() {
+        let mut keys: Vec<&str> = obj.keys().map(std::string::String::as_str).collect();
+        keys.sort();
+        if keys.is_empty() {
+            "(none)".to_string()
+        } else {
+            keys.join(",")
+        }
+    } else {
+        "(non-object)".to_string()
+    }
 }
 
 /// Normalize a tool name from section-delimited format.
@@ -2073,6 +2335,81 @@ That's my plan."#;
         assert!(context.job_description.is_some());
     }
 
+    #[test]
+    fn test_summarize_parameters_for_prompt_includes_required_enum_and_default() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["now", "parse", "diff"],
+                    "description": "The operation to perform"
+                },
+                "timezone": {
+                    "type": "string",
+                    "description": "Optional timezone",
+                    "default": "UTC"
+                }
+            },
+            "required": ["operation"]
+        });
+
+        let lines = summarize_parameters_for_prompt(&schema);
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("`operation`") && l.contains("required"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("allowed: \"now\", \"parse\", \"diff\""))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("`timezone`") && l.contains("default: \"UTC\""))
+        );
+    }
+
+    #[test]
+    fn test_conversation_prompt_includes_tool_parameter_summary() {
+        let llm: Arc<dyn LlmProvider> = Arc::new(SequencedLlm::new(Vec::new(), Vec::new()));
+        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: false,
+        }));
+        let reasoning = Reasoning::new(llm, safety);
+
+        let context = ReasoningContext::new().with_tools(vec![ToolDefinition {
+            name: "time".to_string(),
+            description: "Get current time, convert timezones, or calculate time differences."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["now", "parse", "format", "diff"],
+                        "description": "The time operation to perform"
+                    },
+                    "timestamp": {
+                        "type": "string",
+                        "description": "ISO 8601 timestamp"
+                    }
+                },
+                "required": ["operation"]
+            }),
+        }]);
+
+        let prompt = reasoning.build_conversation_prompt(&context);
+        assert!(prompt.contains("## Available Tools"));
+        assert!(prompt.contains("Parameters:"));
+        assert!(prompt.contains("`operation` (string, required)"));
+        assert!(prompt.contains("allowed: \"now\", \"parse\", \"format\", \"diff\""));
+    }
+
     // ---- Basic thinking tag stripping ----
 
     #[test]
@@ -2548,6 +2885,80 @@ That's my plan."#;
         let content = "<|tool_calls_section_begin|><|tool_call_begin|>functions.nonexistent:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>";
         let calls = recover_tool_calls_from_content(content, &tools);
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_recover_section_delimited_placeholder_tool_name_repaired() {
+        let tools = vec![
+            ToolDefinition {
+                name: "memory_read".to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"}
+                    },
+                    "required": ["path"]
+                }),
+            },
+            ToolDefinition {
+                name: "time".to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "operation": {"type": "string"}
+                    },
+                    "required": ["operation"]
+                }),
+            },
+        ];
+
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>recovered_1<|tool_call_argument_begin|>{\"path\":\"HEARTBEAT.md\"}<|tool_call_end|><|tool_calls_section_end|>";
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "memory_read");
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"path":"HEARTBEAT.md"})
+        );
+    }
+
+    #[test]
+    fn test_recover_section_delimited_placeholder_tool_name_ambiguous_ignored() {
+        let tools = vec![
+            ToolDefinition {
+                name: "memory_read".to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"}
+                    },
+                    "required": ["path"]
+                }),
+            },
+            ToolDefinition {
+                name: "read_file".to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"}
+                    },
+                    "required": ["path"]
+                }),
+            },
+        ];
+
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>recovered_2<|tool_call_argument_begin|>{\"path\":\"HEARTBEAT.md\"}<|tool_call_end|><|tool_calls_section_end|>";
+        let (calls, stats) = recover_tool_calls_from_content_with_stats(content, &tools);
+        assert!(calls.is_empty());
+        assert_eq!(stats.section_blocks, 1);
+        assert_eq!(stats.section_calls_seen, 1);
+        assert_eq!(stats.placeholder_names_seen, 1);
+        assert_eq!(stats.placeholder_names_repaired, 0);
+        assert_eq!(stats.unknown_calls_dropped, 1);
     }
 
     #[test]
