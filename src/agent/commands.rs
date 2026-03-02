@@ -27,6 +27,14 @@ fn format_count(n: u64, suffix: &str) -> String {
     }
 }
 
+fn normalize_job_state(status: &str) -> &str {
+    match status {
+        "creating" => "pending",
+        "running" => "in_progress",
+        s => s,
+    }
+}
+
 impl Agent {
     /// Handle job-related intents without turn tracking.
     pub(super) async fn handle_job_or_command(
@@ -115,23 +123,74 @@ impl Agent {
     ) -> Result<String, Error> {
         match job_id {
             Some(id) => {
-                let uuid = Uuid::parse_str(&id)
-                    .map_err(|_| crate::error::JobError::NotFound { id: Uuid::nil() })?;
+                let uuid = if let Ok(parsed) = Uuid::parse_str(&id) {
+                    parsed
+                } else if let Some(store) = self.store() {
+                    let prefix = id.to_lowercase();
+                    if prefix.len() < 4 {
+                        return Err(crate::error::JobError::NotFound { id: Uuid::nil() }.into());
+                    }
+
+                    let mut matches: Vec<Uuid> = store
+                        .list_all_jobs_for_user(user_id)
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|j| {
+                            let hex = j.id.to_string().replace('-', "");
+                            if hex.starts_with(&prefix) {
+                                Some(j.id)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    matches.sort_unstable();
+                    matches.dedup();
+
+                    match matches.len() {
+                        1 => matches[0],
+                        _ => {
+                            return Err(crate::error::JobError::NotFound { id: Uuid::nil() }.into());
+                        }
+                    }
+                } else {
+                    return Err(crate::error::JobError::NotFound { id: Uuid::nil() }.into());
+                };
 
                 // Try DB first for persistent state, fall back to ContextManager.
-                if let Some(store) = self.store()
-                    && let Ok(Some(ctx)) = store.get_job(uuid).await
-                {
-                    return Ok(format!(
-                        "Job: {}\nStatus: {:?}\nCreated: {}\nStarted: {}\nActual cost: {}",
-                        ctx.title,
-                        ctx.state,
-                        ctx.created_at.format("%Y-%m-%d %H:%M:%S"),
-                        ctx.started_at
-                            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-                            .unwrap_or_else(|| "Not started".to_string()),
-                        ctx.actual_cost
-                    ));
+                if let Some(store) = self.store() {
+                    if let Ok(Some(rec)) = store.get_sandbox_job(uuid).await
+                        && rec.user_id == user_id
+                    {
+                        return Ok(format!(
+                            "Job: {}\nStatus: {}\nCreated: {}\nStarted: {}",
+                            rec.task,
+                            normalize_job_state(&rec.status),
+                            rec.created_at.format("%Y-%m-%d %H:%M:%S"),
+                            rec.started_at
+                                .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                                .unwrap_or_else(|| "Not started".to_string()),
+                        ));
+                    }
+
+                    if let Ok(Some(ctx)) = store.get_job(uuid).await {
+                        if ctx.user_id != user_id {
+                            return Err(crate::error::JobError::NotFound { id: uuid }.into());
+                        }
+
+                        return Ok(format!(
+                            "Job: {}\nStatus: {:?}\nCreated: {}\nStarted: {}\nActual cost: {}",
+                            ctx.title,
+                            ctx.state,
+                            ctx.created_at.format("%Y-%m-%d %H:%M:%S"),
+                            ctx.started_at
+                                .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                                .unwrap_or_else(|| "Not started".to_string()),
+                            ctx.actual_cost
+                        ));
+                    }
                 }
 
                 let ctx = self.context_manager.get_context(uuid).await?;
@@ -154,28 +213,29 @@ impl Agent {
                 // Show summary from DB for consistency with Jobs tab.
                 if let Some(store) = self.store() {
                     let mut total = 0;
+                    let mut pending = 0;
                     let mut in_progress = 0;
                     let mut completed = 0;
                     let mut failed = 0;
                     let mut stuck = 0;
 
-                    if let Ok(s) = store.agent_job_summary().await {
-                        total += s.total;
-                        in_progress += s.in_progress;
-                        completed += s.completed;
-                        failed += s.failed;
-                        stuck += s.stuck;
-                    }
-                    if let Ok(s) = store.sandbox_job_summary().await {
-                        total += s.total;
-                        in_progress += s.running;
-                        completed += s.completed;
-                        failed += s.failed + s.interrupted;
+                    if let Ok(jobs) = store.list_all_jobs_for_user(user_id).await {
+                        for job in jobs {
+                            total += 1;
+                            match job.status.as_str() {
+                                "creating" | "pending" => pending += 1,
+                                "running" | "in_progress" => in_progress += 1,
+                                "completed" | "submitted" | "accepted" => completed += 1,
+                                "failed" | "cancelled" | "interrupted" => failed += 1,
+                                "stuck" => stuck += 1,
+                                _ => {}
+                            }
+                        }
                     }
 
                     return Ok(format!(
-                        "Jobs summary: Total: {} In Progress: {} Completed: {} Failed: {} Stuck: {}",
-                        total, in_progress, completed, failed, stuck
+                        "Jobs summary: Total: {} Pending: {} In Progress: {} Completed: {} Failed: {} Stuck: {}",
+                        total, pending, in_progress, completed, failed, stuck
                     ));
                 }
 
@@ -223,31 +283,26 @@ impl Agent {
     ) -> Result<String, Error> {
         // List from DB for consistency with Jobs tab.
         if let Some(store) = self.store() {
-            let agent_jobs = match store.list_agent_jobs().await {
+            let jobs = match store.list_all_jobs_for_user(user_id).await {
                 Ok(jobs) => jobs,
                 Err(e) => {
-                    tracing::warn!("Failed to list agent jobs: {}", e);
-                    Vec::new()
-                }
-            };
-            let sandbox_jobs = match store.list_sandbox_jobs().await {
-                Ok(jobs) => jobs,
-                Err(e) => {
-                    tracing::warn!("Failed to list sandbox jobs: {}", e);
+                    tracing::warn!("Failed to list jobs for user '{}': {}", user_id, e);
                     Vec::new()
                 }
             };
 
-            if agent_jobs.is_empty() && sandbox_jobs.is_empty() {
+            if jobs.is_empty() {
                 return Ok("No jobs found.".to_string());
             }
 
             let mut output = String::from("Jobs:\n");
-            for j in &agent_jobs {
-                output.push_str(&format!("  {} - {} ({})\n", j.id, j.title, j.status));
-            }
-            for j in &sandbox_jobs {
-                output.push_str(&format!("  {} - {} ({})\n", j.id, j.task, j.status));
+            for j in jobs {
+                output.push_str(&format!(
+                    "  {} - {} ({})\n",
+                    j.id,
+                    j.task,
+                    normalize_job_state(&j.status)
+                ));
             }
             return Ok(output);
         }

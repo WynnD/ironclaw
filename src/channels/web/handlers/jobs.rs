@@ -10,6 +10,7 @@ use axum::{
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::channels::IncomingMessage;
 use crate::channels::web::server::GatewayState;
 use crate::channels::web::types::*;
 
@@ -370,6 +371,114 @@ pub async fn jobs_restart_handler(
         "old_job_id": old_job_id,
         "new_job_id": new_job_id,
     })))
+}
+
+pub async fn jobs_delete_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let job_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID".to_string()))?;
+
+    let deleted = store
+        .delete_job(job_id, &state.user_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if deleted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            "Job not found or not deletable".to_string(),
+        ))
+    }
+}
+
+pub async fn jobs_update_handler(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateJobRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let store = state.store.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Database not available".to_string(),
+    ))?;
+
+    let job_id = Uuid::parse_str(&id)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid job ID".to_string()))?;
+
+    let title = body
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Missing or empty 'title' field".to_string(),
+        ))?;
+
+    let updated = store
+        .update_job_title(job_id, &state.user_id, title)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if !updated {
+        return Err((StatusCode::NOT_FOUND, "Job not found".to_string()));
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "updated",
+        "job_id": job_id,
+    })))
+}
+
+pub async fn jobs_create_handler(
+    State(state): State<Arc<GatewayState>>,
+    Json(body): Json<CreateJobRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+    let msg_tx = state.msg_tx.read().await;
+    let tx = msg_tx.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Agent not connected".to_string(),
+    ))?;
+
+    let title = body.title.trim();
+    if title.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Title is required".to_string()));
+    }
+
+    let description = body.description.unwrap_or_default();
+    let description = description.trim();
+
+    let content = if description.is_empty() {
+        title.to_string()
+    } else {
+        format!("{title}\n\n{description}")
+    };
+
+    let msg =
+        IncomingMessage::new("gateway", &state.user_id, content).with_metadata(serde_json::json!({
+            "source": "jobs_create",
+            "title": title,
+        }));
+
+    tx.send(msg)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "status": "dispatched",
+            "message": "Job request sent to agent",
+        })),
+    ))
 }
 
 /// Submit a follow-up prompt to a running Claude Code sandbox job.

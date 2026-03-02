@@ -77,6 +77,64 @@ async fn resolve_job_id(input: &str, context_manager: &ContextManager) -> Result
     }
 }
 
+/// Resolve a job ID for a specific user from:
+/// 1) full UUID input,
+/// 2) in-memory jobs for that user, and
+/// 3) persisted DB jobs for that user (when store is provided).
+async fn resolve_job_id_for_user(
+    input: &str,
+    user_id: &str,
+    context_manager: &ContextManager,
+    store: Option<&Arc<dyn Database>>,
+) -> Result<Uuid, ToolError> {
+    if let Ok(id) = Uuid::parse_str(input) {
+        return Ok(id);
+    }
+
+    if input.len() < 4 {
+        return Err(ToolError::InvalidParameters(
+            "job ID prefix must be at least 4 hex characters".to_string(),
+        ));
+    }
+
+    let input_lower = input.to_lowercase();
+    let mut candidates: HashSet<Uuid> = context_manager
+        .all_jobs_for(user_id)
+        .await
+        .into_iter()
+        .filter(|id| {
+            let hex = id.to_string().replace('-', "");
+            hex.starts_with(&input_lower)
+        })
+        .collect();
+
+    if let Some(store) = store
+        && let Ok(db_jobs) = store.list_all_jobs_for_user(user_id).await
+    {
+        for job in db_jobs {
+            let hex = job.id.to_string().replace('-', "");
+            if hex.starts_with(&input_lower) {
+                candidates.insert(job.id);
+            }
+        }
+    }
+
+    match candidates.len() {
+        1 => candidates
+            .into_iter()
+            .next()
+            .ok_or_else(|| ToolError::InvalidParameters("no matching job found".to_string())),
+        0 => Err(ToolError::InvalidParameters(format!(
+            "no job found matching prefix '{}'",
+            input
+        ))),
+        n => Err(ToolError::InvalidParameters(format!(
+            "ambiguous prefix '{}' matches {} jobs, provide more characters",
+            input, n
+        ))),
+    }
+}
+
 fn metadata_string(metadata: &serde_json::Value, key: &str) -> Option<String> {
     metadata
         .get(key)
@@ -1068,6 +1126,10 @@ impl Tool for ListJobsTool {
     fn requires_sanitization(&self) -> bool {
         false
     }
+
+    fn is_core(&self) -> bool {
+        true
+    }
 }
 
 /// Tool for checking job status.
@@ -1117,7 +1179,13 @@ impl Tool for JobStatusTool {
         let requester_id = ctx.user_id.clone();
 
         let job_id_str = require_str(&params, "job_id")?;
-        let job_id = resolve_job_id(job_id_str, &self.context_manager).await?;
+        let job_id = resolve_job_id_for_user(
+            job_id_str,
+            &requester_id,
+            &self.context_manager,
+            self.store.as_ref(),
+        )
+        .await?;
 
         match self.context_manager.get_context(job_id).await {
             Ok(job_ctx) => {
@@ -1140,14 +1208,10 @@ impl Tool for JobStatusTool {
                 Ok(ToolOutput::success(result, start.elapsed()))
             }
             Err(_) => {
-                // Fall back to database lookup. Try parsing job_id as a full
-                // UUID for DB lookup (prefix matching against the DB would be
-                // expensive).
-                if let Some(store) = &self.store
-                    && let Ok(parsed_id) = Uuid::parse_str(job_id_str)
-                {
+                // Fall back to database lookup.
+                if let Some(store) = &self.store {
                     // Try SandboxStore first (simpler record).
-                    if let Ok(Some(rec)) = store.get_sandbox_job(parsed_id).await
+                    if let Ok(Some(rec)) = store.get_sandbox_job(job_id).await
                         && rec.user_id == requester_id
                     {
                         let result = serde_json::json!({
@@ -1164,11 +1228,11 @@ impl Tool for JobStatusTool {
                     }
 
                     // Try JobStore (richer record with cost info).
-                    if let Ok(Some(job_ctx)) = store.get_job(parsed_id).await
+                    if let Ok(Some(job_ctx)) = store.get_job(job_id).await
                         && job_ctx.user_id == requester_id
                     {
                         let result = serde_json::json!({
-                            "job_id": parsed_id.to_string(),
+                            "job_id": job_id.to_string(),
                             "title": job_ctx.title,
                             "description": job_ctx.description,
                             "status": format!("{:?}", job_ctx.state),
@@ -1192,6 +1256,10 @@ impl Tool for JobStatusTool {
 
     fn requires_sanitization(&self) -> bool {
         false
+    }
+
+    fn is_core(&self) -> bool {
+        true
     }
 }
 
@@ -1590,7 +1658,7 @@ impl Tool for DeleteJobTool {
             "properties": {
                 "job_id": {
                     "type": "string",
-                    "description": "The job ID (full UUID) of the job to delete"
+                    "description": "The job ID (full UUID or short prefix, e.g. 'f2854dd8') of the job to delete"
                 }
             },
             "required": ["job_id"]
@@ -1605,7 +1673,13 @@ impl Tool for DeleteJobTool {
         let start = std::time::Instant::now();
 
         let job_id_str = require_str(&params, "job_id")?;
-        let job_id = resolve_job_id(job_id_str, &self.context_manager).await?;
+        let job_id = resolve_job_id_for_user(
+            job_id_str,
+            &ctx.user_id,
+            &self.context_manager,
+            Some(&self.store),
+        )
+        .await?;
 
         // Verify the job belongs to the requesting user before deleting.
         let belongs = self
@@ -2248,5 +2322,15 @@ mod tests {
         let cm = ContextManager::new(5);
         let result = resolve_job_id("not-hex-at-all!", &cm).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_list_and_status_tools_are_core() {
+        let manager = Arc::new(ContextManager::new(5));
+        let list = ListJobsTool::new(Arc::clone(&manager), None);
+        let status = JobStatusTool::new(manager, None);
+
+        assert!(list.is_core(), "list_jobs should be a core tool");
+        assert!(status.is_core(), "job_status should be a core tool");
     }
 }

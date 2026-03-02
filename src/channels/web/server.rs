@@ -30,9 +30,9 @@ use crate::bootstrap::ironclaw_base_dir;
 use crate::channels::IncomingMessage;
 use crate::channels::web::auth::{AuthState, auth_middleware};
 use crate::channels::web::handlers::jobs::{
-    job_files_list_handler, job_files_read_handler, jobs_cancel_handler, jobs_detail_handler,
-    jobs_events_handler, jobs_list_handler, jobs_prompt_handler, jobs_restart_handler,
-    jobs_summary_handler,
+    job_files_list_handler, job_files_read_handler, jobs_cancel_handler, jobs_create_handler,
+    jobs_delete_handler, jobs_detail_handler, jobs_events_handler, jobs_list_handler,
+    jobs_prompt_handler, jobs_restart_handler, jobs_summary_handler, jobs_update_handler,
 };
 use crate::channels::web::handlers::skills::{
     skills_install_handler, skills_list_handler, skills_remove_handler, skills_search_handler,
@@ -219,9 +219,17 @@ pub async fn start_server(
         .route("/api/memory/write", post(memory_write_handler))
         .route("/api/memory/search", post(memory_search_handler))
         // Jobs
-        .route("/api/jobs", get(jobs_list_handler))
+        .route(
+            "/api/jobs",
+            get(jobs_list_handler).post(jobs_create_handler),
+        )
         .route("/api/jobs/summary", get(jobs_summary_handler))
-        .route("/api/jobs/{id}", get(jobs_detail_handler))
+        .route(
+            "/api/jobs/{id}",
+            get(jobs_detail_handler)
+                .delete(jobs_delete_handler)
+                .put(jobs_update_handler),
+        )
         .route("/api/jobs/{id}/cancel", post(jobs_cancel_handler))
         .route("/api/jobs/{id}/restart", post(jobs_restart_handler))
         .route("/api/jobs/{id}/prompt", post(jobs_prompt_handler))
@@ -1822,6 +1830,28 @@ async fn pairing_approve_handler(
 
 // --- Routines handlers ---
 
+fn routine_not_found() -> (StatusCode, String) {
+    (StatusCode::NOT_FOUND, "Routine not found".to_string())
+}
+
+async fn get_owned_routine(
+    store: &dyn Database,
+    routine_id: Uuid,
+    user_id: &str,
+) -> Result<crate::agent::routine::Routine, (StatusCode, String)> {
+    let routine = store
+        .get_routine(routine_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(routine_not_found)?;
+
+    if routine.user_id != user_id {
+        return Err(routine_not_found());
+    }
+
+    Ok(routine)
+}
+
 async fn routines_list_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<RoutineListResponse>, (StatusCode, String)> {
@@ -1831,7 +1861,7 @@ async fn routines_list_handler(
     ))?;
 
     let routines = store
-        .list_all_routines()
+        .list_routines(&state.user_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -1849,7 +1879,7 @@ async fn routines_summary_handler(
     ))?;
 
     let routines = store
-        .list_all_routines()
+        .list_routines(&state.user_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -1895,11 +1925,7 @@ async fn routines_detail_handler(
     let routine_id = Uuid::parse_str(&id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
 
-    let routine = store
-        .get_routine(routine_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Routine not found".to_string()))?;
+    let routine = get_owned_routine(store.as_ref(), routine_id, &state.user_id).await?;
 
     let runs = store
         .list_routine_runs(routine_id, 20)
@@ -1949,11 +1975,7 @@ async fn routines_trigger_handler(
     let routine_id = Uuid::parse_str(&id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
 
-    let routine = store
-        .get_routine(routine_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Routine not found".to_string()))?;
+    let routine = get_owned_routine(store.as_ref(), routine_id, &state.user_id).await?;
 
     // Send the routine prompt through the message pipeline as a manual trigger.
     let prompt = match &routine.action {
@@ -2003,11 +2025,7 @@ async fn routines_toggle_handler(
     let routine_id = Uuid::parse_str(&id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
 
-    let mut routine = store
-        .get_routine(routine_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Routine not found".to_string()))?;
+    let mut routine = get_owned_routine(store.as_ref(), routine_id, &state.user_id).await?;
 
     // If a specific value was provided, use it; otherwise toggle.
     routine.enabled = match body {
@@ -2038,6 +2056,9 @@ async fn routines_delete_handler(
     let routine_id = Uuid::parse_str(&id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
 
+    // Verify ownership before deleting.
+    let _ = get_owned_routine(store.as_ref(), routine_id, &state.user_id).await?;
+
     let deleted = store
         .delete_routine(routine_id)
         .await
@@ -2064,6 +2085,9 @@ async fn routines_runs_handler(
 
     let routine_id = Uuid::parse_str(&id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
+
+    // Verify ownership before exposing run history.
+    let _ = get_owned_routine(store.as_ref(), routine_id, &state.user_id).await?;
 
     let runs = store
         .list_routine_runs(routine_id, 50)

@@ -14,6 +14,28 @@ use crate::channels::IncomingMessage;
 use crate::channels::web::server::GatewayState;
 use crate::channels::web::types::*;
 
+fn routine_not_found() -> (StatusCode, String) {
+    (StatusCode::NOT_FOUND, "Routine not found".to_string())
+}
+
+async fn get_owned_routine(
+    store: &dyn crate::db::Database,
+    routine_id: Uuid,
+    user_id: &str,
+) -> Result<crate::agent::routine::Routine, (StatusCode, String)> {
+    let routine = store
+        .get_routine(routine_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(routine_not_found)?;
+
+    if routine.user_id != user_id {
+        return Err(routine_not_found());
+    }
+
+    Ok(routine)
+}
+
 pub async fn routines_list_handler(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<RoutineListResponse>, (StatusCode, String)> {
@@ -23,7 +45,7 @@ pub async fn routines_list_handler(
     ))?;
 
     let routines = store
-        .list_all_routines()
+        .list_routines(&state.user_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -41,7 +63,7 @@ pub async fn routines_summary_handler(
     ))?;
 
     let routines = store
-        .list_all_routines()
+        .list_routines(&state.user_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -87,11 +109,7 @@ pub async fn routines_detail_handler(
     let routine_id = Uuid::parse_str(&id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
 
-    let routine = store
-        .get_routine(routine_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Routine not found".to_string()))?;
+    let routine = get_owned_routine(store.as_ref(), routine_id, &state.user_id).await?;
 
     let runs = store
         .list_routine_runs(routine_id, 20)
@@ -141,11 +159,7 @@ pub async fn routines_trigger_handler(
     let routine_id = Uuid::parse_str(&id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
 
-    let routine = store
-        .get_routine(routine_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Routine not found".to_string()))?;
+    let routine = get_owned_routine(store.as_ref(), routine_id, &state.user_id).await?;
 
     // Send the routine prompt through the message pipeline as a manual trigger.
     let prompt = match &routine.action {
@@ -195,11 +209,7 @@ pub async fn routines_toggle_handler(
     let routine_id = Uuid::parse_str(&id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
 
-    let mut routine = store
-        .get_routine(routine_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Routine not found".to_string()))?;
+    let mut routine = get_owned_routine(store.as_ref(), routine_id, &state.user_id).await?;
 
     // If a specific value was provided, use it; otherwise toggle.
     routine.enabled = match body {
@@ -230,6 +240,9 @@ pub async fn routines_delete_handler(
     let routine_id = Uuid::parse_str(&id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
 
+    // Verify ownership before deleting.
+    let _ = get_owned_routine(store.as_ref(), routine_id, &state.user_id).await?;
+
     let deleted = store
         .delete_routine(routine_id)
         .await
@@ -256,6 +269,9 @@ pub async fn routines_runs_handler(
 
     let routine_id = Uuid::parse_str(&id)
         .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid routine ID".to_string()))?;
+
+    // Verify ownership before exposing run history.
+    let _ = get_owned_routine(store.as_ref(), routine_id, &state.user_id).await?;
 
     let runs = store
         .list_routine_runs(routine_id, 50)
