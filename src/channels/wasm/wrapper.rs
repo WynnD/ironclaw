@@ -1533,6 +1533,34 @@ impl WasmChannel {
 
                 *self.typing_task.write().await = Some(handle);
             }
+            StatusUpdate::ToolStarted {
+                name,
+                params_preview,
+            } => {
+                // Some WASM channels do not implement on_status yet. Send the
+                // tool-start event as a normal response so users still see live
+                // execution progress.
+                let mut prompt = format!("Running tool: {}", name);
+                if let Some(params) = params_preview
+                    && !params.trim().is_empty()
+                {
+                    prompt.push_str("\nParams: ");
+                    prompt.push_str(&truncate_status_text(params, 140));
+                }
+
+                let metadata_json = serde_json::to_string(metadata).unwrap_or_default();
+                if let Err(e) = self
+                    .call_on_respond(uuid::Uuid::new_v4(), &prompt, None, &metadata_json)
+                    .await
+                {
+                    tracing::debug!(
+                        channel = %self.name,
+                        error = %e,
+                        "Failed to send tool-start update via on_respond, falling back to on_status"
+                    );
+                    let _ = self.call_on_status(&status, metadata).await;
+                }
+            }
             StatusUpdate::StreamChunk(_) => {
                 // No-op, too noisy
             }
@@ -2362,9 +2390,21 @@ fn status_to_wit(status: &StatusUpdate, metadata: &serde_json::Value) -> wit_cha
             message: msg.clone(),
             metadata_json,
         },
-        StatusUpdate::ToolStarted { name } => wit_channel::StatusUpdate {
+        StatusUpdate::ToolStarted {
+            name,
+            params_preview,
+        } => wit_channel::StatusUpdate {
             status: wit_channel::StatusType::ToolStarted,
-            message: format!("Tool started: {}", name),
+            message: {
+                let mut msg = format!("Tool started: {}", name);
+                if let Some(params) = params_preview
+                    && !params.trim().is_empty()
+                {
+                    msg.push(' ');
+                    msg.push_str(&truncate_status_text(params, 140));
+                }
+                msg
+            },
             metadata_json,
         },
         StatusUpdate::ToolCompleted { name, success } => wit_channel::StatusUpdate {
@@ -2858,6 +2898,7 @@ mod tests {
             .send_status(
                 crate::channels::StatusUpdate::ToolStarted {
                     name: "http_request".into(),
+                    params_preview: Some("{\"url\":\"https://api.example.com\"}".into()),
                 },
                 &metadata,
             )
@@ -3163,6 +3204,7 @@ mod tests {
         let wit = status_to_wit(
             &crate::channels::StatusUpdate::ToolStarted {
                 name: "http_request".to_string(),
+                params_preview: Some("{\"url\":\"https://api.weather.test\"}".to_string()),
             },
             &metadata,
         );
@@ -3171,7 +3213,8 @@ mod tests {
             wit.status,
             super::wit_channel::StatusType::ToolStarted
         ));
-        assert_eq!(wit.message, "Tool started: http_request");
+        assert!(wit.message.starts_with("Tool started: http_request"));
+        assert!(wit.message.contains("\"url\""));
     }
 
     #[test]

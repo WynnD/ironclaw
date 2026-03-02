@@ -302,7 +302,7 @@ impl Channel for GatewayChannel {
                 message: msg,
                 thread_id: thread_id.clone(),
             },
-            StatusUpdate::ToolStarted { name } => SseEvent::ToolStarted {
+            StatusUpdate::ToolStarted { name, .. } => SseEvent::ToolStarted {
                 name,
                 thread_id: thread_id.clone(),
             },
