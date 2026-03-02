@@ -1,13 +1,48 @@
-name: Run Tests
+name: CI
 on:
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE*'
   push:
     branches:
       - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE*'
+  workflow_dispatch:
 
 jobs:
   tests:
-    name: Run Tests
+    name: Tests (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: all-features
+            flags: "--all-features"
+          - name: default
+            flags: ""
+          - name: libsql-only
+            flags: "--no-default-features --features libsql"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          profile: minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - name: Run Tests
+        run: cargo test ${{ matrix.flags }} -- --nocapture
+
+  telegram-tests:
+    name: Telegram Channel Tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -15,7 +50,69 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run Tests
-        run: cargo test --all-features -- --nocapture
       - name: Run Telegram Channel Tests
         run: cargo test --manifest-path channels-src/telegram/Cargo.toml -- --nocapture
+
+  # Runs in parallel with tests — validates Dockerfile on PRs,
+  # warms buildx GHA cache on main for the push-image job.
+  docker-build:
+    name: Docker Build
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'arc-runner-set-ironclaw' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          cache-from: type=registry,ref=registry.wynndrahorad.com/ironclaw:buildcache
+          cache-to: type=registry,ref=registry.wynndrahorad.com/ironclaw:buildcache,mode=max
+
+  # Rebuilds from GHA cache (near-instant) and pushes.
+  # Only runs on main after tests AND docker-build both succeed.
+  push-image:
+    name: Push Image
+    needs: [tests, telegram-tests, docker-build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: arc-runner-set-ironclaw
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Derive image tag
+        id: meta
+        run: echo "tag=sha-$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            registry.wynndrahorad.com/ironclaw:latest
+            registry.wynndrahorad.com/ironclaw:${{ steps.meta.outputs.tag }}
+          cache-from: type=registry,ref=registry.wynndrahorad.com/ironclaw:buildcache
+
+  # Roll-up job for branch protection
+  run-tests:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [tests, telegram-tests, docker-build, push-image]
+    steps:
+      - run: |
+          if [[ "${{ needs.tests.result }}" != "success" || \
+                "${{ needs.telegram-tests.result }}" != "success" || \
+                "${{ needs.docker-build.result }}" != "success" ]]; then
+            echo "Required jobs failed"
+            exit 1
+          fi
+          if [[ "${{ needs.push-image.result }}" == "failure" ]]; then
+            echo "Image push failed"
+            exit 1
+          fi

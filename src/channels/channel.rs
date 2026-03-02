@@ -115,7 +115,11 @@ pub enum StatusUpdate {
     /// Agent is thinking/processing.
     Thinking(String),
     /// Tool execution started.
-    ToolStarted { name: String },
+    ToolStarted {
+        name: String,
+        /// Very short JSON preview of tool parameters.
+        params_preview: Option<String>,
+    },
     /// Tool execution completed.
     ToolCompleted { name: String, success: bool },
     /// Brief preview of tool execution output.

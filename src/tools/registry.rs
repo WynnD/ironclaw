@@ -16,11 +16,12 @@ use crate::skills::catalog::SkillCatalog;
 use crate::skills::registry::SkillRegistry;
 use crate::tools::builder::{BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder};
 use crate::tools::builtin::{
-    ApplyPatchTool, CancelJobTool, CreateJobTool, DeleteJobTool, EchoTool, HttpTool, JobEventsTool,
-    JobPromptTool, JobStatusTool, JsonTool, ListDirTool, ListJobsTool, MemoryReadTool,
-    MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool, ShellTool,
-    SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool, ToolActivateTool,
-    ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool, WriteFileTool,
+    ApplyPatchTool, CancelJobTool, CreateJobTool, DeleteJobTool, DiscoverToolsTool, EchoTool,
+    HttpTool, JobEventsTool, JobPromptTool, JobStatusTool, JsonTool, ListDirTool, ListJobsTool,
+    MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool,
+    ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool,
+    ToolActivateTool, ToolAuthTool, ToolInstallTool, ToolListTool, ToolRemoveTool, ToolSearchTool,
+    WebFetchTool, WriteFileTool,
 };
 use crate::tools::rate_limiter::RateLimiter;
 use crate::tools::tool::{Tool, ToolDomain};
@@ -68,6 +69,8 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "skill_install",
     "skill_remove",
     "message",
+    "discover_tools",
+    "web_fetch",
 ];
 
 /// Registry of available tools.
@@ -81,8 +84,6 @@ pub struct ToolRegistry {
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
     /// Shared rate limiter for built-in tool invocations.
     rate_limiter: RateLimiter,
-    /// Reference to the message tool for setting context per-turn.
-    message_tool: RwLock<Option<Arc<crate::tools::builtin::MessageTool>>>,
 }
 
 impl ToolRegistry {
@@ -94,7 +95,6 @@ impl ToolRegistry {
             credential_registry: None,
             secrets_store: None,
             rate_limiter: RateLimiter::new(),
-            message_tool: RwLock::new(None),
         }
     }
 
@@ -206,6 +206,77 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Get tool definitions for only core tools (those with `is_core() == true`).
+    ///
+    /// Used when deferred tool loading is enabled to reduce payload size.
+    pub async fn core_tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.tools
+            .read()
+            .await
+            .values()
+            .filter(|tool| tool.is_core())
+            .map(|tool| ToolDefinition {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                parameters: tool.parameters_schema(),
+            })
+            .collect()
+    }
+
+    /// Get the catalog of deferred (non-core) tools as (name, description) pairs.
+    ///
+    /// This is injected into the system prompt so the LLM knows what's available
+    /// to discover via `discover_tools`.
+    pub async fn deferred_tool_catalog(&self) -> Vec<(String, String)> {
+        self.tools
+            .read()
+            .await
+            .values()
+            .filter(|tool| !tool.is_core())
+            .map(|tool| (tool.name().to_string(), tool.description().to_string()))
+            .collect()
+    }
+
+    /// Search tools by keyword, matching against name and description.
+    ///
+    /// Returns tool definitions for all matching tools (case-insensitive).
+    pub async fn search_tools(&self, query: &str) -> Vec<ToolDefinition> {
+        let query_lower = query.to_lowercase();
+        let keywords: Vec<&str> = query_lower.split_whitespace().collect();
+
+        self.tools
+            .read()
+            .await
+            .values()
+            .filter(|tool| {
+                let name = tool.name().to_lowercase();
+                let desc = tool.description().to_lowercase();
+                keywords
+                    .iter()
+                    .any(|kw| name.contains(kw) || desc.contains(kw))
+            })
+            .map(|tool| ToolDefinition {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                parameters: tool.parameters_schema(),
+            })
+            .collect()
+    }
+
+    /// Register the discover_tools tool (requires Arc<Self>).
+    ///
+    /// Must be called after other tool registrations so the registry
+    /// reference captures the full set.
+    pub async fn register_discover_tool(self: &Arc<Self>) {
+        let tool = DiscoverToolsTool::new(Arc::clone(self));
+        self.register(Arc::new(tool)).await;
+        self.builtin_names
+            .write()
+            .await
+            .insert("discover_tools".to_string());
+        tracing::info!("Registered discover_tools tool");
+    }
+
     /// Register all built-in tools.
     pub fn register_builtin_tools(&self) {
         self.register_sync(Arc::new(EchoTool));
@@ -217,6 +288,7 @@ impl ToolRegistry {
             http = http.with_credentials(Arc::clone(cr), Arc::clone(ss));
         }
         self.register_sync(Arc::new(http));
+        self.register_sync(Arc::new(WebFetchTool::new()));
 
         tracing::info!("Registered {} built-in tools", self.count());
     }
@@ -286,11 +358,13 @@ impl ToolRegistry {
     ///
     /// Job tools allow the LLM to create, list, check status, and cancel jobs.
     /// When sandbox deps are provided, `create_job` automatically delegates to
-    /// Docker containers. Otherwise it creates in-memory jobs via ContextManager.
+    /// Docker containers. Otherwise it dispatches via the Scheduler (which
+    /// persists to DB and spawns a worker).
     #[allow(clippy::too_many_arguments)]
     pub fn register_job_tools(
         &self,
         context_manager: Arc<ContextManager>,
+        scheduler_slot: Option<crate::tools::builtin::SchedulerSlot>,
         job_manager: Option<Arc<ContainerJobManager>>,
         store: Option<Arc<dyn Database>>,
         job_event_tx: Option<
@@ -301,6 +375,9 @@ impl ToolRegistry {
         secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
     ) {
         let mut create_tool = CreateJobTool::new(Arc::clone(&context_manager));
+        if let Some(slot) = scheduler_slot {
+            create_tool = create_tool.with_scheduler_slot(slot);
+        }
         if let Some(jm) = job_manager {
             create_tool = create_tool.with_sandbox(jm, store.clone());
         }
@@ -422,7 +499,6 @@ impl ToolRegistry {
     ) {
         use crate::tools::builtin::MessageTool;
         let tool = Arc::new(MessageTool::new(channel_manager));
-        *self.message_tool.write().await = Some(Arc::clone(&tool));
         self.tools
             .write()
             .await
@@ -432,14 +508,6 @@ impl ToolRegistry {
             .await
             .insert("message".to_string());
         tracing::info!("Registered message tool");
-    }
-
-    /// Set the default channel and target for the message tool.
-    /// Call this before each agent turn with the current conversation's context.
-    pub async fn set_message_tool_context(&self, channel: Option<String>, target: Option<String>) {
-        if let Some(tool) = self.message_tool.read().await.as_ref() {
-            tool.set_context(channel, target).await;
-        }
     }
 
     /// Register the software builder tool.

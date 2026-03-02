@@ -17,6 +17,7 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::bootstrap::ironclaw_base_dir;
 use crate::channels::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
 use crate::config::SignalConfig;
 use crate::error::ChannelError;
@@ -557,9 +558,7 @@ impl SignalChannel {
     /// - All paths are within ~/.ironclaw/ sandbox
     fn validate_attachment_paths(paths: &[String]) -> Result<(), ChannelError> {
         // Get the sandbox base directory (same as MessageTool uses)
-        let base_dir = dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".ironclaw");
+        let base_dir = ironclaw_base_dir();
 
         for path in paths {
             crate::tools::builtin::path_utils::validate_path(path, Some(&base_dir)).map_err(
@@ -966,10 +965,18 @@ impl Channel for SignalChannel {
 
         // Send tool started notification (debug mode only)
         if self.is_debug()
-            && let StatusUpdate::ToolStarted { name } = &status
+            && let StatusUpdate::ToolStarted {
+                name,
+                params_preview,
+            } = &status
             && let Some(target_str) = metadata.get("signal_target").and_then(|v| v.as_str())
         {
-            let message = format!("\u{25CB} Running tool: {}", name);
+            let params = params_preview
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .map(|s| format!(" {}", s))
+                .unwrap_or_default();
+            let message = format!("\u{25CB} Running tool: {}{}", name, params);
             self.send_status_message(target_str, &message).await;
         }
 
@@ -2671,9 +2678,7 @@ mod tests {
         use std::fs;
 
         // Create test files in sandbox
-        let base_dir = dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".ironclaw");
+        let base_dir = crate::bootstrap::ironclaw_base_dir();
 
         // Create sandbox directory if it doesn't exist (needed for CI)
         let _ = fs::create_dir_all(&base_dir);

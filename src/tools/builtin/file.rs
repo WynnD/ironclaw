@@ -177,6 +177,10 @@ impl Tool for ReadFileTool {
     fn domain(&self) -> ToolDomain {
         ToolDomain::Container
     }
+
+    fn is_core(&self) -> bool {
+        true
+    }
 }
 
 /// Write file contents tool.
@@ -292,6 +296,10 @@ impl Tool for WriteFileTool {
     fn rate_limit_config(&self) -> Option<crate::tools::tool::ToolRateLimitConfig> {
         Some(crate::tools::tool::ToolRateLimitConfig::new(20, 200))
     }
+
+    fn is_core(&self) -> bool {
+        true
+    }
 }
 
 /// List directory contents tool.
@@ -403,6 +411,10 @@ impl Tool for ListDirTool {
 
     fn domain(&self) -> ToolDomain {
         ToolDomain::Container
+    }
+
+    fn is_core(&self) -> bool {
+        true
     }
 }
 
@@ -620,6 +632,10 @@ impl Tool for ApplyPatchTool {
 
     fn rate_limit_config(&self) -> Option<crate::tools::tool::ToolRateLimitConfig> {
         Some(crate::tools::tool::ToolRateLimitConfig::new(20, 200))
+    }
+
+    fn is_core(&self) -> bool {
+        true
     }
 }
 

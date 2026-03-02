@@ -501,7 +501,19 @@ impl LlmProvider for NearAiChatProvider {
 
         // Fall back to reasoning_content when content is null (e.g. GLM-5
         // returns its answer in reasoning_content instead of content).
-        let content = choice.message.content.or(choice.message.reasoning_content);
+        // Pre-strip <think> tags so chain-of-thought doesn't leak through
+        // as user-visible text (which clean_response would strip, leaving empty).
+        let content = choice.message.content.or_else(|| {
+            choice.message.reasoning_content.and_then(|rc| {
+                let stripped = crate::llm::reasoning::strip_think_tags(&rc);
+                let trimmed = stripped.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            })
+        });
         let tool_calls: Vec<ToolCall> = choice
             .message
             .tool_calls

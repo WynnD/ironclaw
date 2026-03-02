@@ -204,6 +204,60 @@ impl ClaudeBridgeRuntime {
         Ok(())
     }
 
+    /// Materialize subscription credentials from env into `~/.claude/.credentials.json`.
+    ///
+    /// Returns true when credentials were written during this call.
+    fn install_subscription_credentials_from_env(
+        &self,
+        extra_env: &mut std::collections::HashMap<String, String>,
+    ) -> Result<bool, WorkerError> {
+        let env_key = crate::config::CLAUDE_CODE_CREDENTIALS_ENV_VAR;
+        let raw = extra_env
+            .remove(env_key)
+            .or_else(|| std::env::var(env_key).ok());
+        let Some(raw_json) = raw else {
+            return Ok(false);
+        };
+
+        let trimmed = raw_json.trim();
+        let parsed: serde_json::Value =
+            serde_json::from_str(trimmed).map_err(|e| WorkerError::ExecutionFailed {
+                reason: format!("invalid Claude Code credentials JSON: {e}"),
+            })?;
+        let has_token = parsed["claudeAiOauth"]["accessToken"]
+            .as_str()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if !has_token {
+            return Err(WorkerError::ExecutionFailed {
+                reason: "Claude Code credentials JSON is missing claudeAiOauth.accessToken"
+                    .to_string(),
+            });
+        }
+
+        let target_dir = std::path::Path::new("/home/sandbox/.claude");
+        std::fs::create_dir_all(target_dir).map_err(|e| WorkerError::ExecutionFailed {
+            reason: format!("failed to create ~/.claude: {e}"),
+        })?;
+
+        let creds_path = target_dir.join(".credentials.json");
+        std::fs::write(&creds_path, trimmed).map_err(|e| WorkerError::ExecutionFailed {
+            reason: format!("failed to write ~/.claude/.credentials.json: {e}"),
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&creds_path, std::fs::Permissions::from_mode(0o600));
+        }
+
+        tracing::info!(
+            job_id = %self.config.job_id,
+            "Installed Claude Code subscription credentials in container home"
+        );
+        Ok(true)
+    }
+
     /// Run the bridge: fetch job, spawn claude, stream events, handle follow-ups.
     pub async fn run(&self) -> Result<(), WorkerError> {
         // Copy auth files from read-only host mount (if present) into the
@@ -239,16 +293,18 @@ impl ClaudeBridgeRuntime {
             );
         }
 
-        // Warn if no auth method is available (check both process env and fetched credentials).
-        let has_api_key = extra_env.contains_key("ANTHROPIC_API_KEY")
-            || std::env::var("ANTHROPIC_API_KEY").is_ok();
+        let wrote_subscription = self.install_subscription_credentials_from_env(&mut extra_env)?;
+
+        // Warn if no auth method is available.
+        let has_subscription_file = wrote_subscription
+            || std::path::Path::new("/home/sandbox/.claude/.credentials.json").exists();
         let has_oauth = extra_env.contains_key("CLAUDE_CODE_OAUTH_TOKEN")
             || std::env::var("CLAUDE_CODE_OAUTH_TOKEN").is_ok();
-        if !has_api_key && !has_oauth {
+        if !has_subscription_file && !has_oauth {
             tracing::warn!(
                 job_id = %self.config.job_id,
-                "No Claude Code auth available. Set ANTHROPIC_API_KEY or run \
-                 `claude login` on the host to authenticate."
+                "No Claude Code subscription login available. Run `claude login` \
+                 on the host so credentials can be imported."
             );
         }
 
@@ -364,6 +420,7 @@ impl ClaudeBridgeRuntime {
 
         // Inject credentials into the child process environment without
         // mutating the global process env (which is unsafe in multi-threaded programs).
+        cmd.env_remove(crate::config::CLAUDE_CODE_CREDENTIALS_ENV_VAR);
         cmd.envs(extra_env);
 
         cmd.current_dir("/workspace")

@@ -35,6 +35,7 @@ pub struct WorkerDeps {
     pub hooks: Arc<HookRegistry>,
     pub timeout: Duration,
     pub use_planning: bool,
+    pub deferred_tool_loading: bool,
 }
 
 /// Worker that executes a single job.
@@ -211,6 +212,11 @@ impl Worker {
         // Build initial reasoning context (tool definitions refreshed each iteration in execution_loop)
         let mut reason_ctx = ReasoningContext::new().with_job(&job_ctx.description);
 
+        // Inject deferred tool catalog into system prompt when deferred loading is on
+        if self.deps.deferred_tool_loading {
+            reason_ctx.deferred_tool_catalog = self.tools().deferred_tool_catalog().await;
+        }
+
         // Add system message
         reason_ctx.messages.push(ChatMessage::system(format!(
             r#"You are an autonomous agent working on a job.
@@ -234,6 +240,37 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         match result {
             Ok(Ok(())) => {
                 tracing::info!("Worker for job {} completed successfully", self.job_id);
+                // Only mark completed if still in an active, non-stuck state.
+                // The execution_loop may have already called mark_completed or
+                // mark_stuck (e.g. "plan completed but work remains").
+                let current_state = self
+                    .context_manager()
+                    .get_context(self.job_id)
+                    .await
+                    .map(|ctx| ctx.state);
+                match current_state {
+                    Ok(state) if state.is_terminal() => {
+                        // Already in a terminal state (e.g. execution_loop
+                        // called mark_completed itself).
+                    }
+                    Ok(JobState::Stuck) => {
+                        // execution_loop marked this as stuck (e.g. "plan
+                        // completed but work remains"); leave for self-repair.
+                        tracing::info!(
+                            "Job {} returned Ok but is Stuck — leaving for self-repair",
+                            self.job_id
+                        );
+                    }
+                    Ok(_) => {
+                        self.mark_completed().await?;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            job_id = %self.job_id,
+                            "Failed to get job context, cannot mark as completed: {}", e
+                        );
+                    }
+                }
             }
             Ok(Err(e)) => {
                 tracing::error!("Worker for job {} failed: {}", self.job_id, e);
@@ -265,8 +302,15 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
         let max_iterations = max_iterations.min(MAX_WORKER_ITERATIONS);
         let mut iteration = 0;
 
+        // Track tools activated via discover_tools (only used when deferred loading is on)
+        let mut discovered_tool_names: HashSet<String> = HashSet::new();
+
         // Initial tool definitions for planning (will be refreshed in loop)
-        reason_ctx.available_tools = self.tools().tool_definitions().await;
+        reason_ctx.available_tools = if self.deps.deferred_tool_loading {
+            self.tools().core_tool_definitions().await
+        } else {
+            self.tools().tool_definitions().await
+        };
 
         // Generate plan if planning is enabled
         let plan = if self.use_planning() {
@@ -349,11 +393,25 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 return Ok(());
             }
 
-            // Refresh tool definitions so newly built tools become visible
-            reason_ctx.available_tools = self.tools().tool_definitions().await;
+            // Refresh tool definitions so newly built tools become visible.
+            // When deferred loading is on, only send core + previously-discovered tools.
+            reason_ctx.available_tools = if self.deps.deferred_tool_loading {
+                let mut defs = self.tools().core_tool_definitions().await;
+                if !discovered_tool_names.is_empty() {
+                    let names: Vec<&str> =
+                        discovered_tool_names.iter().map(|s| s.as_str()).collect();
+                    defs.extend(self.tools().tool_definitions_for(&names).await);
+                }
+                defs
+            } else {
+                self.tools().tool_definitions().await
+            };
 
             // Select next tool(s) to use
             let selections = reasoning.select_tools(reason_ctx).await?;
+
+            // Collect all executed selections for discover_tools tracking below
+            let mut executed_selections: Vec<ToolSelection> = Vec::new();
 
             if selections.is_empty() {
                 // No tools from select_tools, ask LLM directly (may still return tool calls)
@@ -391,6 +449,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     RespondResult::ToolCalls {
                         tool_calls,
                         content,
+                        assistant_content,
                     } => {
                         // Model returned tool calls - execute them
                         tracing::debug!(
@@ -413,12 +472,12 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                         reason_ctx
                             .messages
                             .push(ChatMessage::assistant_with_tool_calls(
-                                content,
+                                assistant_content.or(content),
                                 tool_calls.clone(),
                             ));
 
                         // Convert ToolCalls to ToolSelections and execute in parallel
-                        let selections: Vec<ToolSelection> = tool_calls
+                        let respond_selections: Vec<ToolSelection> = tool_calls
                             .iter()
                             .map(|tc| ToolSelection {
                                 tool_name: tc.name.clone(),
@@ -429,11 +488,12 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                             })
                             .collect();
 
-                        let results = self.execute_tools_parallel(&selections).await;
-                        for (selection, result) in selections.iter().zip(results) {
+                        let results = self.execute_tools_parallel(&respond_selections).await;
+                        for (selection, result) in respond_selections.iter().zip(results) {
                             self.process_tool_result(reason_ctx, selection, result.result)
                                 .await?;
                         }
+                        executed_selections = respond_selections;
                     }
                 }
             } else if selections.len() == 1 {
@@ -452,6 +512,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
 
                 self.process_tool_result(reason_ctx, selection, result)
                     .await?;
+                executed_selections = selections;
             } else {
                 // Multiple tools: execute in parallel
                 tracing::debug!(
@@ -466,6 +527,35 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 for (selection, result) in selections.iter().zip(results) {
                     self.process_tool_result(reason_ctx, selection, result.result)
                         .await?;
+                }
+                executed_selections = selections;
+            }
+
+            // Track discover_tools calls to expand the tool set.
+            if self.deps.deferred_tool_loading {
+                for selection in &executed_selections {
+                    if selection.tool_name == "discover_tools" {
+                        if let Some(q) = selection
+                            .parameters
+                            .get("query")
+                            .and_then(|v: &serde_json::Value| v.as_str())
+                        {
+                            for def in self.tools().search_tools(q).await {
+                                discovered_tool_names.insert(def.name);
+                            }
+                        }
+                        if let Some(names) = selection
+                            .parameters
+                            .get("names")
+                            .and_then(|v: &serde_json::Value| v.as_array())
+                        {
+                            let name_strs: Vec<&str> =
+                                names.iter().filter_map(|v| v.as_str()).collect();
+                            for def in self.tools().tool_definitions_for(&name_strs).await {
+                                discovered_tool_names.insert(def.name);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1177,6 +1267,7 @@ mod tests {
             hooks: Arc::new(crate::hooks::HookRegistry::new()),
             timeout: Duration::from_secs(30),
             use_planning: false,
+            deferred_tool_loading: false,
         };
 
         Worker::new(job_id, deps)

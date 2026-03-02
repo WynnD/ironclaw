@@ -3,7 +3,10 @@
 //! Monitors the size of the conversation context and triggers
 //! compaction when approaching the limit.
 
+use std::sync::LazyLock;
+
 use crate::llm::ChatMessage;
+use tiktoken_rs::CoreBPE;
 
 /// Default context window limit (conservative estimate).
 const DEFAULT_CONTEXT_LIMIT: usize = 100_000;
@@ -15,6 +18,13 @@ const COMPACTION_THRESHOLD: f64 = 0.8;
 const TOKENS_PER_WORD: f64 = 1.3;
 /// Approximate tokens per byte (safer for JSON/code than word count).
 const TOKENS_PER_BYTE: f64 = 0.25;
+static CL100K_BPE: LazyLock<Option<CoreBPE>> = LazyLock::new(|| match tiktoken_rs::cl100k_base() {
+    Ok(bpe) => Some(bpe),
+    Err(e) => {
+        tracing::warn!(error = %e, "Failed to initialize cl100k tokenizer; using heuristic token estimation");
+        None
+    }
+});
 
 /// Strategy for context compaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +159,10 @@ fn estimate_message_tokens(message: &ChatMessage) -> usize {
 
 /// Estimate tokens for raw text.
 pub fn estimate_text_tokens(text: &str) -> usize {
+    if let Some(bpe) = CL100K_BPE.as_ref() {
+        return bpe.encode_ordinary(text).len();
+    }
+
     let word_count = text.split_whitespace().count();
     let word_estimate = (word_count as f64 * TOKENS_PER_WORD).ceil() as usize;
     let byte_estimate = (text.len() as f64 * TOKENS_PER_BYTE).ceil() as usize;

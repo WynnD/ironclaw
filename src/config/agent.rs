@@ -33,6 +33,10 @@ pub struct AgentConfig {
     pub context_output_reserve_tokens: usize,
     /// Maximum estimated tokens from a single tool result allowed into LLM context.
     pub max_tool_output_tokens: usize,
+    /// When true, only core tools are sent with each LLM request.
+    /// Non-core tools are discoverable via `discover_tools` on demand.
+    /// Reduces payload size for providers with request size limits.
+    pub deferred_tool_loading: bool,
 }
 
 impl AgentConfig {
@@ -81,6 +85,83 @@ impl AgentConfig {
                 4096usize,
             )?,
             max_tool_output_tokens: parse_optional_env("MAX_TOOL_OUTPUT_TOKENS", 4096usize)?,
+            deferred_tool_loading: parse_bool_env("DEFERRED_TOOL_LOADING", false)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::helpers::ENV_MUTEX;
+    use crate::settings::Settings;
+
+    fn clear_agent_env() {
+        // SAFETY: Called only while holding ENV_MUTEX.
+        unsafe {
+            for key in [
+                "AGENT_NAME",
+                "AGENT_MAX_PARALLEL_JOBS",
+                "AGENT_JOB_TIMEOUT_SECS",
+                "AGENT_STUCK_THRESHOLD_SECS",
+                "SELF_REPAIR_CHECK_INTERVAL_SECS",
+                "SELF_REPAIR_MAX_ATTEMPTS",
+                "AGENT_USE_PLANNING",
+                "SESSION_IDLE_TIMEOUT_SECS",
+                "ALLOW_LOCAL_TOOLS",
+                "MAX_COST_PER_DAY_CENTS",
+                "MAX_ACTIONS_PER_HOUR",
+                "AGENT_MAX_TOOL_ITERATIONS",
+                "AGENT_AUTO_APPROVE_TOOLS",
+                "CONTEXT_LIMIT",
+                "CONTEXT_OUTPUT_RESERVE_TOKENS",
+                "MAX_TOOL_OUTPUT_TOKENS",
+                "DEFERRED_TOOL_LOADING",
+            ] {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_uses_settings_defaults_when_env_unset() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_agent_env();
+
+        let settings = Settings::default();
+        let cfg = AgentConfig::resolve(&settings).expect("resolve should succeed");
+
+        assert_eq!(cfg.name, settings.agent.name);
+        assert_eq!(
+            cfg.max_parallel_jobs,
+            settings.agent.max_parallel_jobs as usize
+        );
+        assert_eq!(
+            cfg.max_tool_iterations,
+            settings.agent.max_tool_iterations
+        );
+        assert_eq!(cfg.auto_approve_tools, settings.agent.auto_approve_tools);
+    }
+
+    #[test]
+    fn resolve_honors_env_overrides_for_numeric_and_bool_fields() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_agent_env();
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("AGENT_MAX_TOOL_ITERATIONS", "77");
+            std::env::set_var("AGENT_AUTO_APPROVE_TOOLS", "true");
+            std::env::set_var("MAX_COST_PER_DAY_CENTS", "12345");
+            std::env::set_var("MAX_ACTIONS_PER_HOUR", "99");
+            std::env::set_var("CONTEXT_LIMIT", "65536");
+        }
+
+        let cfg = AgentConfig::resolve(&Settings::default()).expect("resolve should succeed");
+        assert_eq!(cfg.max_tool_iterations, 77);
+        assert!(cfg.auto_approve_tools);
+        assert_eq!(cfg.max_cost_per_day_cents, Some(12345));
+        assert_eq!(cfg.max_actions_per_hour, Some(99));
+        assert_eq!(cfg.context_limit_override, Some(65536));
     }
 }

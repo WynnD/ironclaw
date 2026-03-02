@@ -38,6 +38,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::agent::truncate_for_preview;
+use crate::bootstrap::ironclaw_base_dir;
 use crate::channels::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
 use crate::error::ChannelError;
 
@@ -279,10 +280,7 @@ fn print_help() {
 
 /// Get the history file path (~/.ironclaw/history).
 fn history_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".ironclaw")
-        .join("history")
+    ironclaw_base_dir().join("history")
 }
 
 #[async_trait]
@@ -465,8 +463,15 @@ impl Channel for ReplChannel {
                 let display = truncate_for_preview(&msg, CLI_STATUS_MAX);
                 eprintln!("  \x1b[90m\u{25CB} {display}\x1b[0m");
             }
-            StatusUpdate::ToolStarted { name } => {
-                eprintln!("  \x1b[33m\u{25CB} {name}\x1b[0m");
+            StatusUpdate::ToolStarted {
+                name,
+                params_preview,
+            } => {
+                let detail = params_preview
+                    .filter(|s| !s.is_empty())
+                    .map(|s| format!(" {}", truncate_for_preview(&s, CLI_STATUS_MAX / 2)))
+                    .unwrap_or_default();
+                eprintln!("  \x1b[33m\u{25CB} {name}{detail}\x1b[0m");
             }
             StatusUpdate::ToolCompleted { name, success } => {
                 if success {

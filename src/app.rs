@@ -229,6 +229,9 @@ impl AppBuilder {
         // Fire-and-forget housekeeping — no need to block startup.
         let db_cleanup = db.clone();
         tokio::spawn(async move {
+            if let Err(e) = db_cleanup.cleanup_stale_agent_jobs().await {
+                tracing::warn!("Failed to cleanup stale direct jobs: {}", e);
+            }
             if let Err(e) = db_cleanup.cleanup_stale_sandbox_jobs().await {
                 tracing::warn!("Failed to cleanup stale sandbox jobs: {}", e);
             }
@@ -428,19 +431,17 @@ impl AppBuilder {
         let mcp_session_manager = Arc::new(McpSessionManager::new());
         let app_user_id = self.app_user_id().to_string();
 
-        // Create WASM tool runtime
-        let wasm_tool_runtime: Option<Arc<WasmToolRuntime>> =
-            if self.config.wasm.enabled && self.config.wasm.tools_dir.exists() {
-                match WasmToolRuntime::new(self.config.wasm.to_runtime_config()) {
-                    Ok(runtime) => Some(Arc::new(runtime)),
-                    Err(e) => {
-                        tracing::warn!("Failed to initialize WASM runtime: {}", e);
-                        None
-                    }
-                }
-            } else {
-                None
-            };
+        // Create WASM tool runtime eagerly so extensions installed after startup
+        // (e.g. via the web UI) can still be activated. The tools directory is only
+        // needed when loading modules, not for engine initialisation.
+        let wasm_tool_runtime: Option<Arc<WasmToolRuntime>> = if self.config.wasm.enabled {
+            WasmToolRuntime::new(self.config.wasm.to_runtime_config())
+                .map(Arc::new)
+                .map_err(|e| tracing::warn!("Failed to initialize WASM runtime: {}", e))
+                .ok()
+        } else {
+            None
+        };
 
         // Load WASM tools and MCP servers concurrently
         let wasm_tools_future = {
@@ -768,9 +769,15 @@ impl AppBuilder {
             },
         ));
 
+        // Register discover_tools when deferred tool loading is enabled
+        if self.config.agent.deferred_tool_loading {
+            tools.register_discover_tool().await;
+        }
+
         tracing::info!(
-            "Tool registry initialized with {} total tools",
-            tools.count()
+            "Tool registry initialized with {} total tools (deferred_loading={})",
+            tools.count(),
+            self.config.agent.deferred_tool_loading,
         );
 
         Ok(AppComponents {

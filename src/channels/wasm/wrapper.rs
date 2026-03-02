@@ -28,7 +28,7 @@
 //! └──────────────────────────────────────────────────────────────┘
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -547,12 +547,50 @@ pub struct WasmChannel {
     /// Telegram's "typing..." indicator expires after ~5s, so we refresh it.
     typing_task: RwLock<Option<tokio::task::JoinHandle<()>>>,
 
+    /// Per-target guard to avoid spamming repeated "Working..." fallback messages
+    /// when a channel does not support `on_status` typing indicators.
+    fallback_progress_sent: RwLock<HashSet<String>>,
+
     /// Pairing store for DM pairing (guest access control).
     pairing_store: Arc<PairingStore>,
 
     /// In-memory workspace store persisting writes across callback invocations.
     /// Ensures WASM channels can maintain state (e.g., polling offsets) between ticks.
     workspace_store: Arc<ChannelWorkspaceStore>,
+
+    /// Last-seen message metadata (contains chat_id for broadcast routing).
+    /// Populated from incoming messages so `broadcast()` knows where to send.
+    last_broadcast_metadata: Arc<tokio::sync::RwLock<Option<String>>>,
+
+    /// Settings store for persisting broadcast metadata across restarts.
+    settings_store: Option<Arc<dyn crate::db::SettingsStore>>,
+}
+
+/// Update broadcast metadata in memory and persist to the settings store when
+/// it changes. Extracted as a free function so both the `WasmChannel` instance
+/// method and the static polling helper share one implementation.
+async fn do_update_broadcast_metadata(
+    channel_name: &str,
+    metadata: &str,
+    last_broadcast_metadata: &tokio::sync::RwLock<Option<String>>,
+    settings_store: Option<&Arc<dyn crate::db::SettingsStore>>,
+) {
+    let mut guard = last_broadcast_metadata.write().await;
+    let changed = guard.as_deref() != Some(metadata);
+    *guard = Some(metadata.to_string());
+    drop(guard);
+
+    if changed && let Some(store) = settings_store {
+        let key = format!("channel_broadcast_metadata_{}", channel_name);
+        let value = serde_json::Value::String(metadata.to_string());
+        if let Err(e) = store.set_setting("default", &key, &value).await {
+            tracing::warn!(
+                channel = %channel_name,
+                "Failed to persist broadcast metadata: {}",
+                e
+            );
+        }
+    }
 }
 
 impl WasmChannel {
@@ -563,6 +601,7 @@ impl WasmChannel {
         capabilities: ChannelCapabilities,
         config_json: String,
         pairing_store: Arc<PairingStore>,
+        settings_store: Option<Arc<dyn crate::db::SettingsStore>>,
     ) -> Self {
         let name = prepared.name.clone();
         let rate_limiter = ChannelEmitRateLimiter::new(capabilities.emit_rate_limit.clone());
@@ -582,8 +621,11 @@ impl WasmChannel {
             endpoints: RwLock::new(Vec::new()),
             credentials: Arc::new(RwLock::new(HashMap::new())),
             typing_task: RwLock::new(None),
+            fallback_progress_sent: RwLock::new(HashSet::new()),
             pairing_store,
             workspace_store: Arc::new(ChannelWorkspaceStore::new()),
+            last_broadcast_metadata: Arc::new(tokio::sync::RwLock::new(None)),
+            settings_store,
         }
     }
 
@@ -629,6 +671,51 @@ impl WasmChannel {
     /// Get the channel name.
     pub fn channel_name(&self) -> &str {
         &self.name
+    }
+
+    /// Settings key for persisted broadcast metadata.
+    fn broadcast_metadata_key(&self) -> String {
+        format!("channel_broadcast_metadata_{}", self.name)
+    }
+
+    /// Update broadcast metadata in memory and persist if changed (best-effort).
+    ///
+    /// Compares with the current value to avoid redundant DB writes on every
+    /// incoming message (the chat_id rarely changes).
+    async fn update_broadcast_metadata(&self, metadata: &str) {
+        do_update_broadcast_metadata(
+            &self.name,
+            metadata,
+            &self.last_broadcast_metadata,
+            self.settings_store.as_ref(),
+        )
+        .await;
+    }
+
+    /// Load broadcast metadata from settings store on startup.
+    async fn load_broadcast_metadata(&self) {
+        if let Some(ref store) = self.settings_store {
+            match store
+                .get_setting("default", &self.broadcast_metadata_key())
+                .await
+            {
+                Ok(Some(serde_json::Value::String(meta))) => {
+                    *self.last_broadcast_metadata.write().await = Some(meta);
+                    tracing::debug!(
+                        channel = %self.name,
+                        "Restored broadcast metadata from settings"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        channel = %self.name,
+                        "Failed to load broadcast metadata: {}",
+                        e
+                    );
+                }
+            }
+        }
     }
 
     /// Get the channel capabilities.
@@ -1369,6 +1456,63 @@ impl WasmChannel {
         }
     }
 
+    /// Build a best-effort routing key for per-target status fallbacks.
+    fn status_target_key(metadata: &serde_json::Value) -> String {
+        for key in [
+            "chat_id",
+            "signal_target",
+            "sender_id",
+            "user_id",
+            "thread_id",
+        ] {
+            if let Some(value) = metadata.get(key) {
+                if let Some(s) = value.as_str()
+                    && !s.trim().is_empty()
+                {
+                    return format!("{key}:{s}");
+                }
+                if let Some(i) = value.as_i64() {
+                    return format!("{key}:{i}");
+                }
+                if let Some(u) = value.as_u64() {
+                    return format!("{key}:{u}");
+                }
+            }
+        }
+        "default".to_string()
+    }
+
+    /// Mark that a fallback progress message has been sent for this target.
+    /// Returns true only for the first send.
+    async fn mark_fallback_progress_sent(&self, target_key: &str) -> bool {
+        let mut sent = self.fallback_progress_sent.write().await;
+        sent.insert(target_key.to_string())
+    }
+
+    /// Clear fallback progress marker for a target (turn completed/interrupted).
+    async fn clear_fallback_progress_sent(&self, metadata: &serde_json::Value) {
+        let target_key = Self::status_target_key(metadata);
+        self.fallback_progress_sent
+            .write()
+            .await
+            .remove(&target_key);
+    }
+
+    /// Emit a one-shot progress fallback when typing/status callbacks are unavailable.
+    async fn send_progress_fallback_message(&self, metadata: &serde_json::Value) {
+        let metadata_json = serde_json::to_string(metadata).unwrap_or_default();
+        if let Err(e) = self
+            .call_on_respond(uuid::Uuid::new_v4(), "Working...", None, &metadata_json)
+            .await
+        {
+            tracing::debug!(
+                channel = %self.name,
+                error = %e,
+                "Failed to send fallback progress message via on_respond"
+            );
+        }
+    }
+
     /// Handle a status update, managing the typing repeat timer.
     ///
     /// On Thinking: fires on_status once, then spawns a background task
@@ -1399,57 +1543,97 @@ impl WasmChannel {
                 // Cancel any existing typing task
                 self.cancel_typing_task().await;
 
+                let mut on_status_ok = true;
                 // Fire once immediately
                 if let Err(e) = self.call_on_status(&status, metadata).await {
+                    on_status_ok = false;
                     tracing::debug!(
                         channel = %self.name,
                         error = %e,
                         "on_status(Thinking) failed (best-effort)"
                     );
-                }
-
-                // Spawn background repeater
-                let channel_name = self.name.clone();
-                let runtime = Arc::clone(&self.runtime);
-                let prepared = Arc::clone(&self.prepared);
-                let capabilities = self.capabilities.clone();
-                let credentials = self.credentials.clone();
-                let pairing_store = self.pairing_store.clone();
-                let callback_timeout = self.runtime.config().callback_timeout;
-                let wit_update = status_to_wit(&status, metadata);
-
-                let handle = tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(Duration::from_secs(4));
-                    // Skip the first tick (we already fired above)
-                    interval.tick().await;
-
-                    loop {
-                        interval.tick().await;
-
-                        let wit_update_clone = clone_wit_status_update(&wit_update);
-
-                        if let Err(e) = Self::execute_status(
-                            &channel_name,
-                            &runtime,
-                            &prepared,
-                            &capabilities,
-                            &credentials,
-                            pairing_store.clone(),
-                            callback_timeout,
-                            wit_update_clone,
-                        )
-                        .await
-                        {
-                            tracing::debug!(
-                                channel = %channel_name,
-                                error = %e,
-                                "Typing repeat on_status failed (best-effort)"
-                            );
+                    // Telegram fallback: if typing callback isn't available,
+                    // send one visible progress message so work is still obvious.
+                    if self.name == "telegram" {
+                        let target_key = Self::status_target_key(metadata);
+                        if self.mark_fallback_progress_sent(&target_key).await {
+                            self.send_progress_fallback_message(metadata).await;
                         }
                     }
-                });
+                }
 
-                *self.typing_task.write().await = Some(handle);
+                if on_status_ok {
+                    // Spawn background repeater
+                    let channel_name = self.name.clone();
+                    let runtime = Arc::clone(&self.runtime);
+                    let prepared = Arc::clone(&self.prepared);
+                    let capabilities = self.capabilities.clone();
+                    let credentials = self.credentials.clone();
+                    let pairing_store = self.pairing_store.clone();
+                    let callback_timeout = self.runtime.config().callback_timeout;
+                    let wit_update = status_to_wit(&status, metadata);
+
+                    let handle = tokio::spawn(async move {
+                        let mut interval = tokio::time::interval(Duration::from_secs(4));
+                        // Skip the first tick (we already fired above)
+                        interval.tick().await;
+
+                        loop {
+                            interval.tick().await;
+
+                            let wit_update_clone = clone_wit_status_update(&wit_update);
+
+                            if let Err(e) = Self::execute_status(
+                                &channel_name,
+                                &runtime,
+                                &prepared,
+                                &capabilities,
+                                &credentials,
+                                pairing_store.clone(),
+                                callback_timeout,
+                                wit_update_clone,
+                            )
+                            .await
+                            {
+                                tracing::debug!(
+                                    channel = %channel_name,
+                                    error = %e,
+                                    "Typing repeat on_status failed (best-effort)"
+                                );
+                            }
+                        }
+                    });
+
+                    *self.typing_task.write().await = Some(handle);
+                }
+            }
+            StatusUpdate::ToolStarted {
+                name,
+                params_preview,
+            } => {
+                // Some WASM channels do not implement on_status yet. Send the
+                // tool-start event as a normal response so users still see live
+                // execution progress.
+                let mut prompt = format!("Running tool: {}", name);
+                if let Some(params) = params_preview
+                    && !params.trim().is_empty()
+                {
+                    prompt.push_str("\nParams: ");
+                    prompt.push_str(&truncate_status_text(params, 140));
+                }
+
+                let metadata_json = serde_json::to_string(metadata).unwrap_or_default();
+                if let Err(e) = self
+                    .call_on_respond(uuid::Uuid::new_v4(), &prompt, None, &metadata_json)
+                    .await
+                {
+                    tracing::debug!(
+                        channel = %self.name,
+                        error = %e,
+                        "Failed to send tool-start update via on_respond, falling back to on_status"
+                    );
+                    let _ = self.call_on_status(&status, metadata).await;
+                }
             }
             StatusUpdate::StreamChunk(_) => {
                 // No-op, too noisy
@@ -1464,6 +1648,7 @@ impl WasmChannel {
                 // interactive approval overlays.  Send the approval prompt
                 // as an actual message so the user can reply yes/no.
                 self.cancel_typing_task().await;
+                self.clear_fallback_progress_sent(metadata).await;
 
                 let params_preview = parameters
                     .as_object()
@@ -1523,6 +1708,7 @@ impl WasmChannel {
             StatusUpdate::AuthRequired { .. } => {
                 // Waiting on user action: stop typing and fire once.
                 self.cancel_typing_task().await;
+                self.clear_fallback_progress_sent(metadata).await;
 
                 if let Err(e) = self.call_on_status(&status, metadata).await {
                     tracing::debug!(
@@ -1535,6 +1721,7 @@ impl WasmChannel {
             StatusUpdate::Status(msg) if is_terminal_text_status(msg) => {
                 // Waiting on user or terminal states: stop typing and fire once.
                 self.cancel_typing_task().await;
+                self.clear_fallback_progress_sent(metadata).await;
 
                 if let Err(e) = self.call_on_status(&status, metadata).await {
                     tracing::debug!(
@@ -1613,6 +1800,8 @@ impl WasmChannel {
             // Parse metadata JSON
             if let Ok(metadata) = serde_json::from_str(&emitted.metadata_json) {
                 msg = msg.with_metadata(metadata);
+                // Store for broadcast routing (chat_id etc.)
+                self.update_broadcast_metadata(&emitted.metadata_json).await;
             }
 
             // Send to stream
@@ -1656,6 +1845,8 @@ impl WasmChannel {
         let pairing_store = self.pairing_store.clone();
         let callback_timeout = self.runtime.config().callback_timeout;
         let workspace_store = self.workspace_store.clone();
+        let last_broadcast_metadata = self.last_broadcast_metadata.clone();
+        let settings_store = self.settings_store.clone();
 
         tokio::spawn(async move {
             let mut interval_timer = tokio::time::interval(interval);
@@ -1690,6 +1881,8 @@ impl WasmChannel {
                                         emitted_messages,
                                         &message_tx,
                                         &rate_limiter,
+                                        &last_broadcast_metadata,
+                                        settings_store.as_ref(),
                                     ).await {
                                         tracing::warn!(
                                             channel = %channel_name,
@@ -1813,6 +2006,8 @@ impl WasmChannel {
         messages: Vec<EmittedMessage>,
         message_tx: &RwLock<Option<mpsc::Sender<IncomingMessage>>>,
         rate_limiter: &RwLock<ChannelEmitRateLimiter>,
+        last_broadcast_metadata: &tokio::sync::RwLock<Option<String>>,
+        settings_store: Option<&Arc<dyn crate::db::SettingsStore>>,
     ) -> Result<(), WasmChannelError> {
         tracing::info!(
             channel = %channel_name,
@@ -1858,6 +2053,14 @@ impl WasmChannel {
             // Parse metadata JSON
             if let Ok(metadata) = serde_json::from_str(&emitted.metadata_json) {
                 msg = msg.with_metadata(metadata);
+                // Store for broadcast routing (chat_id etc.)
+                do_update_broadcast_metadata(
+                    channel_name,
+                    &emitted.metadata_json,
+                    last_broadcast_metadata,
+                    settings_store,
+                )
+                .await;
             }
 
             // Send to stream
@@ -1893,6 +2096,9 @@ impl Channel for WasmChannel {
     }
 
     async fn start(&self) -> Result<MessageStream, ChannelError> {
+        // Restore broadcast metadata from settings (survives restarts)
+        self.load_broadcast_metadata().await;
+
         // Create message channel
         let (tx, rx) = mpsc::channel(256);
         *self.message_tx.write().await = Some(tx);
@@ -1971,6 +2177,7 @@ impl Channel for WasmChannel {
     ) -> Result<(), ChannelError> {
         // Stop the typing indicator, we're about to send the actual response
         self.cancel_typing_task().await;
+        self.clear_fallback_progress_sent(&msg.metadata).await;
 
         // Check if there's a pending synchronous response waiter
         if let Some(tx) = self.pending_responses.write().await.remove(&msg.id) {
@@ -1982,6 +2189,8 @@ impl Channel for WasmChannel {
         // The original metadata contains channel-specific routing info (e.g., Telegram chat_id)
         // that the WASM channel needs to send the reply to the correct destination.
         let metadata_json = serde_json::to_string(&msg.metadata).unwrap_or_default();
+        // Store for broadcast routing (chat_id etc.)
+        self.update_broadcast_metadata(&metadata_json).await;
         self.call_on_respond(
             msg.id,
             &response.content,
@@ -2092,6 +2301,7 @@ impl Channel for WasmChannel {
     async fn shutdown(&self) -> Result<(), ChannelError> {
         // Cancel typing indicator
         self.cancel_typing_task().await;
+        self.fallback_progress_sent.write().await.clear();
 
         // Send shutdown signal
         if let Some(tx) = self.shutdown_tx.write().await.take() {
@@ -2259,9 +2469,21 @@ fn status_to_wit(status: &StatusUpdate, metadata: &serde_json::Value) -> wit_cha
             message: msg.clone(),
             metadata_json,
         },
-        StatusUpdate::ToolStarted { name } => wit_channel::StatusUpdate {
+        StatusUpdate::ToolStarted {
+            name,
+            params_preview,
+        } => wit_channel::StatusUpdate {
             status: wit_channel::StatusType::ToolStarted,
-            message: format!("Tool started: {}", name),
+            message: {
+                let mut msg = format!("Tool started: {}", name);
+                if let Some(params) = params_preview
+                    && !params.trim().is_empty()
+                {
+                    msg.push(' ');
+                    msg.push_str(&truncate_status_text(params, 140));
+                }
+                msg
+            },
             metadata_json,
         },
         StatusUpdate::ToolCompleted { name, success } => wit_channel::StatusUpdate {
@@ -2464,6 +2686,7 @@ mod tests {
             capabilities,
             "{}".to_string(),
             Arc::new(PairingStore::new()),
+            None,
         )
     }
 
@@ -2569,11 +2792,14 @@ mod tests {
             EmittedMessage::new("user2", "Another message"),
         ];
 
+        let last_broadcast_metadata = Arc::new(tokio::sync::RwLock::new(None));
         let result = WasmChannel::dispatch_emitted_messages(
             "test-channel",
             messages,
             &message_tx,
             &rate_limiter,
+            &last_broadcast_metadata,
+            None,
         )
         .await;
 
@@ -2607,11 +2833,14 @@ mod tests {
         let messages = vec![EmittedMessage::new("user1", "Hello!")];
 
         // Should return Ok even without a sender (logs warning but doesn't fail)
+        let last_broadcast_metadata = Arc::new(tokio::sync::RwLock::new(None));
         let result = WasmChannel::dispatch_emitted_messages(
             "test-channel",
             messages,
             &message_tx,
             &rate_limiter,
+            &last_broadcast_metadata,
+            None,
         )
         .await;
 
@@ -2642,6 +2871,7 @@ mod tests {
             capabilities,
             "{}".to_string(),
             Arc::new(PairingStore::new()),
+            None,
         );
 
         // Start the channel
@@ -2747,6 +2977,7 @@ mod tests {
             .send_status(
                 crate::channels::StatusUpdate::ToolStarted {
                     name: "http_request".into(),
+                    params_preview: Some("{\"url\":\"https://api.example.com\"}".into()),
                 },
                 &metadata,
             )
@@ -3052,6 +3283,7 @@ mod tests {
         let wit = status_to_wit(
             &crate::channels::StatusUpdate::ToolStarted {
                 name: "http_request".to_string(),
+                params_preview: Some("{\"url\":\"https://api.weather.test\"}".to_string()),
             },
             &metadata,
         );
@@ -3060,7 +3292,8 @@ mod tests {
             wit.status,
             super::wit_channel::StatusType::ToolStarted
         ));
-        assert_eq!(wit.message, "Tool started: http_request");
+        assert!(wit.message.starts_with("Tool started: http_request"));
+        assert!(wit.message.contains("\"url\""));
     }
 
     #[test]

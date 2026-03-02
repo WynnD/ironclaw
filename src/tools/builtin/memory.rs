@@ -112,6 +112,10 @@ impl Tool for MemorySearchTool {
     fn requires_sanitization(&self) -> bool {
         false // Internal memory, trusted content
     }
+
+    fn is_core(&self) -> bool {
+        true
+    }
 }
 
 /// Tool for writing to workspace memory.
@@ -284,6 +288,10 @@ impl Tool for MemoryWriteTool {
     fn rate_limit_config(&self) -> Option<crate::tools::tool::ToolRateLimitConfig> {
         Some(crate::tools::tool::ToolRateLimitConfig::new(20, 200))
     }
+
+    fn is_core(&self) -> bool {
+        true
+    }
 }
 
 /// Tool for reading workspace files.
@@ -353,6 +361,10 @@ impl Tool for MemoryReadTool {
 
     fn requires_sanitization(&self) -> bool {
         false // Internal memory
+    }
+
+    fn is_core(&self) -> bool {
+        true
     }
 }
 
@@ -472,6 +484,10 @@ impl Tool for MemoryTreeTool {
 
     fn requires_sanitization(&self) -> bool {
         false // Internal tool
+    }
+
+    fn is_core(&self) -> bool {
+        true
     }
 }
 

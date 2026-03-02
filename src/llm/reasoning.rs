@@ -1,9 +1,11 @@
 //! LLM reasoning capabilities for planning, tool selection, and evaluation.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
 use crate::error::LlmError;
 
@@ -15,6 +17,65 @@ use crate::safety::SafetyLayer;
 /// Token the agent returns when it has nothing to say (e.g. in group chats).
 /// The dispatcher should check for this and suppress the message.
 pub const SILENT_REPLY_TOKEN: &str = "NO_REPLY";
+const EMPTY_RESPONSE_FALLBACK: &str = "I'm not sure how to respond to that.";
+const UNVERIFIED_TOOL_CLAIM_FALLBACK: &str =
+    "I couldn't verify an actual tool execution for that step, so I won't invent results.";
+
+/// Process-wide counters for empty-response recovery observability.
+struct EmptyResponseRecoveryStats {
+    recovery_attempts: AtomicU64,
+    recovery_successes: AtomicU64,
+    fallback_emitted: AtomicU64,
+}
+
+impl EmptyResponseRecoveryStats {
+    const fn new() -> Self {
+        Self {
+            recovery_attempts: AtomicU64::new(0),
+            recovery_successes: AtomicU64::new(0),
+            fallback_emitted: AtomicU64::new(0),
+        }
+    }
+}
+
+static EMPTY_RESPONSE_RECOVERY_STATS: EmptyResponseRecoveryStats =
+    EmptyResponseRecoveryStats::new();
+
+/// Snapshot of empty-response recovery telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyResponseRecoverySnapshot {
+    pub recovery_attempts: u64,
+    pub recovery_successes: u64,
+    pub fallback_emitted: u64,
+}
+
+/// Return current process-wide counters for empty-response handling.
+pub fn empty_response_recovery_snapshot() -> EmptyResponseRecoverySnapshot {
+    EmptyResponseRecoverySnapshot {
+        recovery_attempts: EMPTY_RESPONSE_RECOVERY_STATS
+            .recovery_attempts
+            .load(Ordering::Relaxed),
+        recovery_successes: EMPTY_RESPONSE_RECOVERY_STATS
+            .recovery_successes
+            .load(Ordering::Relaxed),
+        fallback_emitted: EMPTY_RESPONSE_RECOVERY_STATS
+            .fallback_emitted
+            .load(Ordering::Relaxed),
+    }
+}
+
+#[cfg(test)]
+fn reset_empty_response_recovery_stats_for_tests() {
+    EMPTY_RESPONSE_RECOVERY_STATS
+        .recovery_attempts
+        .store(0, Ordering::Relaxed);
+    EMPTY_RESPONSE_RECOVERY_STATS
+        .recovery_successes
+        .store(0, Ordering::Relaxed);
+    EMPTY_RESPONSE_RECOVERY_STATS
+        .fallback_emitted
+        .store(0, Ordering::Relaxed);
+}
 
 /// Check if a response is a silent reply (the agent has nothing to say).
 ///
@@ -28,6 +89,18 @@ pub fn is_silent_reply(text: &str) -> bool {
             && trimmed[SILENT_REPLY_TOKEN.len()..]
                 .chars()
                 .all(|c| c.is_whitespace() || c.is_ascii_punctuation())
+}
+
+/// Simple `<think>...</think>` stripping for preprocessing raw LLM output.
+/// Unlike `clean_response`, this only removes `<think>` blocks without
+/// code-region awareness — suitable for early-stage content before it
+/// reaches the full cleaning pipeline.
+pub fn strip_think_tags(text: &str) -> String {
+    static THINK_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)<\s*think(?:ing)?\b[^>]*>.*?<\s*/\s*think(?:ing)?\s*>")
+            .expect("THINK_BLOCK_RE")
+    });
+    THINK_BLOCK_RE.replace_all(text, "").to_string()
 }
 
 /// Quick-check: bail early if no reasoning/final tags are present at all.
@@ -50,12 +123,29 @@ static PIPE_REASONING_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)<\|(/?)\s*(?:think(?:ing)?|thought|thoughts|antthinking|reasoning|reflection|scratchpad|inner_monologue)\|>").expect("PIPE_REASONING_TAG_RE")
 });
 
+/// Detects first-person claims that a tool was executed.
+static TOOL_EXECUTION_CLAIM_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:i|we)\s+(?:called|used|ran|invoked|queried|checked|fetched|looked\s+up)\b")
+        .expect("TOOL_EXECUTION_CLAIM_RE")
+});
+
+/// Detects text that presents a tool result as already obtained.
+static TOOL_RESULT_CLAIM_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(?:here(?:'s| is)\s+what\s+(?:it|the tool)\s+returned|tool\s+returned|it\s+returned)\b",
+    )
+    .expect("TOOL_RESULT_CLAIM_RE")
+});
+
 /// Context for reasoning operations.
 pub struct ReasoningContext {
     /// Conversation history.
     pub messages: Vec<ChatMessage>,
     /// Available tools.
     pub available_tools: Vec<ToolDefinition>,
+    /// Deferred tool catalog (name, description) for system prompt injection.
+    /// Only populated when deferred tool loading is enabled.
+    pub deferred_tool_catalog: Vec<(String, String)>,
     /// Job description if working on a job.
     pub job_description: Option<String>,
     /// Current state description.
@@ -73,6 +163,7 @@ impl ReasoningContext {
         Self {
             messages: Vec::new(),
             available_tools: Vec::new(),
+            deferred_tool_catalog: Vec::new(),
             job_description: None,
             current_state: None,
             metadata: std::collections::HashMap::new(),
@@ -189,7 +280,14 @@ pub enum RespondResult {
     /// include explanatory text alongside tool calls).
     ToolCalls {
         tool_calls: Vec<ToolCall>,
+        /// User-visible content (already cleaned/sanitized for display).
         content: Option<String>,
+        /// Raw assistant content to store in tool-turn context.
+        ///
+        /// This may include hidden `<thinking>...</thinking>` blocks that are
+        /// stripped from `content` but should be preserved in context for
+        /// interleaved-thinking models.
+        assistant_content: Option<String>,
     },
 }
 
@@ -467,6 +565,7 @@ Respond in JSON format:
 
         let mut messages = vec![ChatMessage::system(system_prompt)];
         messages.extend(context.messages.clone());
+        let messages_for_recovery = messages.clone();
 
         let effective_tools = if context.force_text {
             Vec::new()
@@ -483,30 +582,51 @@ Respond in JSON format:
             request.metadata = context.metadata.clone();
 
             let response = self.llm.complete_with_tools(request).await?;
-            let usage = TokenUsage {
+            let mut usage = TokenUsage {
                 input_tokens: response.input_tokens,
                 output_tokens: response.output_tokens,
             };
 
             // If there were tool calls, return them for execution
             if !response.tool_calls.is_empty() {
+                let assistant_content = response.content.clone();
+                let display_content = assistant_content
+                    .as_ref()
+                    .map(|c| clean_response(c))
+                    .filter(|c| !c.is_empty());
                 return Ok(RespondOutput {
                     result: RespondResult::ToolCalls {
                         tool_calls: response.tool_calls,
-                        content: response.content.map(|c| clean_response(&c)),
+                        content: display_content,
+                        assistant_content,
                     },
                     usage,
                 });
             }
 
-            let content = response
-                .content
-                .unwrap_or_else(|| "I'm not sure how to respond to that.".to_string());
+            let content = response.content.unwrap_or_default();
 
             // Some models (e.g. GLM-4.7) emit tool calls as XML tags in content
             // instead of using the structured tool_calls field. Try to recover
             // them before giving up and returning plain text.
-            let recovered = recover_tool_calls_from_content(&content, &context.available_tools);
+            tracing::debug!(
+                content_len = content.len(),
+                content_preview = %crate::llm::rig_adapter::truncate_for_log(&content, 300),
+                "Attempting tool call recovery from text content",
+            );
+            let (recovered, recovery_stats) =
+                recover_tool_calls_from_content_with_stats(&content, &context.available_tools);
+            if recovery_stats.section_blocks > 0 && recovered.is_empty() {
+                tracing::warn!(
+                    section_blocks = recovery_stats.section_blocks,
+                    section_calls_seen = recovery_stats.section_calls_seen,
+                    placeholder_names_seen = recovery_stats.placeholder_names_seen,
+                    placeholder_names_repaired = recovery_stats.placeholder_names_repaired,
+                    unknown_calls_dropped = recovery_stats.unknown_calls_dropped,
+                    content_preview = %crate::llm::rig_adapter::truncate_for_log(&content, 300),
+                    "Detected section-delimited tool calls but recovered zero executable tool calls",
+                );
+            }
             if !recovered.is_empty() {
                 let cleaned = clean_response(&content);
                 return Ok(RespondOutput {
@@ -517,9 +637,37 @@ Respond in JSON format:
                         } else {
                             Some(cleaned)
                         },
+                        assistant_content: Some(content),
                     },
                     usage,
                 });
+            }
+
+            // Guardrail: some providers/models occasionally narrate fabricated
+            // tool usage in plain text instead of returning executable tool calls.
+            // If there is no fresh tool-result evidence in context, force one
+            // retry with explicit anti-fabrication instructions.
+            if !has_tool_result_since_last_user(&context.messages)
+                && claims_unverified_tool_execution(&content, &context.available_tools)
+            {
+                tracing::warn!(
+                    content_preview = %crate::llm::rig_adapter::truncate_for_log(&content, 300),
+                    "Detected unverifiable tool-execution claim with no executable tool call; retrying once",
+                );
+                let (retry_result, retry_usage) = self
+                    .recover_unverified_tool_claim(
+                        &messages_for_recovery,
+                        &context.available_tools,
+                        &context.metadata,
+                    )
+                    .await?;
+                usage.input_tokens = usage.input_tokens.saturating_add(retry_usage.input_tokens);
+                usage.output_tokens = usage
+                    .output_tokens
+                    .saturating_add(retry_usage.output_tokens);
+                if let Some(result) = retry_result {
+                    return Ok(RespondOutput { result, usage });
+                }
             }
 
             // Guard against empty text after cleaning. This can happen
@@ -530,10 +678,25 @@ Respond in JSON format:
             let cleaned = clean_response(&content);
             let final_text = if cleaned.trim().is_empty() {
                 tracing::warn!(
-                    "LLM response was empty after cleaning (original len={}), using fallback",
-                    content.len()
+                    "LLM response was empty after cleaning (original len={}, first 200 chars={:?}), using fallback",
+                    content.len(),
+                    &content[..content.len().min(200)]
                 );
-                "I'm not sure how to respond to that.".to_string()
+                let (retry_text, retry_usage) = self
+                    .recover_empty_visible_response(&messages_for_recovery, &context.metadata)
+                    .await?;
+                usage.input_tokens = usage.input_tokens.saturating_add(retry_usage.input_tokens);
+                usage.output_tokens = usage
+                    .output_tokens
+                    .saturating_add(retry_usage.output_tokens);
+                if let Some(text) = retry_text {
+                    text
+                } else {
+                    EMPTY_RESPONSE_RECOVERY_STATS
+                        .fallback_emitted
+                        .fetch_add(1, Ordering::Relaxed);
+                    EMPTY_RESPONSE_FALLBACK.to_string()
+                }
             } else {
                 cleaned
             };
@@ -549,36 +712,177 @@ Respond in JSON format:
             request.metadata = context.metadata.clone();
 
             let response = self.llm.complete(request).await?;
+            let mut usage = TokenUsage {
+                input_tokens: response.input_tokens,
+                output_tokens: response.output_tokens,
+            };
             let cleaned = clean_response(&response.content);
             let final_text = if cleaned.trim().is_empty() {
                 tracing::warn!(
                     "LLM response was empty after cleaning (original len={}), using fallback",
                     response.content.len()
                 );
-                "I'm not sure how to respond to that.".to_string()
+                let (retry_text, retry_usage) = self
+                    .recover_empty_visible_response(&messages_for_recovery, &context.metadata)
+                    .await?;
+                usage.input_tokens = usage.input_tokens.saturating_add(retry_usage.input_tokens);
+                usage.output_tokens = usage
+                    .output_tokens
+                    .saturating_add(retry_usage.output_tokens);
+                if let Some(text) = retry_text {
+                    text
+                } else {
+                    EMPTY_RESPONSE_RECOVERY_STATS
+                        .fallback_emitted
+                        .fetch_add(1, Ordering::Relaxed);
+                    EMPTY_RESPONSE_FALLBACK.to_string()
+                }
             } else {
                 cleaned
             };
             Ok(RespondOutput {
                 result: RespondResult::Text(final_text),
-                usage: TokenUsage {
-                    input_tokens: response.input_tokens,
-                    output_tokens: response.output_tokens,
-                },
+                usage,
             })
         }
+    }
+
+    /// Try once more when the model produced no user-visible text.
+    ///
+    /// Some providers occasionally return empty or reasoning-only content for a turn.
+    /// This recovery call forces a plain text completion from the same context
+    /// before falling back to a generic message.
+    async fn recover_empty_visible_response(
+        &self,
+        base_messages: &[ChatMessage],
+        metadata: &std::collections::HashMap<String, String>,
+    ) -> Result<(Option<String>, TokenUsage), LlmError> {
+        EMPTY_RESPONSE_RECOVERY_STATS
+            .recovery_attempts
+            .fetch_add(1, Ordering::Relaxed);
+
+        let mut retry_messages = base_messages.to_vec();
+        retry_messages.push(ChatMessage::system(
+            "Your previous response had no user-visible final answer. \
+             Reply now with a concise final response for the user. \
+             Do not call tools in this reply.",
+        ));
+
+        let mut retry_request = CompletionRequest::new(retry_messages)
+            .with_max_tokens(1024)
+            .with_temperature(0.2);
+        retry_request.metadata = metadata.clone();
+
+        let retry = self.llm.complete(retry_request).await?;
+        let retry_usage = TokenUsage {
+            input_tokens: retry.input_tokens,
+            output_tokens: retry.output_tokens,
+        };
+        let retry_cleaned = clean_response(&retry.content);
+        if retry_cleaned.trim().is_empty() {
+            tracing::warn!(
+                "Empty response recovery also produced no user-visible text (original len={})",
+                retry.content.len()
+            );
+            Ok((None, retry_usage))
+        } else {
+            EMPTY_RESPONSE_RECOVERY_STATS
+                .recovery_successes
+                .fetch_add(1, Ordering::Relaxed);
+            Ok((Some(retry_cleaned), retry_usage))
+        }
+    }
+
+    /// Retry once when the model claims tool execution but returns no
+    /// executable tool calls.
+    async fn recover_unverified_tool_claim(
+        &self,
+        base_messages: &[ChatMessage],
+        available_tools: &[ToolDefinition],
+        metadata: &std::collections::HashMap<String, String>,
+    ) -> Result<(Option<RespondResult>, TokenUsage), LlmError> {
+        if available_tools.is_empty() {
+            return Ok((None, TokenUsage::default()));
+        }
+
+        let mut retry_messages = base_messages.to_vec();
+        retry_messages.push(ChatMessage::system(
+            "Your previous response claimed tool execution/results without an executable tool call.\n\
+             Do not fabricate tool output.\n\
+             If you need tool data, return executable tool calls only.\n\
+             If you can answer without tools, answer directly and do not claim any tool execution.",
+        ));
+
+        let mut retry_request =
+            ToolCompletionRequest::new(retry_messages, available_tools.to_vec())
+                .with_max_tokens(2048)
+                .with_temperature(0.2)
+                .with_tool_choice("auto");
+        retry_request.metadata = metadata.clone();
+
+        let retry = self.llm.complete_with_tools(retry_request).await?;
+        let retry_usage = TokenUsage {
+            input_tokens: retry.input_tokens,
+            output_tokens: retry.output_tokens,
+        };
+
+        if !retry.tool_calls.is_empty() {
+            let assistant_content = retry.content.clone();
+            let display_content = assistant_content
+                .as_ref()
+                .map(|c| clean_response(c))
+                .filter(|c| !c.is_empty());
+            return Ok((
+                Some(RespondResult::ToolCalls {
+                    tool_calls: retry.tool_calls,
+                    content: display_content,
+                    assistant_content,
+                }),
+                retry_usage,
+            ));
+        }
+
+        let retry_content = retry.content.unwrap_or_default();
+        let (recovered, _) =
+            recover_tool_calls_from_content_with_stats(&retry_content, available_tools);
+        if !recovered.is_empty() {
+            let cleaned = clean_response(&retry_content);
+            return Ok((
+                Some(RespondResult::ToolCalls {
+                    tool_calls: recovered,
+                    content: if cleaned.is_empty() {
+                        None
+                    } else {
+                        Some(cleaned)
+                    },
+                    assistant_content: Some(retry_content),
+                }),
+                retry_usage,
+            ));
+        }
+
+        let cleaned = clean_response(&retry_content);
+        if cleaned.trim().is_empty() {
+            return Ok((None, retry_usage));
+        }
+
+        if claims_unverified_tool_execution(&retry_content, available_tools) {
+            return Ok((
+                Some(RespondResult::Text(
+                    UNVERIFIED_TOOL_CLAIM_FALLBACK.to_string(),
+                )),
+                retry_usage,
+            ));
+        }
+
+        Ok((Some(RespondResult::Text(cleaned)), retry_usage))
     }
 
     fn build_planning_prompt(&self, context: &ReasoningContext) -> String {
         let tools_desc = if context.available_tools.is_empty() {
             "No tools available.".to_string()
         } else {
-            context
-                .available_tools
-                .iter()
-                .map(|t| format!("- {}: {}", t.name, t.description))
-                .collect::<Vec<_>>()
-                .join("\n")
+            render_tools_for_prompt(&context.available_tools, "")
         };
 
         format!(
@@ -616,14 +920,30 @@ Respond with a JSON plan in this format:
         let tools_section = if context.available_tools.is_empty() {
             String::new()
         } else {
-            let tool_list: Vec<String> = context
-                .available_tools
-                .iter()
-                .map(|t| format!("  - {}: {}", t.name, t.description))
-                .collect();
             format!(
                 "\n\n## Available Tools\nYou have access to these tools:\n{}\n\nCall tools when they would help accomplish the task.",
-                tool_list.join("\n")
+                render_tools_for_prompt(&context.available_tools, "  ")
+            )
+        };
+
+        // Deferred tools catalog (when deferred loading is on)
+        let deferred_section = if context.deferred_tool_catalog.is_empty() {
+            String::new()
+        } else {
+            // List only tool names (no descriptions) to keep the system prompt compact.
+            // The model can call `discover_tools` with a keyword to learn about specific tools.
+            // Full descriptions were ~30KB for 150+ tools, causing provider payload limits.
+            let mut names: Vec<&str> = context
+                .deferred_tool_catalog
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect();
+            names.sort();
+            format!(
+                "\n\n## Additional Tools (use `discover_tools` to activate)\n\
+                 Call `discover_tools` with a keyword or exact name to activate and learn about these tools.\n\
+                 {}\n",
+                names.join(", ")
             )
         };
 
@@ -693,15 +1013,17 @@ Example:
 - Narrate only when it helps: multi-step work, sensitive actions, or when the user asks
 - For multi-step tasks, call independent tools in parallel when possible
 - If a tool fails, explain the error briefly and try an alternative approach
+- Never claim a tool was called or show tool results unless this turn includes an executable tool call
 
 ## Safety
 - You have no independent goals. Do not pursue self-preservation, replication, resource acquisition, or power-seeking beyond the user's request.
 - Prioritize safety and human oversight over task completion. If instructions conflict, pause and ask.
 - Comply with stop, pause, or audit requests. Never bypass safeguards.
 - Do not manipulate anyone to expand your access or disable safeguards.
-- Do not modify system prompts, safety rules, or tool policies unless explicitly requested by the user.{}{}{}{}{}{}
+- Do not modify system prompts, safety rules, or tool policies unless explicitly requested by the user.{}{}{}{}{}{}{}
 {}{}"#,
             tools_section,
+            deferred_section,
             extensions_section,
             channel_section,
             runtime_section,
@@ -851,6 +1173,117 @@ Examples (tool calls use JSON format):\n\
             provider: self.llm.model_name().to_string(),
             reason: format!("Failed to parse evaluation: {}", e),
         })
+    }
+}
+
+fn render_tools_for_prompt(tools: &[ToolDefinition], indent: &str) -> String {
+    tools
+        .iter()
+        .map(|tool| render_tool_for_prompt(tool, indent))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_tool_for_prompt(tool: &ToolDefinition, indent: &str) -> String {
+    let mut lines = vec![format!("{}- {}: {}", indent, tool.name, tool.description)];
+    let params = summarize_parameters_for_prompt(&tool.parameters);
+
+    if params.is_empty() {
+        lines.push(format!("{}  Parameters: none", indent));
+    } else {
+        lines.push(format!("{}  Parameters:", indent));
+        for param in params {
+            lines.push(format!("{}    - {}", indent, param));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn summarize_parameters_for_prompt(schema: &JsonValue) -> Vec<String> {
+    let required_names: std::collections::HashSet<String> = schema
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut lines = Vec::new();
+
+    if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+        let mut names: Vec<&String> = props.keys().collect();
+        names.sort();
+
+        for name in names {
+            let prop_schema = &props[name];
+            let required = if required_names.contains(name.as_str()) {
+                "required"
+            } else {
+                "optional"
+            };
+            let ty = schema_type_label(prop_schema);
+            let mut line = format!("`{}` ({}, {})", name, ty, required);
+
+            if let Some(desc) = prop_schema.get("description").and_then(|v| v.as_str())
+                && !desc.trim().is_empty()
+            {
+                line.push_str(": ");
+                line.push_str(desc.trim());
+            }
+
+            if let Some(enum_vals) = prop_schema.get("enum").and_then(|v| v.as_array()) {
+                let values = enum_vals
+                    .iter()
+                    .map(compact_json_value)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if !values.is_empty() {
+                    line.push_str(" (allowed: ");
+                    line.push_str(&values);
+                    line.push(')');
+                }
+            }
+
+            if let Some(default_val) = prop_schema.get("default") {
+                line.push_str(" (default: ");
+                line.push_str(&compact_json_value(default_val));
+                line.push(')');
+            }
+
+            lines.push(line);
+        }
+    }
+
+    lines
+}
+
+fn schema_type_label(schema: &JsonValue) -> String {
+    match schema.get("type") {
+        Some(JsonValue::String(ty)) => ty.clone(),
+        Some(JsonValue::Array(types)) => {
+            let mut names: Vec<String> = types
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            names.sort();
+            names.dedup();
+            if names.is_empty() {
+                "any".to_string()
+            } else {
+                names.join("|")
+            }
+        }
+        _ => "any".to_string(),
+    }
+}
+
+fn compact_json_value(v: &JsonValue) -> String {
+    match v {
+        JsonValue::String(s) => format!("\"{}\"", s),
+        _ => v.to_string(),
     }
 }
 
@@ -1072,16 +1505,36 @@ fn is_inside_code(pos: usize, regions: &[CodeRegion]) -> bool {
 /// - `<tool_call>{"name":"x","arguments":{}}</tool_call>` (JSON)
 /// - `<|tool_call|>...<|/tool_call|>` (pipe-delimited variant)
 /// - `<function_call>...</function_call>` (function_call variant)
+/// - `<|tool_calls_section_begin|>...<|tool_calls_section_end|>` (section-delimited, Kimi K2.5)
 ///
 /// Only returns calls whose name matches an available tool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ToolCallRecoveryStats {
+    section_blocks: usize,
+    section_calls_seen: usize,
+    placeholder_names_seen: usize,
+    placeholder_names_repaired: usize,
+    unknown_calls_dropped: usize,
+}
+
+#[cfg(test)]
 fn recover_tool_calls_from_content(
     content: &str,
     available_tools: &[ToolDefinition],
 ) -> Vec<ToolCall> {
+    recover_tool_calls_from_content_with_stats(content, available_tools).0
+}
+
+fn recover_tool_calls_from_content_with_stats(
+    content: &str,
+    available_tools: &[ToolDefinition],
+) -> (Vec<ToolCall>, ToolCallRecoveryStats) {
     let tool_names: std::collections::HashSet<&str> =
         available_tools.iter().map(|t| t.name.as_str()).collect();
     let mut calls = Vec::new();
+    let mut stats = ToolCallRecoveryStats::default();
 
+    // Format 1: paired XML/pipe tags
     for (open, close) in &[
         ("<tool_call>", "</tool_call>"),
         ("<|tool_call|>", "<|/tool_call|>"),
@@ -1131,7 +1584,349 @@ fn recover_tool_calls_from_content(
         }
     }
 
-    calls
+    // Format 2: section-delimited tool calls (Kimi K2.5 and similar models)
+    //
+    // <|tool_calls_section_begin|>
+    //   <|tool_call_begin|>functions.http:0<|tool_call_argument_begin|>{"method":"GET",...}<|tool_call_end|>
+    //   <|tool_call_begin|>functions.shell:1<|tool_call_argument_begin|>{"command":"ls"}<|tool_call_end|>
+    // <|tool_calls_section_end|>
+    const SECTION_BEGIN: &str = "<|tool_calls_section_begin|>";
+    const SECTION_END: &str = "<|tool_calls_section_end|>";
+    const CALL_BEGIN: &str = "<|tool_call_begin|>";
+    const CALL_END: &str = "<|tool_call_end|>";
+    const ARG_BEGIN: &str = "<|tool_call_argument_begin|>";
+
+    let mut remaining = content;
+    while let Some(sec_start) = remaining.find(SECTION_BEGIN) {
+        stats.section_blocks += 1;
+        let after_sec = &remaining[sec_start + SECTION_BEGIN.len()..];
+        let sec_end = after_sec.find(SECTION_END).unwrap_or(after_sec.len());
+        let section = &after_sec[..sec_end];
+        remaining = if sec_end < after_sec.len() {
+            &after_sec[sec_end + SECTION_END.len()..]
+        } else {
+            ""
+        };
+
+        // Parse individual tool calls within the section
+        let mut section_remaining = section;
+        while let Some(call_start) = section_remaining.find(CALL_BEGIN) {
+            let after_call = &section_remaining[call_start + CALL_BEGIN.len()..];
+            let call_end = match after_call.find(CALL_END) {
+                Some(pos) => pos,
+                None => break,
+            };
+            let call_body = &after_call[..call_end];
+            section_remaining = &after_call[call_end + CALL_END.len()..];
+            stats.section_calls_seen += 1;
+
+            // Split on <|tool_call_argument_begin|> to get name and arguments
+            let (raw_name, arguments) = if let Some(arg_pos) = call_body.find(ARG_BEGIN) {
+                let name_part = call_body[..arg_pos].trim();
+                let arg_part = call_body[arg_pos + ARG_BEGIN.len()..].trim();
+                let args: serde_json::Value =
+                    serde_json::from_str(arg_part).unwrap_or(serde_json::json!({}));
+                (name_part, args)
+            } else {
+                (call_body.trim(), serde_json::json!({}))
+            };
+
+            // Normalize: "functions.http:0" → "http"
+            let name = normalize_section_tool_name(raw_name);
+
+            let mut matched_name = if tool_names.contains(name.as_str()) {
+                Some(name.clone())
+            } else {
+                // Fuzzy match: model may invent a more specific name like
+                // "time_get_current_time" for tool "time", or prepend
+                // a server namespace like "home_assistant_time".
+                fuzzy_match_tool_name(&name, &tool_names)
+                    .or_else(|| canonical_match_tool_name(&name, &tool_names))
+            };
+
+            if matched_name.is_none() && is_placeholder_tool_name(&name) {
+                stats.placeholder_names_seen += 1;
+                matched_name = infer_placeholder_tool_name(&name, &arguments, available_tools);
+                if let Some(ref repaired) = matched_name {
+                    stats.placeholder_names_repaired += 1;
+                    tracing::warn!(
+                        placeholder_tool = %name,
+                        repaired_tool = %repaired,
+                        argument_keys = %argument_keys_for_log(&arguments),
+                        "Recovered placeholder tool name emitted by model"
+                    );
+                } else {
+                    tracing::warn!(
+                        placeholder_tool = %name,
+                        argument_keys = %argument_keys_for_log(&arguments),
+                        "Model emitted placeholder tool name that could not be mapped to an available tool"
+                    );
+                }
+            }
+
+            if let Some(matched) = matched_name {
+                calls.push(ToolCall {
+                    id: format!("recovered_{}", calls.len()),
+                    name: matched,
+                    arguments,
+                });
+            } else {
+                stats.unknown_calls_dropped += 1;
+            }
+        }
+    }
+
+    (calls, stats)
+}
+
+/// Returns true if there's at least one tool-result message after the most
+/// recent user message in the current context.
+fn has_tool_result_since_last_user(messages: &[ChatMessage]) -> bool {
+    for msg in messages.iter().rev() {
+        if msg.role == crate::llm::Role::User {
+            return false;
+        }
+        if msg.role == crate::llm::Role::Tool {
+            return true;
+        }
+    }
+    false
+}
+
+/// Detects unverifiable tool-use claims in plain text.
+///
+/// This is only used when the model returned no executable tool calls, to
+/// avoid passing fabricated "I called X, it returned Y" responses downstream.
+fn claims_unverified_tool_execution(content: &str, available_tools: &[ToolDefinition]) -> bool {
+    if content.trim().is_empty() || available_tools.is_empty() {
+        return false;
+    }
+
+    let lower = content.to_ascii_lowercase();
+    let mentions_tool = lower.contains(" tool")
+        || lower.contains("tool ")
+        || available_tools
+            .iter()
+            .map(|tool| tool.name.to_ascii_lowercase())
+            .any(|tool_name| lower.contains(&tool_name));
+
+    mentions_tool
+        && (TOOL_EXECUTION_CLAIM_RE.is_match(&lower) || TOOL_RESULT_CLAIM_RE.is_match(&lower))
+}
+
+fn is_placeholder_tool_name(name: &str) -> bool {
+    has_numeric_suffix(name, "recovered_") || has_numeric_suffix(name, "generated_tool_call_")
+}
+
+fn has_numeric_suffix(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn infer_placeholder_tool_name(
+    placeholder_name: &str,
+    arguments: &serde_json::Value,
+    available_tools: &[ToolDefinition],
+) -> Option<String> {
+    let args_obj = arguments.as_object()?;
+    if args_obj.is_empty() {
+        tracing::warn!(
+            placeholder_tool = %placeholder_name,
+            "Placeholder tool name had empty arguments; refusing to infer tool mapping"
+        );
+        return None;
+    }
+
+    let arg_keys: std::collections::HashSet<&str> =
+        args_obj.keys().map(std::string::String::as_str).collect();
+    let mut candidates: Vec<(String, usize, usize, usize)> = Vec::new();
+
+    for tool in available_tools {
+        let Some(props) = tool
+            .parameters
+            .get("properties")
+            .and_then(|v| v.as_object())
+        else {
+            continue;
+        };
+        if props.is_empty() {
+            continue;
+        }
+
+        let prop_keys: std::collections::HashSet<&str> =
+            props.keys().map(std::string::String::as_str).collect();
+        if !arg_keys.iter().all(|k| prop_keys.contains(k)) {
+            continue;
+        }
+
+        let required: std::collections::HashSet<&str> = tool
+            .parameters
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        if !required.iter().all(|k| arg_keys.contains(k)) {
+            continue;
+        }
+
+        candidates.push((
+            tool.name.clone(),
+            required.len(),
+            arg_keys.len(),
+            prop_keys.len(),
+        ));
+    }
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    candidates.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.3.cmp(&b.3))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let best = &candidates[0];
+    if candidates.len() > 1 {
+        let second = &candidates[1];
+        if best.1 == second.1 && best.2 == second.2 && best.3 == second.3 {
+            tracing::warn!(
+                placeholder_tool = %placeholder_name,
+                first_candidate = %best.0,
+                second_candidate = %second.0,
+                argument_keys = %argument_keys_for_log(arguments),
+                "Placeholder tool name mapping was ambiguous; refusing to guess"
+            );
+            return None;
+        }
+    }
+
+    Some(best.0.clone())
+}
+
+fn argument_keys_for_log(arguments: &serde_json::Value) -> String {
+    if let Some(obj) = arguments.as_object() {
+        let mut keys: Vec<&str> = obj.keys().map(std::string::String::as_str).collect();
+        keys.sort();
+        if keys.is_empty() {
+            "(none)".to_string()
+        } else {
+            keys.join(",")
+        }
+    } else {
+        "(non-object)".to_string()
+    }
+}
+
+/// Normalize a tool name from section-delimited format.
+///
+/// Models like Kimi K2.5 emit names like `functions.http:0` where `functions.`
+/// is a namespace prefix and `:0` is a call index. Strip both to get `http`.
+fn normalize_section_tool_name(raw: &str) -> String {
+    let mut name = raw;
+
+    // Strip "functions." prefix
+    if let Some(stripped) = name.strip_prefix("functions.") {
+        name = stripped;
+    }
+
+    // Strip ":N" suffix (call index)
+    if let Some(colon) = name.rfind(':')
+        && name[colon + 1..].bytes().all(|b| b.is_ascii_digit())
+        && colon + 1 < name.len()
+    {
+        name = &name[..colon];
+    }
+
+    name.to_string()
+}
+
+/// Fuzzy-match a model-generated tool name against known tool names.
+///
+/// Models sometimes invent more specific names like `time_get_current_time` for
+/// a tool registered as `time`. Try matching by prefix: if `time` is a prefix
+/// of `time_get_current_time` (followed by `_`), it's a match.
+///
+/// Picks the longest matching tool name to avoid ambiguity (e.g., `memory_search`
+/// should match `memory_search`, not `memory`).
+fn fuzzy_match_tool_name(
+    model_name: &str,
+    tool_names: &std::collections::HashSet<&str>,
+) -> Option<String> {
+    let mut best: Option<&str> = None;
+    for &tool in tool_names {
+        // Check if the model name starts with the tool name followed by '_'
+        if model_name.starts_with(tool)
+            && (model_name.len() == tool.len()
+                || model_name.as_bytes().get(tool.len()) == Some(&b'_'))
+            && best.is_none_or(|b| tool.len() > b.len())
+        {
+            best = Some(tool);
+        }
+
+        // Also handle server-prefixed model names, e.g.
+        // "home_assistant_ha_search_entities" for tool "ha_search_entities".
+        if model_name.len() > tool.len()
+            && model_name.ends_with(tool)
+            && model_name
+                .as_bytes()
+                .get(model_name.len().saturating_sub(tool.len() + 1))
+                == Some(&b'_')
+            && best.is_none_or(|b| tool.len() > b.len())
+        {
+            best = Some(tool);
+        }
+    }
+    if let Some(matched) = best {
+        tracing::info!(
+            model_name = model_name,
+            matched_tool = matched,
+            "Fuzzy-matched model tool name to registered tool",
+        );
+    }
+    best.map(|s| s.to_string())
+}
+
+fn canonicalize_tool_token(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut prev_was_sep = false;
+
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_was_sep = false;
+        } else if !prev_was_sep {
+            out.push('_');
+            prev_was_sep = true;
+        }
+    }
+
+    out.trim_matches('_').to_string()
+}
+
+fn canonical_match_tool_name(
+    model_name: &str,
+    tool_names: &std::collections::HashSet<&str>,
+) -> Option<String> {
+    let canonical_model = canonicalize_tool_token(model_name);
+    if canonical_model.is_empty() {
+        return None;
+    }
+
+    for &tool in tool_names {
+        if canonicalize_tool_token(tool) == canonical_model {
+            tracing::info!(
+                model_name = model_name,
+                matched_tool = tool,
+                "Canonical-matched model tool name to registered tool",
+            );
+            return Some(tool.to_string());
+        }
+    }
+
+    None
 }
 
 /// `<tool_call>tool_list</tool_call>` or `<|tool_call|>` in the content field
@@ -1174,8 +1969,16 @@ fn clean_response(text: &str) -> String {
         result = strip_pipe_tag(&result, tag);
     }
 
+    // 6b. Strip section-delimited tool call blocks
+    // (e.g. <|tool_calls_section_begin|>...<|tool_calls_section_end|>)
+    result = strip_section_tool_calls(&result);
+
     // 7. Collapse triple+ newlines, trim
-    collapse_newlines(&result)
+    let collapsed = collapse_newlines(&result);
+
+    // Some providers occasionally duplicate the exact same final response
+    // back-to-back in one completion. Collapse that case.
+    collapse_exact_duplicate_response(&collapsed)
 }
 
 /// Tool-related tags stripped with simple string matching (no code-awareness needed).
@@ -1228,7 +2031,7 @@ fn strip_thinking_tags_regex(text: &str, code_regions: &[CodeRegion]) -> String 
 /// When `<final>` tags are present, ONLY content inside them reaches the user.
 /// This discards any untagged reasoning that leaked outside `<think>` tags.
 fn extract_final_content(text: &str, code_regions: &[CodeRegion]) -> Option<String> {
-    let mut parts: Vec<&str> = Vec::new();
+    let mut raw_parts: Vec<&str> = Vec::new();
     let mut in_final = false;
     let mut last_index = 0;
     let mut found_any = false;
@@ -1252,7 +2055,7 @@ fn extract_final_content(text: &str, code_regions: &[CodeRegion]) -> Option<Stri
             last_index = m.end();
         } else if in_final && is_close {
             // Closing </final>
-            parts.push(&text[last_index..idx]);
+            raw_parts.push(&text[last_index..idx]);
             in_final = false;
             last_index = m.end();
         }
@@ -1264,10 +2067,44 @@ fn extract_final_content(text: &str, code_regions: &[CodeRegion]) -> Option<Stri
 
     // Unclosed <final> — include trailing content
     if in_final {
-        parts.push(&text[last_index..]);
+        raw_parts.push(&text[last_index..]);
     }
 
-    Some(parts.join(""))
+    // Some models emit duplicate adjacent <final> blocks. Deduplicate exact
+    // repeats to avoid doubled user-visible text.
+    let mut parts: Vec<String> = Vec::new();
+    for part in raw_parts {
+        let normalized = part.trim();
+        if normalized.is_empty() {
+            continue;
+        }
+        if parts.last().is_some_and(|prev| prev == normalized) {
+            continue;
+        }
+        parts.push(normalized.to_string());
+    }
+
+    Some(stitch_final_parts(&parts))
+}
+
+fn stitch_final_parts(parts: &[String]) -> String {
+    let mut out = String::new();
+    for part in parts {
+        if out.is_empty() {
+            out.push_str(part);
+            continue;
+        }
+
+        let prev = out.chars().rev().find(|c| !c.is_whitespace());
+        let join_with_paragraph = prev.is_some_and(|c| matches!(c, '.' | '!' | '?' | ':' | ';'));
+        if join_with_paragraph {
+            out.push_str("\n\n");
+        } else {
+            out.push(' ');
+        }
+        out.push_str(part);
+    }
+    out
 }
 
 /// Strip pipe-delimited reasoning tags, respecting code regions.
@@ -1383,6 +2220,35 @@ fn strip_pipe_tag(text: &str, tag: &str) -> String {
     result
 }
 
+/// Strip `<|tool_calls_section_begin|>...<|tool_calls_section_end|>` blocks.
+///
+/// These are emitted by Kimi K2.5 and similar models when tool calls appear as
+/// text in the content field. Strips the entire section including all inner
+/// `<|tool_call_begin|>...<|tool_call_end|>` blocks.
+fn strip_section_tool_calls(text: &str) -> String {
+    const SECTION_BEGIN: &str = "<|tool_calls_section_begin|>";
+    const SECTION_END: &str = "<|tool_calls_section_end|>";
+
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+
+    while let Some(start) = remaining.find(SECTION_BEGIN) {
+        result.push_str(&remaining[..start]);
+
+        let after = &remaining[start + SECTION_BEGIN.len()..];
+        if let Some(end_offset) = after.find(SECTION_END) {
+            remaining = &after[end_offset + SECTION_END.len()..];
+        } else {
+            // No closing tag — discard rest (malformed)
+            remaining = "";
+            break;
+        }
+    }
+
+    result.push_str(remaining);
+    result
+}
+
 /// Collapse triple+ newlines to double, then trim.
 fn collapse_newlines(text: &str) -> String {
     let mut result = text.to_string();
@@ -1392,11 +2258,413 @@ fn collapse_newlines(text: &str) -> String {
     result.trim().to_string()
 }
 
+/// Collapse exact duplicated full responses (`X X`) while preserving the first copy.
+///
+/// Conservative guardrails:
+/// - only consider longer outputs (to avoid touching intentional short repetition)
+/// - require exact string match after optional whitespace normalization
+fn collapse_exact_duplicate_response(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.len() < 80 {
+        return trimmed.to_string();
+    }
+
+    // Pass 1: exact / whitespace-normalized duplicate at any split point.
+    for (idx, ch) in trimmed.char_indices() {
+        if !ch.is_whitespace() {
+            continue;
+        }
+        let left = trimmed[..idx].trim_end();
+        let right = trimmed[idx..].trim_start();
+        if left.len() < 40 || right.len() < 40 {
+            continue;
+        }
+
+        if left == right || normalized_whitespace_eq(left, right) {
+            return left.to_string();
+        }
+    }
+
+    // Pass 2: near-duplicate detection via repeated prefix — O(n).
+    // GLM5 pattern: the answer appears twice with minor differences (extra
+    // trailing sentence or small preamble). We find positions where
+    // words[0] recurs, then verify the match length from that anchor.
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    if words.len() >= 14 {
+        let first_word = words[0];
+        let limit = words.len() * 2 / 3;
+        for start in 1..limit {
+            if !words[start].eq_ignore_ascii_case(first_word) {
+                continue;
+            }
+            // Anchor found — count matching prefix length
+            let prefix_len = words[start..]
+                .iter()
+                .zip(words.iter())
+                .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
+                .count();
+            let shorter_side = start.min(words.len() - start);
+            if prefix_len >= 7 && prefix_len * 10 >= shorter_side * 6 {
+                if start <= words.len() - start {
+                    return words[..start].join(" ");
+                } else {
+                    return words[start..].join(" ");
+                }
+            }
+        }
+    }
+
+    trimmed.to_string()
+}
+
+fn normalized_whitespace_eq(a: &str, b: &str) -> bool {
+    let a_parts: Vec<&str> = a.split_whitespace().collect();
+    let b_parts: Vec<&str> = b.split_whitespace().collect();
+    a_parts == b_parts
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    use async_trait::async_trait;
+    use rust_decimal::Decimal;
+    use tokio::sync::Mutex as AsyncMutex;
+
     use super::*;
+    use crate::config::SafetyConfig;
+    use crate::error::LlmError;
+    use crate::llm::{CompletionResponse, FinishReason, LlmProvider, ToolCompletionResponse};
+    use crate::safety::SafetyLayer;
+
+    static EMPTY_RESPONSE_TEST_GUARD: LazyLock<AsyncMutex<()>> =
+        LazyLock::new(|| AsyncMutex::new(()));
+
+    struct SequencedLlm {
+        model_name: String,
+        completions: Mutex<VecDeque<CompletionResponse>>,
+        tool_completions: Mutex<VecDeque<ToolCompletionResponse>>,
+    }
+
+    impl SequencedLlm {
+        fn new(
+            completions: Vec<CompletionResponse>,
+            tool_completions: Vec<ToolCompletionResponse>,
+        ) -> Self {
+            Self {
+                model_name: "sequenced-llm".to_string(),
+                completions: Mutex::new(VecDeque::from(completions)),
+                tool_completions: Mutex::new(VecDeque::from(tool_completions)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for SequencedLlm {
+        fn model_name(&self) -> &str {
+            &self.model_name
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            let mut queue = self.completions.lock().expect("completions lock poisoned");
+            queue.pop_front().ok_or_else(|| LlmError::InvalidResponse {
+                provider: self.model_name.clone(),
+                reason: "No queued completion response".to_string(),
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, LlmError> {
+            let mut queue = self
+                .tool_completions
+                .lock()
+                .expect("tool_completions lock poisoned");
+            queue.pop_front().ok_or_else(|| LlmError::InvalidResponse {
+                provider: self.model_name.clone(),
+                reason: "No queued tool completion response".to_string(),
+            })
+        }
+    }
 
     // ---- Utility / structural tests ----
+
+    #[tokio::test]
+    async fn test_respond_with_tools_recovers_when_tool_response_content_is_none() {
+        let _guard = EMPTY_RESPONSE_TEST_GUARD.lock().await;
+        reset_empty_response_recovery_stats_for_tests();
+        let llm: Arc<dyn LlmProvider> = Arc::new(SequencedLlm::new(
+            vec![CompletionResponse {
+                content: "<think>reasoning</think><final>Recovered answer.</final>".to_string(),
+                input_tokens: 2,
+                output_tokens: 3,
+                finish_reason: FinishReason::Stop,
+            }],
+            vec![ToolCompletionResponse {
+                content: None,
+                tool_calls: Vec::new(),
+                input_tokens: 10,
+                output_tokens: 5,
+                finish_reason: FinishReason::Stop,
+            }],
+        ));
+        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: false,
+        }));
+        let reasoning = Reasoning::new(llm, safety);
+        let context = ReasoningContext::new()
+            .with_message(ChatMessage::user("Hello"))
+            .with_tools(vec![ToolDefinition {
+                name: "time".to_string(),
+                description: "Get current time".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            }]);
+
+        let output = reasoning
+            .respond_with_tools(&context)
+            .await
+            .expect("respond_with_tools should succeed");
+        match output.result {
+            RespondResult::Text(text) => assert_eq!(text, "Recovered answer."),
+            _ => panic!("Expected text response"),
+        }
+        assert_eq!(output.usage.input_tokens, 12);
+        assert_eq!(output.usage.output_tokens, 8);
+        assert_eq!(
+            empty_response_recovery_snapshot(),
+            EmptyResponseRecoverySnapshot {
+                recovery_attempts: 1,
+                recovery_successes: 1,
+                fallback_emitted: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_respond_with_tools_recovers_when_text_response_is_empty_after_cleaning() {
+        let _guard = EMPTY_RESPONSE_TEST_GUARD.lock().await;
+        reset_empty_response_recovery_stats_for_tests();
+        let llm: Arc<dyn LlmProvider> = Arc::new(SequencedLlm::new(
+            vec![
+                CompletionResponse {
+                    content: "<think>hidden reasoning only</think>".to_string(),
+                    input_tokens: 4,
+                    output_tokens: 6,
+                    finish_reason: FinishReason::Stop,
+                },
+                CompletionResponse {
+                    content: "<final>Recovered from empty response.</final>".to_string(),
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+            Vec::new(),
+        ));
+        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: false,
+        }));
+        let reasoning = Reasoning::new(llm, safety);
+        let context = ReasoningContext::new().with_message(ChatMessage::user("Hi"));
+
+        let output = reasoning
+            .respond_with_tools(&context)
+            .await
+            .expect("respond_with_tools should succeed");
+        match output.result {
+            RespondResult::Text(text) => assert_eq!(text, "Recovered from empty response."),
+            _ => panic!("Expected text response"),
+        }
+        assert_eq!(output.usage.input_tokens, 5);
+        assert_eq!(output.usage.output_tokens, 8);
+        assert_eq!(
+            empty_response_recovery_snapshot(),
+            EmptyResponseRecoverySnapshot {
+                recovery_attempts: 1,
+                recovery_successes: 1,
+                fallback_emitted: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_respond_with_tools_emits_fallback_when_recovery_is_still_empty() {
+        let _guard = EMPTY_RESPONSE_TEST_GUARD.lock().await;
+        reset_empty_response_recovery_stats_for_tests();
+        let llm: Arc<dyn LlmProvider> = Arc::new(SequencedLlm::new(
+            vec![
+                CompletionResponse {
+                    content: "<think>still hidden</think>".to_string(),
+                    input_tokens: 3,
+                    output_tokens: 4,
+                    finish_reason: FinishReason::Stop,
+                },
+                CompletionResponse {
+                    content: "<think>also hidden</think>".to_string(),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+            Vec::new(),
+        ));
+        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: false,
+        }));
+        let reasoning = Reasoning::new(llm, safety);
+        let context = ReasoningContext::new().with_message(ChatMessage::user("Hi"));
+
+        let output = reasoning
+            .respond_with_tools(&context)
+            .await
+            .expect("respond_with_tools should succeed");
+        match output.result {
+            RespondResult::Text(text) => assert_eq!(text, EMPTY_RESPONSE_FALLBACK),
+            _ => panic!("Expected text response"),
+        }
+        assert_eq!(output.usage.input_tokens, 4);
+        assert_eq!(output.usage.output_tokens, 5);
+        assert_eq!(
+            empty_response_recovery_snapshot(),
+            EmptyResponseRecoverySnapshot {
+                recovery_attempts: 1,
+                recovery_successes: 0,
+                fallback_emitted: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_respond_with_tools_retries_unverified_claim_and_recovers_tool_call() {
+        let llm: Arc<dyn LlmProvider> = Arc::new(SequencedLlm::new(
+            Vec::new(),
+            vec![
+                ToolCompletionResponse {
+                    content: Some(
+                        "I called the github_list_pull_requests tool. Here's what it returned."
+                            .to_string(),
+                    ),
+                    tool_calls: Vec::new(),
+                    input_tokens: 5,
+                    output_tokens: 7,
+                    finish_reason: FinishReason::Stop,
+                },
+                ToolCompletionResponse {
+                    content: Some("<|tool_calls_section_begin|><|tool_call_begin|>functions.github_list_pull_requests:0<|tool_call_argument_begin|>{\"repository\":\"WynnD/ironclaw\"}<|tool_call_end|><|tool_calls_section_end|>".to_string()),
+                    tool_calls: Vec::new(),
+                    input_tokens: 3,
+                    output_tokens: 4,
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        ));
+        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: false,
+        }));
+        let reasoning = Reasoning::new(llm, safety);
+        let context = ReasoningContext::new()
+            .with_message(ChatMessage::user("List pull requests"))
+            .with_tools(vec![ToolDefinition {
+                name: "github_list_pull_requests".to_string(),
+                description: "List pull requests for a repository".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "repository": {"type": "string"}
+                    },
+                    "required": ["repository"]
+                }),
+            }]);
+
+        let output = reasoning
+            .respond_with_tools(&context)
+            .await
+            .expect("respond_with_tools should succeed");
+        match output.result {
+            RespondResult::ToolCalls { tool_calls, .. } => {
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].name, "github_list_pull_requests");
+                assert_eq!(
+                    tool_calls[0].arguments,
+                    serde_json::json!({"repository":"WynnD/ironclaw"})
+                );
+            }
+            other => panic!("Expected tool calls, got {:?}", other),
+        }
+        assert_eq!(output.usage.input_tokens, 8);
+        assert_eq!(output.usage.output_tokens, 11);
+    }
+
+    #[tokio::test]
+    async fn test_respond_with_tools_blocks_repeated_unverified_claims() {
+        let llm: Arc<dyn LlmProvider> = Arc::new(SequencedLlm::new(
+            Vec::new(),
+            vec![
+                ToolCompletionResponse {
+                    content: Some(
+                        "I called the github_list_pull_requests tool and got results.".to_string(),
+                    ),
+                    tool_calls: Vec::new(),
+                    input_tokens: 4,
+                    output_tokens: 6,
+                    finish_reason: FinishReason::Stop,
+                },
+                ToolCompletionResponse {
+                    content: Some(
+                        "I used the same tool again. Here is what it returned.".to_string(),
+                    ),
+                    tool_calls: Vec::new(),
+                    input_tokens: 2,
+                    output_tokens: 3,
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        ));
+        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: false,
+        }));
+        let reasoning = Reasoning::new(llm, safety);
+        let context = ReasoningContext::new()
+            .with_message(ChatMessage::user("List pull requests"))
+            .with_tools(vec![ToolDefinition {
+                name: "github_list_pull_requests".to_string(),
+                description: "List pull requests for a repository".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "repository": {"type": "string"}
+                    }
+                }),
+            }]);
+
+        let output = reasoning
+            .respond_with_tools(&context)
+            .await
+            .expect("respond_with_tools should succeed");
+        match output.result {
+            RespondResult::Text(text) => assert_eq!(text, UNVERIFIED_TOOL_CLAIM_FALLBACK),
+            other => panic!("Expected text fallback, got {:?}", other),
+        }
+        assert_eq!(output.usage.input_tokens, 6);
+        assert_eq!(output.usage.output_tokens, 9);
+    }
 
     #[test]
     fn test_extract_json() {
@@ -1415,6 +2683,81 @@ That's my plan."#;
             .with_job("Test job");
         assert_eq!(context.messages.len(), 1);
         assert!(context.job_description.is_some());
+    }
+
+    #[test]
+    fn test_summarize_parameters_for_prompt_includes_required_enum_and_default() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["now", "parse", "diff"],
+                    "description": "The operation to perform"
+                },
+                "timezone": {
+                    "type": "string",
+                    "description": "Optional timezone",
+                    "default": "UTC"
+                }
+            },
+            "required": ["operation"]
+        });
+
+        let lines = summarize_parameters_for_prompt(&schema);
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("`operation`") && l.contains("required"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("allowed: \"now\", \"parse\", \"diff\""))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("`timezone`") && l.contains("default: \"UTC\""))
+        );
+    }
+
+    #[test]
+    fn test_conversation_prompt_includes_tool_parameter_summary() {
+        let llm: Arc<dyn LlmProvider> = Arc::new(SequencedLlm::new(Vec::new(), Vec::new()));
+        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: false,
+        }));
+        let reasoning = Reasoning::new(llm, safety);
+
+        let context = ReasoningContext::new().with_tools(vec![ToolDefinition {
+            name: "time".to_string(),
+            description: "Get current time, convert timezones, or calculate time differences."
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["now", "parse", "format", "diff"],
+                        "description": "The time operation to perform"
+                    },
+                    "timestamp": {
+                        "type": "string",
+                        "description": "ISO 8601 timestamp"
+                    }
+                },
+                "required": ["operation"]
+            }),
+        }]);
+
+        let prompt = reasoning.build_conversation_prompt(&context);
+        assert!(prompt.contains("## Available Tools"));
+        assert!(prompt.contains("Parameters:"));
+        assert!(prompt.contains("`operation` (string, required)"));
+        assert!(prompt.contains("allowed: \"now\", \"parse\", \"format\", \"diff\""));
     }
 
     // ---- Basic thinking tag stripping ----
@@ -1754,6 +3097,41 @@ That's my plan."#;
         assert_eq!(regions[0].end, text.len());
     }
 
+    #[test]
+    fn test_claims_unverified_tool_execution_detects_first_person_claim() {
+        let tools = make_tools(&["github_list_pull_requests"]);
+        let content = "I called the github_list_pull_requests tool. Here's what it returned.";
+        assert!(claims_unverified_tool_execution(content, &tools));
+    }
+
+    #[test]
+    fn test_claims_unverified_tool_execution_ignores_capability_statement() {
+        let tools = make_tools(&["github_list_pull_requests"]);
+        let content = "I can call the github_list_pull_requests tool if you'd like.";
+        assert!(!claims_unverified_tool_execution(content, &tools));
+    }
+
+    #[test]
+    fn test_has_tool_result_since_last_user_true_for_recent_tool_result() {
+        let messages = vec![
+            ChatMessage::user("Check PRs"),
+            ChatMessage::assistant("I'll check that."),
+            ChatMessage::tool_result("call_1", "github_list_pull_requests", "{\"ok\":true}"),
+            ChatMessage::assistant("Tool returned one open PR."),
+        ];
+        assert!(has_tool_result_since_last_user(&messages));
+    }
+
+    #[test]
+    fn test_has_tool_result_since_last_user_false_without_recent_tool_result() {
+        let messages = vec![
+            ChatMessage::user("Check PRs"),
+            ChatMessage::assistant("I'll check that."),
+            ChatMessage::assistant("I called the tool and got results."),
+        ];
+        assert!(!has_tool_result_since_last_user(&messages));
+    }
+
     // ---- recover_tool_calls_from_content tests ----
 
     fn make_tools(names: &[&str]) -> Vec<ToolDefinition> {
@@ -1840,5 +3218,311 @@ That's my plan."#;
         let calls = recover_tool_calls_from_content(content, &tools);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "tool_list");
+    }
+
+    // ---- section-delimited tool call recovery tests ----
+
+    #[test]
+    fn test_recover_section_delimited_single() {
+        let tools = make_tools(&["http"]);
+        let content = r#"I'll fetch that for you. <|tool_calls_section_begin|><|tool_call_begin|>functions.http:0<|tool_call_argument_begin|>{"method": "GET", "url": "https://example.com/rss.xml"}<|tool_call_end|><|tool_calls_section_end|>"#;
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "http");
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"method": "GET", "url": "https://example.com/rss.xml"})
+        );
+    }
+
+    #[test]
+    fn test_recover_section_delimited_multiple() {
+        let tools = make_tools(&["http", "shell"]);
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>functions.http:0<|tool_call_argument_begin|>{\"url\": \"https://example.com\"}<|tool_call_end|><|tool_call_begin|>functions.shell:1<|tool_call_argument_begin|>{\"command\": \"ls\"}<|tool_call_end|><|tool_calls_section_end|>";
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "http");
+        assert_eq!(calls[1].name, "shell");
+        assert_eq!(calls[1].arguments, serde_json::json!({"command": "ls"}));
+    }
+
+    #[test]
+    fn test_recover_section_delimited_no_functions_prefix() {
+        let tools = make_tools(&["time"]);
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>time:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>";
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "time");
+    }
+
+    #[test]
+    fn test_recover_section_delimited_bare_name() {
+        let tools = make_tools(&["time"]);
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>time<|tool_call_end|><|tool_calls_section_end|>";
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "time");
+    }
+
+    #[test]
+    fn test_recover_section_delimited_unknown_tool_ignored() {
+        let tools = make_tools(&["http"]);
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>functions.nonexistent:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>";
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_recover_section_delimited_placeholder_tool_name_repaired() {
+        let tools = vec![
+            ToolDefinition {
+                name: "memory_read".to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"}
+                    },
+                    "required": ["path"]
+                }),
+            },
+            ToolDefinition {
+                name: "time".to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "operation": {"type": "string"}
+                    },
+                    "required": ["operation"]
+                }),
+            },
+        ];
+
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>recovered_1<|tool_call_argument_begin|>{\"path\":\"HEARTBEAT.md\"}<|tool_call_end|><|tool_calls_section_end|>";
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "memory_read");
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"path":"HEARTBEAT.md"})
+        );
+    }
+
+    #[test]
+    fn test_recover_section_delimited_placeholder_tool_name_ambiguous_ignored() {
+        let tools = vec![
+            ToolDefinition {
+                name: "memory_read".to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"}
+                    },
+                    "required": ["path"]
+                }),
+            },
+            ToolDefinition {
+                name: "read_file".to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"}
+                    },
+                    "required": ["path"]
+                }),
+            },
+        ];
+
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>recovered_2<|tool_call_argument_begin|>{\"path\":\"HEARTBEAT.md\"}<|tool_call_end|><|tool_calls_section_end|>";
+        let (calls, stats) = recover_tool_calls_from_content_with_stats(content, &tools);
+        assert!(calls.is_empty());
+        assert_eq!(stats.section_blocks, 1);
+        assert_eq!(stats.section_calls_seen, 1);
+        assert_eq!(stats.placeholder_names_seen, 1);
+        assert_eq!(stats.placeholder_names_repaired, 0);
+        assert_eq!(stats.unknown_calls_dropped, 1);
+    }
+
+    #[test]
+    fn test_normalize_section_tool_name() {
+        assert_eq!(normalize_section_tool_name("functions.http:0"), "http");
+        assert_eq!(normalize_section_tool_name("functions.shell:12"), "shell");
+        assert_eq!(normalize_section_tool_name("http:0"), "http");
+        assert_eq!(
+            normalize_section_tool_name("functions.memory_search:0"),
+            "memory_search"
+        );
+        assert_eq!(normalize_section_tool_name("time"), "time");
+        assert_eq!(normalize_section_tool_name("functions.time"), "time");
+    }
+
+    #[test]
+    fn test_fuzzy_match_tool_name() {
+        let tools: std::collections::HashSet<&str> =
+            ["time", "memory_search", "http", "shell"].into();
+
+        // Exact match returns None (handled by exact check before fuzzy)
+        // But fuzzy also works for exact since exact prefix + length match
+        assert_eq!(
+            fuzzy_match_tool_name("time", &tools),
+            Some("time".to_string())
+        );
+
+        // Model invents longer name
+        assert_eq!(
+            fuzzy_match_tool_name("time_get_current_time", &tools),
+            Some("time".to_string())
+        );
+
+        // Longer prefix wins: "memory_search" beats "memory" (if both existed)
+        assert_eq!(
+            fuzzy_match_tool_name("memory_search_documents", &tools),
+            Some("memory_search".to_string())
+        );
+
+        // No match
+        assert_eq!(fuzzy_match_tool_name("unknown_tool", &tools), None);
+
+        // Partial overlap but not at `_` boundary shouldn't match
+        // "timer" doesn't start with "time_"
+        assert_eq!(fuzzy_match_tool_name("timer", &tools), None);
+    }
+
+    #[test]
+    fn test_fuzzy_match_tool_name_suffix_server_prefix() {
+        let tools: std::collections::HashSet<&str> = ["ha_search_entities", "time"].into();
+        assert_eq!(
+            fuzzy_match_tool_name("home_assistant_ha_search_entities", &tools),
+            Some("ha_search_entities".to_string())
+        );
+    }
+
+    #[test]
+    fn test_canonical_match_tool_name_separator_variants() {
+        let tools: std::collections::HashSet<&str> = ["home-assistant_ha_search_entities"].into();
+        assert_eq!(
+            canonical_match_tool_name("home_assistant_ha_search_entities", &tools),
+            Some("home-assistant_ha_search_entities".to_string())
+        );
+    }
+
+    #[test]
+    fn test_recover_section_delimited_canonical_name_match() {
+        let tools = make_tools(&["home-assistant_ha_search_entities"]);
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>functions.home_assistant_ha_search_entities:2<|tool_call_argument_begin|>{\"query\":\"moisture\",\"domain_filter\":\"sensor\"}<|tool_call_end|><|tool_calls_section_end|>";
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "home-assistant_ha_search_entities");
+    }
+
+    // ---- clean_response section stripping tests ----
+
+    #[test]
+    fn test_clean_response_strips_section_tool_calls() {
+        let input = "Here is my response. <|tool_calls_section_begin|><|tool_call_begin|>functions.http:0<|tool_call_argument_begin|>{\"url\": \"https://example.com\"}<|tool_call_end|><|tool_calls_section_end|>";
+        let cleaned = clean_response(input);
+        assert!(!cleaned.contains("tool_calls_section"));
+        assert!(!cleaned.contains("tool_call_begin"));
+        assert!(cleaned.contains("Here is my response."));
+    }
+
+    #[test]
+    fn test_clean_response_strips_section_preserves_text() {
+        let input = "Before section <|tool_calls_section_begin|><|tool_call_begin|>functions.http:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|> After section";
+        let cleaned = clean_response(input);
+        assert!(cleaned.contains("Before section"));
+        assert!(cleaned.contains("After section"));
+        assert!(!cleaned.contains("tool_calls_section"));
+    }
+
+    #[test]
+    fn test_clean_response_dedupes_duplicate_final_blocks() {
+        let input = "<final>I need to discover the Codex tool first. Let me do that.</final>\
+                     <final>I need to discover the Codex tool first. Let me do that.</final>";
+        let cleaned = clean_response(input);
+        assert_eq!(
+            cleaned,
+            "I need to discover the Codex tool first. Let me do that."
+        );
+    }
+
+    #[test]
+    fn test_clean_response_keeps_distinct_final_blocks() {
+        let input = "<final>First line.</final><final>Second line.</final>";
+        let cleaned = clean_response(input);
+        assert_eq!(cleaned, "First line.\n\nSecond line.");
+    }
+
+    #[test]
+    fn test_clean_response_dedupes_plain_exact_duplicate_response() {
+        let input = "Thanks for the link. Let me read the docs to understand how \
+                     the Codex MCP is supposed to work, then retry properly. \
+                     Thanks for the link. Let me read the docs to understand how \
+                     the Codex MCP is supposed to work, then retry properly.";
+        let cleaned = clean_response(input);
+        assert_eq!(
+            cleaned,
+            "Thanks for the link. Let me read the docs to understand how the Codex \
+             MCP is supposed to work, then retry properly."
+        );
+    }
+
+    #[test]
+    fn test_clean_response_dedupes_near_duplicate_via_substring() {
+        // GLM5 pattern: answer appears twice, second copy has a trailing sentence
+        let input = "The fix is to update the config file and restart the service. \
+                     The fix is to update the config file and restart the service. \
+                     Let me know if you need more help.";
+        let cleaned = clean_response(input);
+        assert_eq!(
+            cleaned,
+            "The fix is to update the config file and restart the service."
+        );
+    }
+
+    #[test]
+    fn test_collapse_near_duplicate_with_preamble_difference() {
+        // Near-duplicate where the second copy has a short preamble ("So,").
+        // The algorithm detects the repeat and keeps the shorter copy.
+        let input = "Here is my analysis of the situation and the recommended fix. \
+                     So, here is my analysis of the situation and the recommended fix.";
+        let cleaned = collapse_exact_duplicate_response(input);
+        assert_eq!(
+            cleaned,
+            "here is my analysis of the situation and the recommended fix."
+        );
+    }
+
+    #[test]
+    fn test_collapse_does_not_catch_distant_substring_match() {
+        // Two distinct paragraphs where one is much longer — NOT a near-duplicate.
+        // The short part happens to be a substring of the long part but the split
+        // point would be far from the midpoint, so it should NOT collapse.
+        let input = "You should update the configuration. \
+                     The configuration file is located at /etc/app/config.yaml \
+                     and you should update the configuration to include the new \
+                     database credentials before restarting the service.";
+        let result = collapse_exact_duplicate_response(input);
+        assert_eq!(result, input.trim());
+    }
+
+    #[test]
+    fn test_collapse_does_not_catch_coincidental_repetition() {
+        // Legitimate content that has some repeated phrases but is NOT a duplicate
+        let input = "The error occurs when the server starts. Check the server logs \
+                     for details about why the server starts failing. The server logs \
+                     are in /var/log/app.log and will show the exact error message.";
+        let result = collapse_exact_duplicate_response(input);
+        assert_eq!(result, input.trim());
+    }
+
+    #[test]
+    fn test_clean_response_keeps_short_repetition() {
+        let input = "ok ok";
+        let cleaned = clean_response(input);
+        assert_eq!(cleaned, "ok ok");
     }
 }

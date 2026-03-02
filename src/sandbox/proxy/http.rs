@@ -97,11 +97,21 @@ impl HttpProxy {
 
     /// Start the proxy server on the given port (0 for auto-assign).
     pub async fn start(&self, port: u16) -> Result<SocketAddr> {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
-            .await
-            .map_err(|e| SandboxError::ProxyError {
-                reason: format!("failed to bind: {}", e),
-            })?;
+        // Match orchestrator API binding semantics:
+        // - Linux: containers reach host via bridge/gateway (not loopback), so bind all interfaces.
+        // - macOS/Windows: Docker Desktop routes host.docker.internal to host loopback.
+        let bind_addr = if cfg!(target_os = "linux") {
+            SocketAddr::from(([0, 0, 0, 0], port))
+        } else {
+            SocketAddr::from(([127, 0, 0, 1], port))
+        };
+
+        let listener =
+            TcpListener::bind(bind_addr)
+                .await
+                .map_err(|e| SandboxError::ProxyError {
+                    reason: format!("failed to bind: {}", e),
+                })?;
 
         let addr = listener
             .local_addr()

@@ -9,13 +9,14 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-use crate::agent::Agent;
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::dispatcher::{
     AgenticLoopResult, check_auth_required, execute_chat_tool_standalone, parse_auth_result,
 };
 use crate::agent::session::{PendingApproval, Session, ThreadState};
 use crate::agent::submission::SubmissionResult;
+use crate::agent::{Agent, tool_params_preview};
+use crate::channels::web::util::truncate_preview;
 use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
 use crate::error::Error;
@@ -177,6 +178,8 @@ impl Agent {
                 .filter_map(|m| match m.role.as_str() {
                     "user" => Some(ChatMessage::user(&m.content)),
                     "assistant" => Some(ChatMessage::assistant(&m.content)),
+                    // tool_calls rows are UI metadata (tool name + preview),
+                    // not part of the LLM conversation context.
                     _ => None,
                 })
                 .collect();
@@ -284,6 +287,18 @@ impl Agent {
             .any(|rule| rule.action == crate::safety::PolicyAction::Block)
         {
             return Ok(SubmissionResult::error("Input rejected by safety policy."));
+        }
+
+        // Scan inbound messages for secrets (API keys, tokens).
+        // Catching them here prevents the LLM from echoing them back, which
+        // would trigger the outbound leak detector and create error loops.
+        if let Some(warning) = self.safety().scan_inbound_for_secrets(content) {
+            tracing::warn!(
+                user = %message.user_id,
+                channel = %message.channel,
+                "Inbound message blocked: contains leaked secret"
+            );
+            return Ok(SubmissionResult::error(warning));
         }
 
         // Handle explicit commands (starting with /) directly
@@ -431,6 +446,11 @@ impl Agent {
                 };
 
                 thread.complete_turn(&response);
+                let tool_calls = thread
+                    .turns
+                    .last()
+                    .map(|t| t.tool_calls.clone())
+                    .unwrap_or_default();
                 let _ = self
                     .channels
                     .send_status(
@@ -440,7 +460,9 @@ impl Agent {
                     )
                     .await;
 
-                // Persist assistant response (user message already persisted at turn start)
+                // Persist tool calls then assistant response (user message already persisted at turn start)
+                self.persist_tool_calls(thread_id, &message.user_id, &tool_calls)
+                    .await;
                 self.persist_assistant_response(thread_id, &message.user_id, &response)
                     .await;
 
@@ -536,6 +558,73 @@ impl Agent {
             .await
         {
             tracing::warn!("Failed to persist assistant message: {}", e);
+        }
+    }
+
+    /// Persist tool call summaries to the DB as a `role="tool_calls"` message.
+    ///
+    /// Stored between the user and assistant messages so that
+    /// `build_turns_from_db_messages` can reconstruct the tool call history.
+    /// Content is a JSON array of tool call summaries.
+    pub(super) async fn persist_tool_calls(
+        &self,
+        thread_id: Uuid,
+        user_id: &str,
+        tool_calls: &[crate::agent::session::TurnToolCall],
+    ) {
+        if tool_calls.is_empty() {
+            return;
+        }
+
+        let store = match self.store() {
+            Some(s) => Arc::clone(s),
+            None => return,
+        };
+
+        let summaries: Vec<serde_json::Value> = tool_calls
+            .iter()
+            .map(|tc| {
+                let mut obj = serde_json::json!({ "name": tc.name });
+                let params_preview = match &tc.parameters {
+                    serde_json::Value::String(s) => truncate_preview(s, 300),
+                    other => truncate_preview(&other.to_string(), 300),
+                };
+                obj["params_preview"] = serde_json::Value::String(params_preview);
+                if let Some(ref result) = tc.result {
+                    let preview = match result {
+                        serde_json::Value::String(s) => truncate_preview(s, 500),
+                        other => truncate_preview(&other.to_string(), 500),
+                    };
+                    obj["result_preview"] = serde_json::Value::String(preview);
+                }
+                if let Some(ref error) = tc.error {
+                    obj["error"] = serde_json::Value::String(truncate_preview(error, 200));
+                }
+                obj
+            })
+            .collect();
+
+        let content = match serde_json::to_string(&summaries) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("Failed to serialize tool calls: {}", e);
+                return;
+            }
+        };
+
+        if let Err(e) = store
+            .ensure_conversation(thread_id, "gateway", user_id, None)
+            .await
+        {
+            tracing::warn!("Failed to ensure conversation {}: {}", thread_id, e);
+            return;
+        }
+
+        if let Err(e) = store
+            .add_conversation_message(thread_id, "tool_calls", &content)
+            .await
+        {
+            tracing::warn!("Failed to persist tool calls: {}", e);
         }
     }
 
@@ -712,7 +801,13 @@ impl Agent {
                 .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
 
             if thread.state != ThreadState::AwaitingApproval {
-                return Ok(SubmissionResult::error("No pending approval request."));
+                // Stale or duplicate approval (tool already executed) — silently ignore.
+                tracing::debug!(
+                    %thread_id,
+                    state = ?thread.state,
+                    "Ignoring stale approval: thread not in AwaitingApproval state"
+                );
+                return Ok(SubmissionResult::ok_with_message(""));
             }
 
             thread.take_pending_approval()
@@ -720,7 +815,13 @@ impl Agent {
 
         let pending = match pending {
             Some(p) => p,
-            None => return Ok(SubmissionResult::error("No pending approval request.")),
+            None => {
+                tracing::debug!(
+                    %thread_id,
+                    "Ignoring stale approval: no pending approval found"
+                );
+                return Ok(SubmissionResult::ok_with_message(""));
+            }
         };
 
         // Verify request ID if provided
@@ -761,8 +862,24 @@ impl Agent {
             }
 
             // Execute the approved tool and continue the loop
-            let job_ctx =
+            let message_target = message
+                .metadata
+                .get("signal_target")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| message.user_id.clone());
+            let mut job_ctx =
                 JobContext::with_user(&message.user_id, "chat", "Interactive chat session");
+            job_ctx.metadata = serde_json::json!({
+                "message_channel": message.channel,
+                "message_target": message_target,
+                "message_context": {
+                    "channel": message.channel,
+                    "target": message_target
+                }
+            });
 
             let _ = self
                 .channels
@@ -770,6 +887,7 @@ impl Agent {
                     &message.channel,
                     StatusUpdate::ToolStarted {
                         name: pending.tool_name.clone(),
+                        params_preview: Some(tool_params_preview(&pending.parameters, 100)),
                     },
                     &message.metadata,
                 )
@@ -890,8 +1008,12 @@ impl Agent {
                     let needs_approval = match tool.requires_approval(&tc.arguments) {
                         ApprovalRequirement::Never => false,
                         ApprovalRequirement::UnlessAutoApproved => {
-                            let sess = session.lock().await;
-                            !sess.is_tool_auto_approved(&tc.name)
+                            if self.config.auto_approve_tools {
+                                false
+                            } else {
+                                let sess = session.lock().await;
+                                !sess.is_tool_auto_approved(&tc.name)
+                            }
                         }
                         ApprovalRequirement::Always => true,
                     };
@@ -918,6 +1040,7 @@ impl Agent {
                             &message.channel,
                             StatusUpdate::ToolStarted {
                                 name: tc.name.clone(),
+                                params_preview: Some(tool_params_preview(&tc.arguments, 100)),
                             },
                             &message.metadata,
                         )
@@ -962,6 +1085,7 @@ impl Agent {
                                 &channel,
                                 StatusUpdate::ToolStarted {
                                     name: tc.name.clone(),
+                                    params_preview: Some(tool_params_preview(&tc.arguments, 100)),
                                 },
                                 &metadata,
                             )
@@ -1148,7 +1272,14 @@ impl Agent {
             match result {
                 Ok(AgenticLoopResult::Response(response)) => {
                     thread.complete_turn(&response);
-                    // User message already persisted at turn start; save assistant response
+                    let tool_calls = thread
+                        .turns
+                        .last()
+                        .map(|t| t.tool_calls.clone())
+                        .unwrap_or_default();
+                    // User message already persisted at turn start; save tool calls then assistant response
+                    self.persist_tool_calls(thread_id, &message.user_id, &tool_calls)
+                        .await;
                     self.persist_assistant_response(thread_id, &message.user_id, &response)
                         .await;
                     let _ = self

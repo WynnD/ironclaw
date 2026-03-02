@@ -32,7 +32,7 @@ use crate::settings::Settings;
 pub use self::agent::AgentConfig;
 pub use self::builder::BuilderModeConfig;
 pub use self::channels::{ChannelsConfig, CliConfig, GatewayConfig, HttpConfig, SignalConfig};
-pub use self::database::{DatabaseBackend, DatabaseConfig, default_libsql_path};
+pub use self::database::{DatabaseBackend, DatabaseConfig, SslMode, default_libsql_path};
 pub use self::embeddings::EmbeddingsConfig;
 pub use self::heartbeat::HeartbeatConfig;
 pub use self::hygiene::HygieneConfig;
@@ -42,7 +42,10 @@ pub use self::llm::{
 };
 pub use self::routines::{RoutineConfig, RoutineCronTimezone};
 pub use self::safety::SafetyConfig;
-pub use self::sandbox::{ClaudeCodeConfig, SandboxModeConfig};
+pub use self::sandbox::{
+    CLAUDE_CODE_CREDENTIALS_ENV_VAR, CLAUDE_CODE_SUBSCRIPTION_SECRET_NAME, ClaudeCodeConfig,
+    SandboxModeConfig,
+};
 pub use self::secrets::SecretsConfig;
 pub use self::skills::SkillsConfig;
 pub use self::tunnel::TunnelConfig;

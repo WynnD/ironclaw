@@ -74,10 +74,36 @@ function syncMobileTabSelect(tab) {
   if (el && el.value !== tab) el.value = tab;
 }
 
+// --- Slash Commands ---
+
+const SLASH_COMMANDS = [
+  { cmd: '/status',     desc: 'Show all jobs, or /status <id> for one job' },
+  { cmd: '/list',       desc: 'List all jobs' },
+  { cmd: '/cancel',     desc: '/cancel <job-id> — cancel a running job' },
+  { cmd: '/undo',       desc: 'Revert the last turn' },
+  { cmd: '/redo',       desc: 'Re-apply an undone turn' },
+  { cmd: '/compact',    desc: 'Compress the context window' },
+  { cmd: '/clear',      desc: 'Clear thread and start fresh' },
+  { cmd: '/interrupt',  desc: 'Stop the current turn' },
+  { cmd: '/heartbeat',  desc: 'Trigger manual heartbeat check' },
+  { cmd: '/summarize',  desc: 'Summarize the current thread' },
+  { cmd: '/suggest',    desc: 'Suggest next steps' },
+  { cmd: '/help',       desc: 'Show help' },
+  { cmd: '/version',    desc: 'Show version info' },
+  { cmd: '/tools',      desc: 'List available tools' },
+  { cmd: '/skills',     desc: 'List installed skills' },
+  { cmd: '/model',      desc: 'Show or switch the LLM model' },
+  { cmd: '/thread new', desc: 'Create a new conversation thread' },
+];
+
+let _slashSelected = -1;
+let _slashMatches = [];
+
 // --- Tool Activity State ---
 let _activeGroup = null;
 let _activeToolCards = {};
 let _activityThinking = null;
+const TERMINAL_CHAT_STATUSES = new Set(['Done', 'Awaiting approval', 'Interrupted', 'Rejected']);
 
 // --- Auth ---
 
@@ -214,7 +240,6 @@ function connectSSE() {
     if (!isCurrentThread(data.thread_id)) return;
     finalizeActivityGroup();
     addMessage('assistant', data.content);
-    setStatus('');
     enableChatInput();
     // Refresh thread list so new titles appear after first message
     loadThreads();
@@ -229,7 +254,7 @@ function connectSSE() {
   eventSource.addEventListener('tool_started', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
-    addToolCard(data.name);
+    addToolCard(data.name, data.params_preview);
   });
 
   eventSource.addEventListener('tool_completed', (e) => {
@@ -254,14 +279,13 @@ function connectSSE() {
   eventSource.addEventListener('status', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
-    setStatus(data.message);
-    // "Done" and "Awaiting approval" are terminal signals from the agent:
-    // the agentic loop finished, so re-enable input as a safety net in case
-    // the response SSE event is empty or lost.
-    if (data.message === 'Done' || data.message === 'Awaiting approval') {
+    const message = (data.message || '').trim();
+    if (TERMINAL_CHAT_STATUSES.has(message)) {
       finalizeActivityGroup();
       enableChatInput();
+      return;
     }
+    if (message) showActivityThinking(message);
   });
 
   eventSource.addEventListener('job_started', (e) => {
@@ -343,39 +367,91 @@ function isCurrentThread(threadId) {
 
 function sendMessage() {
   const input = document.getElementById('chat-input');
-  const sendBtn = document.getElementById('send-btn');
   if (!currentThreadId) {
     console.warn('sendMessage: no thread selected, ignoring');
-    setStatus('Waiting for thread to load...');
     return;
   }
   const content = input.value.trim();
   if (!content) return;
 
   addMessage('user', content);
+  showActivityThinking('Working...');
   input.value = '';
   autoResizeTextarea(input);
-  sendBtn.disabled = true;
-  input.disabled = true;
+  input.focus();
 
   apiFetch('/api/chat/send', {
     method: 'POST',
     body: { content, thread_id: currentThreadId || undefined },
   }).catch((err) => {
+    finalizeActivityGroup();
     addMessage('system', 'Failed to send: ' + err.message);
-    setStatus('');
-    enableChatInput();
   });
 }
 
 function enableChatInput() {
-  // Don't re-enable until a thread is selected (prevents orphan messages)
-  if (!currentThreadId) return;
+  // no-op: input and send button are always enabled
+}
+
+// --- Slash Autocomplete ---
+
+function showSlashAutocomplete(matches) {
+  const el = document.getElementById('slash-autocomplete');
+  if (!el || matches.length === 0) { hideSlashAutocomplete(); return; }
+  _slashMatches = matches;
+  _slashSelected = -1;
+  el.innerHTML = '';
+  matches.forEach((item, i) => {
+    const row = document.createElement('div');
+    row.className = 'slash-ac-item';
+    row.dataset.index = i;
+    var cmdSpan = document.createElement('span');
+    cmdSpan.className = 'slash-ac-cmd';
+    cmdSpan.textContent = item.cmd;
+    var descSpan = document.createElement('span');
+    descSpan.className = 'slash-ac-desc';
+    descSpan.textContent = item.desc;
+    row.appendChild(cmdSpan);
+    row.appendChild(descSpan);
+    row.addEventListener('mousedown', (e) => {
+      e.preventDefault(); // prevent blur
+      selectSlashItem(item.cmd);
+    });
+    el.appendChild(row);
+  });
+  el.style.display = 'block';
+}
+
+function hideSlashAutocomplete() {
+  const el = document.getElementById('slash-autocomplete');
+  if (el) el.style.display = 'none';
+  _slashSelected = -1;
+  _slashMatches = [];
+}
+
+function selectSlashItem(cmd) {
   const input = document.getElementById('chat-input');
-  const sendBtn = document.getElementById('send-btn');
-  sendBtn.disabled = false;
-  input.disabled = false;
+  input.value = cmd + ' ';
   input.focus();
+  hideSlashAutocomplete();
+  autoResizeTextarea(input);
+}
+
+function updateSlashHighlight() {
+  const items = document.querySelectorAll('#slash-autocomplete .slash-ac-item');
+  items.forEach((el, i) => el.classList.toggle('selected', i === _slashSelected));
+}
+
+function filterSlashCommands(value) {
+  if (!value.startsWith('/')) { hideSlashAutocomplete(); return; }
+  // Only show autocomplete when the input is just a slash command prefix (no spaces except /thread new)
+  const lower = value.toLowerCase();
+  const matches = SLASH_COMMANDS.filter((c) => c.cmd.startsWith(lower));
+  if (matches.length === 0 || (matches.length === 1 && matches[0].cmd === lower.trimEnd())) {
+    hideSlashAutocomplete();
+  } else {
+    showSlashAutocomplete(matches);
+  }
 }
 
 function sendApprovalAction(requestId, action) {
@@ -399,6 +475,8 @@ function sendApprovalAction(requestId, action) {
     const labelText = action === 'approve' ? 'Approved' : action === 'always' ? 'Always approved' : 'Denied';
     label.textContent = labelText;
     actions.appendChild(label);
+    // Remove the card after showing the confirmation briefly
+    setTimeout(() => { card.remove(); }, 1500);
   }
 }
 
@@ -474,15 +552,6 @@ function appendToLastAssistant(chunk) {
   }
 }
 
-function setStatus(text) {
-  const el = document.getElementById('chat-status');
-  if (!text) {
-    el.innerHTML = '';
-    return;
-  }
-  el.innerHTML = escapeHtml(text);
-}
-
 // --- Inline Tool Activity Cards ---
 
 function getOrCreateActivityGroup() {
@@ -527,7 +596,7 @@ function removeActivityThinking() {
   }
 }
 
-function addToolCard(name) {
+function addToolCard(name, paramsPreview) {
   // Hide thinking instead of destroying — it may reappear between tool rounds
   if (_activityThinking) _activityThinking.style.display = 'none';
   const group = getOrCreateActivityGroup();
@@ -567,6 +636,13 @@ function addToolCard(name) {
 
   const output = document.createElement('pre');
   output.className = 'activity-tool-output';
+
+  if (paramsPreview) {
+    const params = document.createElement('pre');
+    params.className = 'activity-tool-output';
+    params.textContent = 'Params: ' + paramsPreview;
+    body.appendChild(params);
+  }
   body.appendChild(output);
 
   header.addEventListener('click', () => {
@@ -986,9 +1062,21 @@ function loadHistory(before) {
       container.innerHTML = '';
       for (const turn of data.turns) {
         addMessage('user', turn.user_input);
+        if (turn.tool_calls && turn.tool_calls.length > 0) {
+          addToolCallsSummary(turn.tool_calls);
+        }
         if (turn.response) {
           addMessage('assistant', turn.response);
         }
+      }
+      // Show processing indicator if the last turn is still in-progress
+      var lastTurn = data.turns.length > 0 ? data.turns[data.turns.length - 1] : null;
+      if (lastTurn && !lastTurn.response && lastTurn.state === 'Processing') {
+        showActivityThinking('Processing...');
+      }
+      // Re-render pending approval card if the thread is awaiting approval
+      if (data.pending_approval) {
+        showApproval(data.pending_approval);
       }
     } else {
       // Pagination: prepend older messages
@@ -997,6 +1085,9 @@ function loadHistory(before) {
       for (const turn of data.turns) {
         const userDiv = createMessageElement('user', turn.user_input);
         fragment.appendChild(userDiv);
+        if (turn.tool_calls && turn.tool_calls.length > 0) {
+          fragment.appendChild(createToolCallsSummaryElement(turn.tool_calls));
+        }
         if (turn.response) {
           const assistantDiv = createMessageElement('assistant', turn.response);
           fragment.appendChild(assistantDiv);
@@ -1027,6 +1118,68 @@ function createMessageElement(role, content) {
     div.setAttribute('data-raw', content);
     div.innerHTML = renderMarkdown(content);
   }
+  return div;
+}
+
+function addToolCallsSummary(toolCalls) {
+  const container = document.getElementById('chat-messages');
+  container.appendChild(createToolCallsSummaryElement(toolCalls));
+  container.scrollTop = container.scrollHeight;
+}
+
+function createToolCallsSummaryElement(toolCalls) {
+  const div = document.createElement('div');
+  div.className = 'tool-calls-summary';
+
+  const header = document.createElement('div');
+  header.className = 'tool-calls-header';
+  header.textContent = toolCalls.length + ' tool' + (toolCalls.length !== 1 ? 's' : '') + ' used';
+  div.appendChild(header);
+
+  const list = document.createElement('div');
+  list.className = 'tool-calls-list';
+
+  for (const tc of toolCalls) {
+    const item = document.createElement('div');
+    item.className = 'tool-call-item' + (tc.has_error ? ' tool-error' : '');
+
+    const icon = tc.has_error ? '\u2717' : '\u2713';
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'tool-call-name';
+    nameSpan.textContent = icon + ' ' + tc.name;
+    item.appendChild(nameSpan);
+
+    if (tc.params_preview) {
+      const params = document.createElement('div');
+      params.className = 'tool-call-preview';
+      params.textContent = 'Params: ' + tc.params_preview;
+      item.appendChild(params);
+    }
+
+    if (tc.result_preview) {
+      const preview = document.createElement('div');
+      preview.className = 'tool-call-preview';
+      preview.textContent = tc.result_preview;
+      item.appendChild(preview);
+    }
+    if (tc.error) {
+      const errDiv = document.createElement('div');
+      errDiv.className = 'tool-call-error-text';
+      errDiv.textContent = tc.error;
+      item.appendChild(errDiv);
+    }
+
+    list.appendChild(item);
+  }
+
+  div.appendChild(list);
+
+  header.style.cursor = 'pointer';
+  header.addEventListener('click', () => {
+    list.classList.toggle('expanded');
+    header.classList.toggle('expanded');
+  });
+
   return div;
 }
 
@@ -1105,7 +1258,6 @@ function createNewThread() {
   apiFetch('/api/chat/thread/new', { method: 'POST' }).then((data) => {
     currentThreadId = data.id || null;
     document.getElementById('chat-messages').innerHTML = '';
-    setStatus('');
     loadThreads();
   }).catch((err) => {
     showToast('Failed to create thread: ' + err.message, 'error');
@@ -1114,31 +1266,72 @@ function createNewThread() {
 
 function toggleThreadSidebar() {
   const sidebar = document.getElementById('thread-sidebar');
+  const btn = document.getElementById('thread-toggle-btn');
   const isMobile = window.matchMedia('(max-width: 768px)').matches;
   if (isMobile) {
     sidebar.classList.toggle('expanded-mobile');
-    const btn = document.getElementById('thread-toggle-btn');
-    btn.innerHTML = sidebar.classList.contains('expanded-mobile') ? '&laquo;' : '&raquo;';
+    btn.innerHTML = sidebar.classList.contains('expanded-mobile') ? '&times;' : '&#9776;';
   } else {
     sidebar.classList.toggle('collapsed');
-    const btn = document.getElementById('thread-toggle-btn');
     btn.innerHTML = sidebar.classList.contains('collapsed') ? '&raquo;' : '&laquo;';
   }
 }
 
+// Set correct sidebar toggle icon based on viewport
+(function initSidebarToggle() {
+  var btn = document.getElementById('thread-toggle-btn');
+  if (btn && window.matchMedia('(max-width: 768px)').matches) {
+    btn.innerHTML = '&#9776;';
+  }
+})();
+
 // Chat input auto-resize and keyboard handling
 const chatInput = document.getElementById('chat-input');
 chatInput.addEventListener('keydown', (e) => {
+  const acEl = document.getElementById('slash-autocomplete');
+  const acVisible = acEl && acEl.style.display !== 'none';
+
+  if (acVisible) {
+    const items = acEl.querySelectorAll('.slash-ac-item');
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      _slashSelected = Math.min(_slashSelected + 1, items.length - 1);
+      updateSlashHighlight();
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      _slashSelected = Math.max(_slashSelected - 1, -1);
+      updateSlashHighlight();
+      return;
+    }
+    if (e.key === 'Tab' || (e.key === 'Enter' && _slashSelected >= 0)) {
+      e.preventDefault();
+      const pick = _slashSelected >= 0 ? _slashMatches[_slashSelected] : _slashMatches[0];
+      if (pick) selectSlashItem(pick.cmd);
+      return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      hideSlashAutocomplete();
+      return;
+    }
+  }
+
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
+    hideSlashAutocomplete();
     sendMessage();
   }
 });
-chatInput.addEventListener('input', () => autoResizeTextarea(chatInput));
-
-// Disable send until a thread is selected (loadThreads will enable it)
-chatInput.disabled = true;
-document.getElementById('send-btn').disabled = true;
+chatInput.addEventListener('input', () => {
+  autoResizeTextarea(chatInput);
+  filterSlashCommands(chatInput.value);
+});
+chatInput.addEventListener('blur', () => {
+  // Small delay so mousedown on autocomplete item fires first
+  setTimeout(hideSlashAutocomplete, 150);
+});
 
 // Infinite scroll: load older messages when scrolled near the top
 document.getElementById('chat-messages').addEventListener('scroll', function () {
@@ -1379,7 +1572,9 @@ function buildBreadcrumb(path) {
   let current = '';
   for (const part of parts) {
     current += (current ? '/' : '') + part;
-    html += ' / <a onclick="readMemoryFile(\'' + escapeHtml(current) + '\')">' + escapeHtml(part) + '</a>';
+    // Store the path in data-path (HTML-escaped) and read it back via this.dataset.path
+    // to avoid single-quote injection in inline JS string literals.
+    html += ' / <a onclick="readMemoryFile(this.dataset.path)" data-path="' + escapeHtml(current) + '">' + escapeHtml(part) + '</a>';
   }
   return html;
 }
@@ -1554,10 +1749,8 @@ function applyLogFilters() {
 function setServerLogLevel(level) {
   apiFetch('/api/logs/level', {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ level: level }),
+    body: { level },
   })
-    .then(r => r.json())
     .then(data => {
       document.getElementById('logs-server-level').value = data.level;
     })
@@ -1566,7 +1759,6 @@ function setServerLogLevel(level) {
 
 function loadServerLogLevel() {
   apiFetch('/api/logs/level')
-    .then(r => r.json())
     .then(data => {
       document.getElementById('logs-server-level').value = data.level;
     })
@@ -1574,6 +1766,8 @@ function loadServerLogLevel() {
 }
 
 // --- Extensions ---
+
+var kindLabels = { 'wasm_channel': 'Channel', 'wasm_tool': 'Tool', 'mcp_server': 'MCP' };
 
 function loadExtensions() {
   const extList = document.getElementById('extensions-list');
@@ -1744,7 +1938,7 @@ function renderAvailableExtensionCard(entry) {
 
   const kind = document.createElement('span');
   kind.className = 'ext-kind kind-' + entry.kind;
-  kind.textContent = entry.kind;
+  kind.textContent = kindLabels[entry.kind] || entry.kind;
   header.appendChild(kind);
 
   card.appendChild(header);
@@ -1810,7 +2004,7 @@ function renderMcpServerCard(entry, installedExt) {
 
   var kind = document.createElement('span');
   kind.className = 'ext-kind kind-mcp_server';
-  kind.textContent = 'mcp_server';
+  kind.textContent = kindLabels['mcp_server'] || 'mcp_server';
   header.appendChild(kind);
 
   if (installedExt) {
@@ -1894,12 +2088,12 @@ function renderExtensionCard(ext) {
 
   const name = document.createElement('span');
   name.className = 'ext-name';
-  name.textContent = ext.name;
+  name.textContent = ext.display_name || ext.name;
   header.appendChild(name);
 
   const kind = document.createElement('span');
   kind.className = 'ext-kind kind-' + ext.kind;
-  kind.textContent = ext.kind;
+  kind.textContent = kindLabels[ext.kind] || ext.kind;
   header.appendChild(kind);
 
   // Auth dot only for non-WASM-channel extensions (channels use the stepper instead)
@@ -1975,11 +2169,6 @@ function renderExtensionCard(ext) {
       actions.appendChild(pairingLabel);
       actions.appendChild(createReconfigureButton(ext.name));
     } else if (status === 'failed') {
-      var restartBtn = document.createElement('button');
-      restartBtn.className = 'btn-ext activate';
-      restartBtn.textContent = 'Restart';
-      restartBtn.addEventListener('click', restartGateway);
-      actions.appendChild(restartBtn);
       actions.appendChild(createReconfigureButton(ext.name));
     } else {
       // installed or configured: show Setup button
@@ -2007,7 +2196,7 @@ function renderExtensionCard(ext) {
     if (ext.needs_setup) {
       const configBtn = document.createElement('button');
       configBtn.className = 'btn-ext configure';
-      configBtn.textContent = ext.authenticated ? 'Reconfigure' : 'Configure';
+      configBtn.textContent = ext.authenticated ? 'Reconfigure' : 'Setup';
       configBtn.addEventListener('click', () => showConfigureModal(ext.name));
       actions.appendChild(configBtn);
     }
@@ -2129,7 +2318,8 @@ function renderConfigureModal(name, secrets) {
     if (secret.provided) {
       const badge = document.createElement('span');
       badge.className = 'field-provided';
-      badge.textContent = 'Set';
+      badge.textContent = '\u2713';
+      badge.title = 'Already configured';
       inputRow.appendChild(badge);
     }
     if (secret.auto_generate && !secret.provided) {
@@ -2187,12 +2377,10 @@ function submitConfigureModal(name, fields) {
     .then((res) => {
       closeConfigureModal();
       if (res.success) {
-        if (res.activated && name === 'telegram') {
+        if (res.activated) {
           showToast('Configured and activated ' + name, 'success');
-        } else if (res.activated) {
-          showToast('Configured ' + name + ' successfully', 'success');
         } else if (res.needs_restart) {
-          showToast('Configured ' + name + '. Restart required to activate.', 'info');
+          showToast('Configured ' + name + '. Use Reconfigure to re-enter credentials and activate.', 'info');
         } else {
           showToast(res.message, 'success');
         }
@@ -2468,7 +2656,7 @@ function renderJobsList(jobs) {
     } else if (job.state === 'failed' || job.state === 'interrupted') {
       actionBtns = '<button class="btn-restart" onclick="event.stopPropagation(); restartJob(\'' + job.id + '\')">Restart</button>';
     }
-    if (['completed', 'failed', 'interrupted', 'cancelled', 'Completed', 'Failed', 'Cancelled'].indexOf(job.state) !== -1) {
+    if (['completed', 'failed', 'interrupted', 'cancelled', 'stuck', 'Completed', 'Failed', 'Cancelled', 'Stuck'].indexOf(job.state) !== -1) {
       actionBtns += '<button class="btn-cancel btn-delete" onclick="event.stopPropagation(); deleteJob(\'' + job.id + '\')">Delete</button>';
     }
 
@@ -4101,8 +4289,13 @@ document.addEventListener('keydown', (e) => {
     return;
   }
 
-  // Escape: close job detail or blur input
+  // Escape: close autocomplete, job detail, or blur input
   if (e.key === 'Escape') {
+    const acEl = document.getElementById('slash-autocomplete');
+    if (acEl && acEl.style.display !== 'none') {
+      hideSlashAutocomplete();
+      return;
+    }
     if (currentJobId) {
       closeJobDetail();
     } else if (inInput) {

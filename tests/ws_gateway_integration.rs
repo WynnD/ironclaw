@@ -308,6 +308,7 @@ async fn test_ws_multiple_events_in_sequence() {
     });
     state.sse.broadcast(SseEvent::ToolStarted {
         name: "shell".to_string(),
+        params_preview: None,
         thread_id: None,
     });
     state.sse.broadcast(SseEvent::ToolCompleted {

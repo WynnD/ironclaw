@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::bootstrap::ironclaw_base_dir;
 use crate::error::OrchestratorError;
 use crate::orchestrator::auth::{CredentialGrant, TokenStore};
 use crate::sandbox::connect_docker;
@@ -50,13 +51,6 @@ pub struct ContainerJobConfig {
     pub cpu_shares: u32,
     /// Port the orchestrator internal API listens on.
     pub orchestrator_port: u16,
-    /// Anthropic API key for Claude Code containers (read from ANTHROPIC_API_KEY).
-    /// Takes priority over OAuth token.
-    pub claude_code_api_key: Option<String>,
-    /// OAuth access token extracted from the host's `claude login` session.
-    /// Passed as CLAUDE_CODE_OAUTH_TOKEN to containers. Falls back to this
-    /// when no ANTHROPIC_API_KEY is available.
-    pub claude_code_oauth_token: Option<String>,
     /// Claude model to use in ClaudeCode mode.
     pub claude_code_model: String,
     /// Maximum turns for Claude Code.
@@ -74,8 +68,6 @@ impl Default for ContainerJobConfig {
             memory_limit_mb: 2048,
             cpu_shares: 1024,
             orchestrator_port: 50051,
-            claude_code_api_key: None,
-            claude_code_oauth_token: None,
             claude_code_model: "sonnet".to_string(),
             claude_code_max_turns: 50,
             claude_code_memory_limit_mb: 4096,
@@ -158,11 +150,14 @@ fn validate_bind_mount_path(
             ),
         })?;
 
-    let home = dirs::home_dir().ok_or_else(|| OrchestratorError::ContainerCreationFailed {
-        job_id,
-        reason: "could not determine home directory for path validation".to_string(),
-    })?;
-    let projects_base = home.join(".ironclaw").join("projects");
+    let projects_base = ironclaw_base_dir().join("projects");
+
+    if !projects_base.is_absolute() {
+        return Err(OrchestratorError::ContainerCreationFailed {
+            job_id,
+            reason: "base directory is not absolute; cannot safely validate bind mounts".into(),
+        });
+    }
 
     // Ensure the base exists so canonicalize always succeeds.
     std::fs::create_dir_all(&projects_base).map_err(|e| {
@@ -302,11 +297,9 @@ impl ContainerJobManager {
         let docker = self.docker().await?;
 
         // Build container configuration
-        let orchestrator_host = if cfg!(target_os = "linux") {
-            "172.17.0.1"
-        } else {
-            "host.docker.internal"
-        };
+        // Use host.docker.internal everywhere; Linux resolution is provided by
+        // `extra_hosts: host-gateway` in HostConfig below.
+        let orchestrator_host = "host.docker.internal";
 
         let orchestrator_url = format!(
             "http://{}:{}",
@@ -327,24 +320,13 @@ impl ContainerJobManager {
             env_vec.push("IRONCLAW_WORKSPACE=/workspace".to_string());
         }
 
-        // Claude Code mode: auth + tool allowlist.
-        //
-        // Auth strategies (first match wins):
-        //   1. ANTHROPIC_API_KEY: direct API key (pay-as-you-go billing).
-        //   2. CLAUDE_CODE_OAUTH_TOKEN: OAuth access token from `claude login`
-        //      session, extracted from the host's credential store.
-        if mode == JobMode::ClaudeCode {
-            if let Some(ref api_key) = self.config.claude_code_api_key {
-                env_vec.push(format!("ANTHROPIC_API_KEY={}", api_key));
-            } else if let Some(ref oauth_token) = self.config.claude_code_oauth_token {
-                env_vec.push(format!("CLAUDE_CODE_OAUTH_TOKEN={}", oauth_token));
-            }
-            if !self.config.claude_code_allowed_tools.is_empty() {
-                env_vec.push(format!(
-                    "CLAUDE_CODE_ALLOWED_TOOLS={}",
-                    self.config.claude_code_allowed_tools.join(",")
-                ));
-            }
+        // Claude Code mode: tool allowlist. Authentication is delivered via
+        // per-job credential grants through the orchestrator credentials endpoint.
+        if mode == JobMode::ClaudeCode && !self.config.claude_code_allowed_tools.is_empty() {
+            env_vec.push(format!(
+                "CLAUDE_CODE_ALLOWED_TOOLS={}",
+                self.config.claude_code_allowed_tools.join(",")
+            ));
         }
 
         // Memory limit: Claude Code gets more memory
@@ -617,7 +599,7 @@ mod tests {
 
     #[test]
     fn test_validate_bind_mount_valid_path() {
-        let base = dirs::home_dir().unwrap().join(".ironclaw").join("projects");
+        let base = crate::bootstrap::compute_ironclaw_base_dir().join("projects");
         std::fs::create_dir_all(&base).unwrap();
 
         let test_dir = base.join("test_validate_bind");

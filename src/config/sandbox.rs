@@ -1,6 +1,11 @@
 use crate::config::helpers::{optional_env, parse_bool_env, parse_optional_env, parse_string_env};
 use crate::error::ConfigError;
 
+/// Secret name used to store Claude Code subscription login credentials.
+pub const CLAUDE_CODE_SUBSCRIPTION_SECRET_NAME: &str = "claude_code_subscription_login";
+/// Env var used to pass serialized Claude Code credentials JSON to containers.
+pub const CLAUDE_CODE_CREDENTIALS_ENV_VAR: &str = "CLAUDE_CODE_CREDENTIALS_JSON";
+
 /// Docker sandbox configuration.
 #[derive(Debug, Clone)]
 pub struct SandboxModeConfig {
@@ -84,8 +89,8 @@ impl SandboxModeConfig {
 pub struct ClaudeCodeConfig {
     /// Whether Claude Code sandbox mode is available.
     pub enabled: bool,
-    /// Host directory containing Claude auth config (not mounted into containers;
-    /// auth is handled via ANTHROPIC_API_KEY env var instead).
+    /// Host directory containing Claude auth config (`.credentials.json`).
+    /// Used as a fallback source when importing subscription credentials.
     pub config_dir: std::path::PathBuf,
     /// Claude model to use (e.g. "sonnet", "opus").
     pub model: String,
@@ -159,15 +164,22 @@ impl ClaudeCodeConfig {
         }
     }
 
-    /// Extract the OAuth access token from the host's credential store.
+    /// Extract Claude Code subscription credentials JSON from the host.
     ///
     /// On macOS: reads from Keychain (`Claude Code-credentials` service).
-    /// On Linux: reads from `~/.claude/.credentials.json`.
+    /// On Linux: reads from `~/.claude/.credentials.json` (or configured dir).
     ///
-    /// Returns the access token if found. The token typically expires in
-    /// 8-12 hours, which is sufficient for any single container job.
-    pub fn extract_oauth_token() -> Option<String> {
-        // macOS: extract from Keychain
+    /// Returns the raw JSON only if it contains a Claude OAuth access token.
+    pub fn extract_subscription_credentials_json() -> Option<String> {
+        // Explicit override for hosted/deployed setups.
+        if let Ok(raw) = std::env::var(CLAUDE_CODE_CREDENTIALS_ENV_VAR) {
+            let trimmed = raw.trim();
+            if parse_oauth_access_token(trimmed).is_some() {
+                return Some(trimmed.to_string());
+            }
+        }
+
+        // macOS: extract from Keychain.
         if cfg!(target_os = "macos") {
             match std::process::Command::new("security")
                 .args([
@@ -180,7 +192,10 @@ impl ClaudeCodeConfig {
             {
                 Ok(output) if output.status.success() => {
                     if let Ok(json) = String::from_utf8(output.stdout) {
-                        return parse_oauth_access_token(json.trim());
+                        let trimmed = json.trim();
+                        if parse_oauth_access_token(trimmed).is_some() {
+                            return Some(trimmed.to_string());
+                        }
                     }
                 }
                 Ok(_) => {
@@ -192,22 +207,32 @@ impl ClaudeCodeConfig {
             }
         }
 
-        // Linux / fallback: read from ~/.claude/.credentials.json
-        if let Some(home) = dirs::home_dir() {
-            let creds_path = home.join(".claude").join(".credentials.json");
-            if let Ok(json) = std::fs::read_to_string(&creds_path) {
-                return parse_oauth_access_token(&json);
+        // Linux / fallback: read from config dir/.credentials.json.
+        let creds_path = default_claude_config_dir()
+            .join(".credentials.json")
+            .to_path_buf();
+        if let Ok(json) = std::fs::read_to_string(&creds_path) {
+            let trimmed = json.trim();
+            if parse_oauth_access_token(trimmed).is_some() {
+                return Some(trimmed.to_string());
             }
         }
 
         None
     }
 
+    /// Extract only the OAuth access token from subscription credentials.
+    pub fn extract_oauth_token() -> Option<String> {
+        Self::extract_subscription_credentials_json()
+            .and_then(|json| parse_oauth_access_token(&json))
+    }
+
     pub(crate) fn resolve() -> Result<Self, ConfigError> {
         let defaults = Self::default();
         Ok(Self {
             enabled: parse_bool_env("CLAUDE_CODE_ENABLED", defaults.enabled)?,
-            config_dir: optional_env("CLAUDE_CONFIG_DIR")?
+            config_dir: optional_env("CLAUDE_CODE_CONFIG_DIR")?
+                .or(optional_env("CLAUDE_CONFIG_DIR")?)
                 .map(std::path::PathBuf::from)
                 .unwrap_or(defaults.config_dir),
             model: parse_string_env("CLAUDE_CODE_MODEL", defaults.model)?,
@@ -236,4 +261,20 @@ fn parse_oauth_access_token(json: &str) -> Option<String> {
     creds["claudeAiOauth"]["accessToken"]
         .as_str()
         .map(String::from)
+}
+
+fn default_claude_config_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("CLAUDE_CODE_CONFIG_DIR")
+        && !dir.trim().is_empty()
+    {
+        return std::path::PathBuf::from(dir);
+    }
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR")
+        && !dir.trim().is_empty()
+    {
+        return std::path::PathBuf::from(dir);
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".claude")
 }

@@ -692,6 +692,7 @@ Create alongside the .wasm file to grant capabilities:
                 RespondResult::ToolCalls {
                     tool_calls,
                     content,
+                    assistant_content,
                 } => {
                     tools_executed = true;
 
@@ -699,7 +700,7 @@ Create alongside the .wasm file to grant capabilities:
                     reason_ctx
                         .messages
                         .push(ChatMessage::assistant_with_tool_calls(
-                            content,
+                            assistant_content.or(content),
                             tool_calls.clone(),
                         ));
 

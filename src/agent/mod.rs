@@ -31,8 +31,8 @@ mod thread_ops;
 pub mod undo;
 pub mod worker;
 
-pub(crate) use agent_loop::truncate_for_preview;
 pub use agent_loop::{Agent, AgentDeps};
+pub(crate) use agent_loop::{tool_params_preview, truncate_for_preview};
 pub use compaction::{CompactionResult, ContextCompactor};
 pub use context_monitor::{CompactionStrategy, ContextBreakdown, ContextMonitor};
 pub use heartbeat::{HeartbeatConfig, HeartbeatResult, HeartbeatRunner, spawn_heartbeat};

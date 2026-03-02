@@ -21,6 +21,7 @@ pub mod openai_compat;
 pub mod server;
 pub mod sse;
 pub mod types;
+pub(crate) mod util;
 pub mod ws;
 
 use std::net::SocketAddr;
@@ -301,8 +302,12 @@ impl Channel for GatewayChannel {
                 message: msg,
                 thread_id: thread_id.clone(),
             },
-            StatusUpdate::ToolStarted { name } => SseEvent::ToolStarted {
+            StatusUpdate::ToolStarted {
                 name,
+                params_preview,
+            } => SseEvent::ToolStarted {
+                name,
+                params_preview,
                 thread_id: thread_id.clone(),
             },
             StatusUpdate::ToolCompleted { name, success } => SseEvent::ToolCompleted {

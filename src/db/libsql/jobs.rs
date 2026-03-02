@@ -12,7 +12,7 @@ use super::{
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::JobStore;
 use crate::error::DatabaseError;
-use crate::history::LlmCallRecord;
+use crate::history::{AgentJobRecord, AgentJobSummary, LlmCallRecord};
 
 use chrono::Utc;
 
@@ -174,6 +174,91 @@ impl JobStore for LibSqlBackend {
             }
         }
         Ok(ids)
+    }
+
+    async fn cleanup_stale_agent_jobs(&self) -> Result<u64, DatabaseError> {
+        let conn = self.connect().await?;
+        let now = fmt_ts(&Utc::now());
+        let count = conn
+            .execute(
+                r#"
+                UPDATE agent_jobs SET
+                    status = 'failed',
+                    failure_reason = COALESCE(failure_reason, 'Process restarted'),
+                    completed_at = COALESCE(completed_at, ?1)
+                WHERE source = 'direct' AND status IN ('pending', 'in_progress', 'stuck')
+                "#,
+                params![now],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        if count > 0 {
+            tracing::info!("Marked {} stale direct jobs as failed", count);
+        }
+        Ok(count)
+    }
+
+    async fn list_agent_jobs(&self) -> Result<Vec<AgentJobRecord>, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                r#"
+                SELECT id, title, status, user_id, failure_reason,
+                       created_at, started_at, completed_at
+                FROM agent_jobs WHERE source = 'direct'
+                ORDER BY created_at DESC
+                "#,
+                (),
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut jobs = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            let id_str = get_text(&row, 0);
+            let Ok(id) = id_str.parse() else {
+                tracing::warn!("Skipping agent job with invalid UUID: {}", id_str);
+                continue;
+            };
+            jobs.push(AgentJobRecord {
+                id,
+                title: get_text(&row, 1),
+                status: get_text(&row, 2),
+                user_id: get_text(&row, 3),
+                failure_reason: get_opt_text(&row, 4),
+                created_at: get_ts(&row, 5),
+                started_at: get_opt_ts(&row, 6),
+                completed_at: get_opt_ts(&row, 7),
+            });
+        }
+        Ok(jobs)
+    }
+
+    async fn agent_job_summary(&self) -> Result<AgentJobSummary, DatabaseError> {
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                "SELECT status, COUNT(*) as cnt FROM agent_jobs WHERE source = 'direct' GROUP BY status",
+                (),
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut summary = AgentJobSummary::default();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?
+        {
+            let status = get_text(&row, 0);
+            let count = get_i64(&row, 1) as usize;
+            summary.add_count(&status, count);
+        }
+        Ok(summary)
     }
 
     async fn save_action(&self, job_id: Uuid, action: &ActionRecord) -> Result<(), DatabaseError> {
