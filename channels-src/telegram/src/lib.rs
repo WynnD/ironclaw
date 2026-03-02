@@ -620,7 +620,7 @@ impl Guest for TelegramChannel {
                 );
                 let msg_id = send_message(
                     metadata.chat_id,
-                    &formatted_content,
+                    &response.content,
                     metadata.message_id,
                     None,
                 )
@@ -1537,22 +1537,34 @@ fn normalize_inline_markdown(input: &str) -> String {
                 continue;
             }
             if ch == '_' && next == '_' {
-                out.push('_');
+                out.push('*');
                 idx += 2;
                 continue;
             }
             if ch == '~' && next == '~' {
-                out.push('_');
+                // Strikethrough is not supported in legacy Telegram Markdown.
+                // Keep text and strip markers.
                 idx += 2;
                 continue;
             }
         }
 
+        if should_escape_telegram_markdown(ch, in_inline_code) {
+            out.push('\\');
+        }
         out.push(ch);
         idx += 1;
     }
 
     out
+}
+
+fn should_escape_telegram_markdown(ch: char, in_inline_code: bool) -> bool {
+    if in_inline_code {
+        return matches!(ch, '\\' | '`');
+    }
+
+    matches!(ch, '\\' | '_' | '*' | '`' | '[' | ']' | '(' | ')')
 }
 
 fn collapse_blank_lines(lines: Vec<String>) -> String {
@@ -1797,6 +1809,23 @@ mod tests {
         let input = "| maybe table | maybe not |\nnext line without separator";
         let output = format_markdown_for_telegram(input);
         assert_eq!(output, "| maybe table | maybe not |\nnext line without separator");
+    }
+
+    #[test]
+    fn test_normalize_inline_markdown_escapes_special_characters() {
+        let input = "see [label](https://example.com) and `x_y` plus a*b";
+        let output = normalize_inline_markdown(input);
+        assert_eq!(
+            output,
+            "see \\[label\\]\\(https://example.com\\) and `x_y` plus a\\*b"
+        );
+    }
+
+    #[test]
+    fn test_normalize_inline_markdown_strips_strikethrough_markers() {
+        let input = "~~deprecated~~ value";
+        let output = normalize_inline_markdown(input);
+        assert_eq!(output, "deprecated value");
     }
 
     #[test]
