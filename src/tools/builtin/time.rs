@@ -76,6 +76,20 @@ impl Tool for TimeTool {
                     "unix_millis": dt.timestamp_millis()
                 })
             }
+            "format" => {
+                let timestamp = require_str(&params, "timestamp")?;
+                let fmt = require_str(&params, "format")?;
+
+                let dt: DateTime<Utc> = timestamp.parse().map_err(|e| {
+                    ToolError::InvalidParameters(format!("invalid timestamp: {}", e))
+                })?;
+
+                serde_json::json!({
+                    "formatted": dt.format(fmt).to_string(),
+                    "format": fmt,
+                    "source_iso": dt.to_rfc3339()
+                })
+            }
             "diff" => {
                 let ts1 = require_str(&params, "timestamp")?;
 
@@ -114,5 +128,48 @@ impl Tool for TimeTool {
 
     fn is_core(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_time_format_operation() {
+        let tool = TimeTool;
+        let ctx = JobContext::default();
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "operation": "format",
+                    "timestamp": "2026-03-02T15:04:05Z",
+                    "format": "%Y-%m-%d %H:%M"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("format operation should succeed");
+
+        assert_eq!(result.result["formatted"], "2026-03-02 15:04");
+        assert_eq!(result.result["format"], "%Y-%m-%d %H:%M");
+    }
+
+    #[tokio::test]
+    async fn test_time_format_requires_format_param() {
+        let tool = TimeTool;
+        let ctx = JobContext::default();
+        let err = tool
+            .execute(
+                serde_json::json!({
+                    "operation": "format",
+                    "timestamp": "2026-03-02T15:04:05Z"
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("format without format string should fail");
+
+        assert!(matches!(err, ToolError::InvalidParameters(_)));
     }
 }
