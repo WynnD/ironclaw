@@ -591,11 +591,13 @@ impl Guest for TelegramChannel {
         let metadata: TelegramMessageMetadata = serde_json::from_str(&response.metadata_json)
             .map_err(|e| format!("Failed to parse metadata: {}", e))?;
 
+        let formatted_content = format_markdown_for_telegram(&response.content);
+
         // Try sending with Markdown first; fall back to plain text if Telegram
-        // can't parse the entities (e.g. model leaked <tool_call> with underscores).
+        // can't parse the entities.
         let result = send_message(
             metadata.chat_id,
-            &response.content,
+            &formatted_content,
             metadata.message_id,
             Some("Markdown"),
         );
@@ -1243,6 +1245,381 @@ fn content_to_emit_for_agent(content: &str, bot_username: Option<&str>) -> Optio
     Some(cleaned_text)
 }
 
+fn format_markdown_for_telegram(input: &str) -> String {
+    let normalized = input.replace("\r\n", "\n");
+    let lines: Vec<&str> = normalized.lines().collect();
+
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    let mut output: Vec<String> = Vec::new();
+    let mut idx = 0;
+
+    while idx < lines.len() {
+        if let Some((consumed, code_block)) = try_format_fenced_code_block(&lines[idx..]) {
+            output.push(code_block);
+            idx += consumed;
+            continue;
+        }
+
+        if let Some((consumed, table_lines)) = try_format_markdown_table(&lines[idx..]) {
+            output.extend(table_lines);
+            idx += consumed;
+            continue;
+        }
+
+        output.push(format_markdown_line_for_telegram(lines[idx]));
+        idx += 1;
+    }
+
+    collapse_blank_lines(output)
+}
+
+fn try_format_fenced_code_block(lines: &[&str]) -> Option<(usize, String)> {
+    let first = lines.first()?;
+    if !first.trim_start().starts_with("```") {
+        return None;
+    }
+
+    let mut consumed = 1;
+    let mut code_lines: Vec<&str> = Vec::new();
+    let mut found_closing_fence = false;
+
+    while consumed < lines.len() {
+        let line = lines[consumed];
+        if line.trim_start().starts_with("```") {
+            consumed += 1;
+            found_closing_fence = true;
+            break;
+        }
+        code_lines.push(line);
+        consumed += 1;
+    }
+
+    if !found_closing_fence {
+        consumed = lines.len();
+    }
+
+    let mut rendered = String::from("```\n");
+    if !code_lines.is_empty() {
+        rendered.push_str(&code_lines.join("\n"));
+        rendered.push('\n');
+    }
+    rendered.push_str("```");
+
+    Some((consumed, rendered))
+}
+
+fn try_format_markdown_table(lines: &[&str]) -> Option<(usize, Vec<String>)> {
+    if lines.len() < 2 {
+        return None;
+    }
+
+    let headers = parse_markdown_table_row(lines[0])?;
+    if headers.len() < 2 || !is_markdown_table_separator(lines[1]) {
+        return None;
+    }
+
+    let mut consumed = 2;
+    let mut rows: Vec<Vec<String>> = Vec::new();
+
+    while consumed < lines.len() {
+        let line = lines[consumed];
+        if line.trim().is_empty() {
+            break;
+        }
+
+        let Some(row) = parse_markdown_table_row(line) else {
+            break;
+        };
+
+        if is_markdown_table_separator(line) {
+            break;
+        }
+
+        rows.push(row);
+        consumed += 1;
+    }
+
+    let mut formatted_rows: Vec<String> = rows
+        .iter()
+        .map(|row| format_table_row_for_telegram(&headers, row))
+        .filter(|row| !row.is_empty())
+        .map(|row| format!("- {}", row))
+        .collect();
+
+    if formatted_rows.is_empty() {
+        let fallback = headers
+            .iter()
+            .map(|cell| normalize_inline_markdown(cell))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if !fallback.is_empty() {
+            formatted_rows.push(format!("- {}", fallback));
+        }
+    }
+
+    Some((consumed, formatted_rows))
+}
+
+fn parse_markdown_table_row(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+
+    let mut row = trimmed;
+    if row.starts_with('|') {
+        row = row.trim_start_matches('|');
+    }
+    if row.ends_with('|') {
+        row = row.trim_end_matches('|');
+    }
+
+    let cells: Vec<String> = row.split('|').map(|cell| cell.trim().to_string()).collect();
+    if cells.len() < 2 {
+        return None;
+    }
+
+    Some(cells)
+}
+
+fn is_markdown_table_separator(line: &str) -> bool {
+    let Some(cells) = parse_markdown_table_row(line) else {
+        return false;
+    };
+
+    cells.iter().all(|cell| {
+        let trimmed = cell.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let stripped = trimmed.trim_matches(':');
+        stripped.len() >= 3 && stripped.chars().all(|ch| ch == '-')
+    })
+}
+
+fn format_table_row_for_telegram(headers: &[String], row: &[String]) -> String {
+    let width = std::cmp::max(headers.len(), row.len());
+    let mut parts: Vec<String> = Vec::new();
+
+    for index in 0..width {
+        let cell = row.get(index).map(|v| v.trim()).unwrap_or_default();
+        if cell.is_empty() {
+            continue;
+        }
+
+        let header = headers.get(index).map(|v| v.trim()).unwrap_or_default();
+        let formatted_cell = normalize_inline_markdown(cell);
+
+        if header.is_empty() {
+            parts.push(formatted_cell);
+        } else {
+            parts.push(format!(
+                "*{}:* {}",
+                normalize_inline_markdown(header),
+                formatted_cell
+            ));
+        }
+    }
+
+    parts.join(" | ")
+}
+
+fn format_markdown_line_for_telegram(line: &str) -> String {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if let Some(heading) = strip_markdown_heading(trimmed) {
+        return format!("*{}*", normalize_inline_markdown(heading));
+    }
+
+    if is_markdown_horizontal_rule(trimmed) {
+        return "----------".to_string();
+    }
+
+    if let Some(item) = strip_unordered_list_marker(line) {
+        return format!("- {}", normalize_inline_markdown(item));
+    }
+
+    if let Some((index, item)) = strip_ordered_list_marker(line) {
+        return format!("{}. {}", index, normalize_inline_markdown(item));
+    }
+
+    if let Some(quote) = strip_blockquote_marker(line) {
+        return format!("> {}", normalize_inline_markdown(quote));
+    }
+
+    normalize_inline_markdown(line)
+}
+
+fn strip_markdown_heading(line: &str) -> Option<&str> {
+    let hashes = line.chars().take_while(|ch| *ch == '#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+
+    let content = line[hashes..].trim_start();
+    if content.is_empty() {
+        None
+    } else {
+        Some(content)
+    }
+}
+
+fn is_markdown_horizontal_rule(line: &str) -> bool {
+    let mut marker: Option<char> = None;
+    let mut count = 0;
+
+    for ch in line.chars() {
+        if ch == ' ' {
+            continue;
+        }
+
+        if ch != '-' && ch != '*' && ch != '_' {
+            return false;
+        }
+
+        if let Some(current) = marker {
+            if current != ch {
+                return false;
+            }
+        } else {
+            marker = Some(ch);
+        }
+
+        count += 1;
+    }
+
+    count >= 3
+}
+
+fn strip_unordered_list_marker(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("- ") {
+        return Some(rest.trim_start());
+    }
+    if let Some(rest) = trimmed.strip_prefix("* ") {
+        return Some(rest.trim_start());
+    }
+    if let Some(rest) = trimmed.strip_prefix("+ ") {
+        return Some(rest.trim_start());
+    }
+    None
+}
+
+fn strip_ordered_list_marker(line: &str) -> Option<(String, &str)> {
+    let trimmed = line.trim_start();
+    let dot_idx = trimmed.find(". ")?;
+    if dot_idx == 0 {
+        return None;
+    }
+
+    let number = &trimmed[..dot_idx];
+    if !number.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+
+    let item = trimmed[dot_idx + 2..].trim_start();
+    Some((number.to_string(), item))
+}
+
+fn strip_blockquote_marker(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("> ") {
+        return Some(rest.trim_start());
+    }
+    if let Some(rest) = trimmed.strip_prefix('>') {
+        return Some(rest.trim_start());
+    }
+    None
+}
+
+fn normalize_inline_markdown(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut idx = 0;
+    let mut in_inline_code = false;
+
+    while idx < chars.len() {
+        let ch = chars[idx];
+
+        if ch == '`' {
+            in_inline_code = !in_inline_code;
+            out.push(ch);
+            idx += 1;
+            continue;
+        }
+
+        if !in_inline_code && idx + 1 < chars.len() {
+            let next = chars[idx + 1];
+            if ch == '*' && next == '*' {
+                out.push('*');
+                idx += 2;
+                continue;
+            }
+            if ch == '_' && next == '_' {
+                out.push('*');
+                idx += 2;
+                continue;
+            }
+            if ch == '~' && next == '~' {
+                // Strikethrough is not supported in legacy Telegram Markdown.
+                // Keep text and strip markers.
+                idx += 2;
+                continue;
+            }
+        }
+
+        if should_escape_telegram_markdown(ch, in_inline_code) {
+            out.push('\\');
+        }
+        out.push(ch);
+        idx += 1;
+    }
+
+    out
+}
+
+fn should_escape_telegram_markdown(ch: char, in_inline_code: bool) -> bool {
+    if in_inline_code {
+        return matches!(ch, '\\' | '`');
+    }
+
+    matches!(ch, '\\' | '_' | '*' | '`' | '[' | ']' | '(' | ')')
+}
+
+fn collapse_blank_lines(lines: Vec<String>) -> String {
+    let mut collapsed: Vec<String> = Vec::new();
+    let mut seen_content = false;
+    let mut last_blank = false;
+
+    for line in lines {
+        let is_blank = line.trim().is_empty();
+        if is_blank {
+            if !seen_content || last_blank {
+                continue;
+            }
+            collapsed.push(String::new());
+            last_blank = true;
+            continue;
+        }
+
+        seen_content = true;
+        last_blank = false;
+        collapsed.push(line);
+    }
+
+    while collapsed.last().map(|line| line.is_empty()).unwrap_or(false) {
+        collapsed.pop();
+    }
+
+    collapsed.join("\n")
+}
+
 // ============================================================================
 // Utilities
 // ============================================================================
@@ -1423,6 +1800,57 @@ mod tests {
             content_to_emit_for_agent("@alice hello", Some("MyBot")),
             Some("@alice hello".to_string())
         );
+    }
+
+    #[test]
+    fn test_format_markdown_for_telegram_converts_table_to_bullets() {
+        let input = "## Scores\n\n| Name | Score |\n| --- | --- |\n| Alice | 10 |\n| Bob | **12** |";
+        let output = format_markdown_for_telegram(input);
+        assert_eq!(
+            output,
+            "*Scores*\n\n- *Name:* Alice | *Score:* 10\n- *Name:* Bob | *Score:* *12*"
+        );
+    }
+
+    #[test]
+    fn test_format_markdown_for_telegram_converts_common_blocks() {
+        let input = "# Updates\n- First item\n1. Step one\n> Heads up\n---";
+        let output = format_markdown_for_telegram(input);
+        assert_eq!(
+            output,
+            "*Updates*\n- First item\n1. Step one\n> Heads up\n----------"
+        );
+    }
+
+    #[test]
+    fn test_format_markdown_for_telegram_strips_code_fence_language() {
+        let input = "```rust\nfn main() {}\n```";
+        let output = format_markdown_for_telegram(input);
+        assert_eq!(output, "```\nfn main() {}\n```");
+    }
+
+    #[test]
+    fn test_format_markdown_for_telegram_leaves_non_table_pipes() {
+        let input = "| maybe table | maybe not |\nnext line without separator";
+        let output = format_markdown_for_telegram(input);
+        assert_eq!(output, "| maybe table | maybe not |\nnext line without separator");
+    }
+
+    #[test]
+    fn test_normalize_inline_markdown_escapes_special_characters() {
+        let input = "see [label](https://example.com) and `x_y` plus a*b";
+        let output = normalize_inline_markdown(input);
+        assert_eq!(
+            output,
+            "see \\[label\\]\\(https://example.com\\) and `x_y` plus a\\*b"
+        );
+    }
+
+    #[test]
+    fn test_normalize_inline_markdown_strips_strikethrough_markers() {
+        let input = "~~deprecated~~ value";
+        let output = normalize_inline_markdown(input);
+        assert_eq!(output, "deprecated value");
     }
 
     #[test]
