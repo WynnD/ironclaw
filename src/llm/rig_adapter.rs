@@ -1052,7 +1052,8 @@ fn inject_tools_into_system_prompt(messages: &mut Vec<ChatMessage>, tools: &[Iro
          <|tool_call_argument_begin|>{\"arg\": \"value\"}<|tool_call_end|>\
          <|tool_calls_section_end|>\n\n\
          IMPORTANT: Use the EXACT tool name as listed below (e.g. `time`, not `time_get_current_time`). \
-         The tool name must match exactly.\n\n\
+         The tool name must match exactly.\n\
+         Never claim a tool was called or show tool results unless you emitted a valid tool call block in this response.\n\n\
          Available tools:\n",
     );
 

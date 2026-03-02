@@ -322,7 +322,12 @@ fn create_tinfoil_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvider>, L
     let client = client.completions_api();
     let model = client.completion_model(&tf.model);
     tracing::info!("Using Tinfoil private inference (model: {})", tf.model);
-    Ok(Arc::new(RigAdapter::new(model, &tf.model)))
+    let adapter = RigAdapter::new(model, &tf.model).with_native_transport(
+        TINFOIL_BASE_URL,
+        tf.api_key.expose_secret().to_string(),
+        reqwest::header::HeaderMap::new(),
+    );
+    Ok(Arc::new(adapter))
 }
 
 fn create_openai_compatible_provider(

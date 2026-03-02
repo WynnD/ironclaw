@@ -18,6 +18,8 @@ use crate::safety::SafetyLayer;
 /// The dispatcher should check for this and suppress the message.
 pub const SILENT_REPLY_TOKEN: &str = "NO_REPLY";
 const EMPTY_RESPONSE_FALLBACK: &str = "I'm not sure how to respond to that.";
+const UNVERIFIED_TOOL_CLAIM_FALLBACK: &str =
+    "I couldn't verify an actual tool execution for that step, so I won't invent results.";
 
 /// Process-wide counters for empty-response recovery observability.
 struct EmptyResponseRecoveryStats {
@@ -119,6 +121,20 @@ static FINAL_TAG_RE: LazyLock<Regex> =
 /// Matches pipe-delimited reasoning tags: `<|think|>...<|/think|>` etc.
 static PIPE_REASONING_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)<\|(/?)\s*(?:think(?:ing)?|thought|thoughts|antthinking|reasoning|reflection|scratchpad|inner_monologue)\|>").expect("PIPE_REASONING_TAG_RE")
+});
+
+/// Detects first-person claims that a tool was executed.
+static TOOL_EXECUTION_CLAIM_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:i|we)\s+(?:called|used|ran|invoked|queried|checked|fetched|looked\s+up)\b")
+        .expect("TOOL_EXECUTION_CLAIM_RE")
+});
+
+/// Detects text that presents a tool result as already obtained.
+static TOOL_RESULT_CLAIM_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(?:here(?:'s| is)\s+what\s+(?:it|the tool)\s+returned|tool\s+returned|it\s+returned)\b",
+    )
+    .expect("TOOL_RESULT_CLAIM_RE")
 });
 
 /// Context for reasoning operations.
@@ -627,6 +643,33 @@ Respond in JSON format:
                 });
             }
 
+            // Guardrail: some providers/models occasionally narrate fabricated
+            // tool usage in plain text instead of returning executable tool calls.
+            // If there is no fresh tool-result evidence in context, force one
+            // retry with explicit anti-fabrication instructions.
+            if !has_tool_result_since_last_user(&context.messages)
+                && claims_unverified_tool_execution(&content, &context.available_tools)
+            {
+                tracing::warn!(
+                    content_preview = %crate::llm::rig_adapter::truncate_for_log(&content, 300),
+                    "Detected unverifiable tool-execution claim with no executable tool call; retrying once",
+                );
+                let (retry_result, retry_usage) = self
+                    .recover_unverified_tool_claim(
+                        &messages_for_recovery,
+                        &context.available_tools,
+                        &context.metadata,
+                    )
+                    .await?;
+                usage.input_tokens = usage.input_tokens.saturating_add(retry_usage.input_tokens);
+                usage.output_tokens = usage
+                    .output_tokens
+                    .saturating_add(retry_usage.output_tokens);
+                if let Some(result) = retry_result {
+                    return Ok(RespondOutput { result, usage });
+                }
+            }
+
             // Guard against empty text after cleaning. This can happen
             // when reasoning models (e.g. GLM-5) return chain-of-thought
             // in reasoning_content wrapped in <think> tags and content is
@@ -748,6 +791,91 @@ Respond in JSON format:
                 .fetch_add(1, Ordering::Relaxed);
             Ok((Some(retry_cleaned), retry_usage))
         }
+    }
+
+    /// Retry once when the model claims tool execution but returns no
+    /// executable tool calls.
+    async fn recover_unverified_tool_claim(
+        &self,
+        base_messages: &[ChatMessage],
+        available_tools: &[ToolDefinition],
+        metadata: &std::collections::HashMap<String, String>,
+    ) -> Result<(Option<RespondResult>, TokenUsage), LlmError> {
+        if available_tools.is_empty() {
+            return Ok((None, TokenUsage::default()));
+        }
+
+        let mut retry_messages = base_messages.to_vec();
+        retry_messages.push(ChatMessage::system(
+            "Your previous response claimed tool execution/results without an executable tool call.\n\
+             Do not fabricate tool output.\n\
+             If you need tool data, return executable tool calls only.\n\
+             If you can answer without tools, answer directly and do not claim any tool execution.",
+        ));
+
+        let mut retry_request =
+            ToolCompletionRequest::new(retry_messages, available_tools.to_vec())
+                .with_max_tokens(2048)
+                .with_temperature(0.2)
+                .with_tool_choice("auto");
+        retry_request.metadata = metadata.clone();
+
+        let retry = self.llm.complete_with_tools(retry_request).await?;
+        let retry_usage = TokenUsage {
+            input_tokens: retry.input_tokens,
+            output_tokens: retry.output_tokens,
+        };
+
+        if !retry.tool_calls.is_empty() {
+            let assistant_content = retry.content.clone();
+            let display_content = assistant_content
+                .as_ref()
+                .map(|c| clean_response(c))
+                .filter(|c| !c.is_empty());
+            return Ok((
+                Some(RespondResult::ToolCalls {
+                    tool_calls: retry.tool_calls,
+                    content: display_content,
+                    assistant_content,
+                }),
+                retry_usage,
+            ));
+        }
+
+        let retry_content = retry.content.unwrap_or_default();
+        let (recovered, _) =
+            recover_tool_calls_from_content_with_stats(&retry_content, available_tools);
+        if !recovered.is_empty() {
+            let cleaned = clean_response(&retry_content);
+            return Ok((
+                Some(RespondResult::ToolCalls {
+                    tool_calls: recovered,
+                    content: if cleaned.is_empty() {
+                        None
+                    } else {
+                        Some(cleaned)
+                    },
+                    assistant_content: Some(retry_content),
+                }),
+                retry_usage,
+            ));
+        }
+
+        let cleaned = clean_response(&retry_content);
+        if cleaned.trim().is_empty() {
+            return Ok((None, retry_usage));
+        }
+
+        if claims_unverified_tool_execution(&retry_content, available_tools) {
+            return Ok((
+                Some(RespondResult::Text(
+                    UNVERIFIED_TOOL_CLAIM_FALLBACK.to_string(),
+                )),
+                retry_usage,
+            ));
+        }
+
+        Ok((Some(RespondResult::Text(cleaned)), retry_usage))
     }
 
     fn build_planning_prompt(&self, context: &ReasoningContext) -> String {
@@ -885,6 +1013,7 @@ Example:
 - Narrate only when it helps: multi-step work, sensitive actions, or when the user asks
 - For multi-step tasks, call independent tools in parallel when possible
 - If a tool fails, explain the error briefly and try an alternative approach
+- Never claim a tool was called or show tool results unless this turn includes an executable tool call
 
 ## Safety
 - You have no independent goals. Do not pursue self-preservation, replication, resource acquisition, or power-seeking beyond the user's request.
@@ -1548,6 +1677,41 @@ fn recover_tool_calls_from_content_with_stats(
     }
 
     (calls, stats)
+}
+
+/// Returns true if there's at least one tool-result message after the most
+/// recent user message in the current context.
+fn has_tool_result_since_last_user(messages: &[ChatMessage]) -> bool {
+    for msg in messages.iter().rev() {
+        if msg.role == crate::llm::Role::User {
+            return false;
+        }
+        if msg.role == crate::llm::Role::Tool {
+            return true;
+        }
+    }
+    false
+}
+
+/// Detects unverifiable tool-use claims in plain text.
+///
+/// This is only used when the model returned no executable tool calls, to
+/// avoid passing fabricated "I called X, it returned Y" responses downstream.
+fn claims_unverified_tool_execution(content: &str, available_tools: &[ToolDefinition]) -> bool {
+    if content.trim().is_empty() || available_tools.is_empty() {
+        return false;
+    }
+
+    let lower = content.to_ascii_lowercase();
+    let mentions_tool = lower.contains(" tool")
+        || lower.contains("tool ")
+        || available_tools
+            .iter()
+            .map(|tool| tool.name.to_ascii_lowercase())
+            .any(|tool_name| lower.contains(&tool_name));
+
+    mentions_tool
+        && (TOOL_EXECUTION_CLAIM_RE.is_match(&lower) || TOOL_RESULT_CLAIM_RE.is_match(&lower))
 }
 
 fn is_placeholder_tool_name(name: &str) -> bool {
@@ -2385,6 +2549,123 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_respond_with_tools_retries_unverified_claim_and_recovers_tool_call() {
+        let llm: Arc<dyn LlmProvider> = Arc::new(SequencedLlm::new(
+            Vec::new(),
+            vec![
+                ToolCompletionResponse {
+                    content: Some(
+                        "I called the github_list_pull_requests tool. Here's what it returned."
+                            .to_string(),
+                    ),
+                    tool_calls: Vec::new(),
+                    input_tokens: 5,
+                    output_tokens: 7,
+                    finish_reason: FinishReason::Stop,
+                },
+                ToolCompletionResponse {
+                    content: Some("<|tool_calls_section_begin|><|tool_call_begin|>functions.github_list_pull_requests:0<|tool_call_argument_begin|>{\"repository\":\"WynnD/ironclaw\"}<|tool_call_end|><|tool_calls_section_end|>".to_string()),
+                    tool_calls: Vec::new(),
+                    input_tokens: 3,
+                    output_tokens: 4,
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        ));
+        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: false,
+        }));
+        let reasoning = Reasoning::new(llm, safety);
+        let context = ReasoningContext::new()
+            .with_message(ChatMessage::user("List pull requests"))
+            .with_tools(vec![ToolDefinition {
+                name: "github_list_pull_requests".to_string(),
+                description: "List pull requests for a repository".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "repository": {"type": "string"}
+                    },
+                    "required": ["repository"]
+                }),
+            }]);
+
+        let output = reasoning
+            .respond_with_tools(&context)
+            .await
+            .expect("respond_with_tools should succeed");
+        match output.result {
+            RespondResult::ToolCalls { tool_calls, .. } => {
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].name, "github_list_pull_requests");
+                assert_eq!(
+                    tool_calls[0].arguments,
+                    serde_json::json!({"repository":"WynnD/ironclaw"})
+                );
+            }
+            other => panic!("Expected tool calls, got {:?}", other),
+        }
+        assert_eq!(output.usage.input_tokens, 8);
+        assert_eq!(output.usage.output_tokens, 11);
+    }
+
+    #[tokio::test]
+    async fn test_respond_with_tools_blocks_repeated_unverified_claims() {
+        let llm: Arc<dyn LlmProvider> = Arc::new(SequencedLlm::new(
+            Vec::new(),
+            vec![
+                ToolCompletionResponse {
+                    content: Some(
+                        "I called the github_list_pull_requests tool and got results.".to_string(),
+                    ),
+                    tool_calls: Vec::new(),
+                    input_tokens: 4,
+                    output_tokens: 6,
+                    finish_reason: FinishReason::Stop,
+                },
+                ToolCompletionResponse {
+                    content: Some(
+                        "I used the same tool again. Here is what it returned.".to_string(),
+                    ),
+                    tool_calls: Vec::new(),
+                    input_tokens: 2,
+                    output_tokens: 3,
+                    finish_reason: FinishReason::Stop,
+                },
+            ],
+        ));
+        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: false,
+        }));
+        let reasoning = Reasoning::new(llm, safety);
+        let context = ReasoningContext::new()
+            .with_message(ChatMessage::user("List pull requests"))
+            .with_tools(vec![ToolDefinition {
+                name: "github_list_pull_requests".to_string(),
+                description: "List pull requests for a repository".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "repository": {"type": "string"}
+                    }
+                }),
+            }]);
+
+        let output = reasoning
+            .respond_with_tools(&context)
+            .await
+            .expect("respond_with_tools should succeed");
+        match output.result {
+            RespondResult::Text(text) => assert_eq!(text, UNVERIFIED_TOOL_CLAIM_FALLBACK),
+            other => panic!("Expected text fallback, got {:?}", other),
+        }
+        assert_eq!(output.usage.input_tokens, 6);
+        assert_eq!(output.usage.output_tokens, 9);
+    }
+
     #[test]
     fn test_extract_json() {
         let text = r#"Here's the plan:
@@ -2814,6 +3095,41 @@ That's my plan."#;
         assert_eq!(regions.len(), 1);
         // Unclosed fence extends to EOF
         assert_eq!(regions[0].end, text.len());
+    }
+
+    #[test]
+    fn test_claims_unverified_tool_execution_detects_first_person_claim() {
+        let tools = make_tools(&["github_list_pull_requests"]);
+        let content = "I called the github_list_pull_requests tool. Here's what it returned.";
+        assert!(claims_unverified_tool_execution(content, &tools));
+    }
+
+    #[test]
+    fn test_claims_unverified_tool_execution_ignores_capability_statement() {
+        let tools = make_tools(&["github_list_pull_requests"]);
+        let content = "I can call the github_list_pull_requests tool if you'd like.";
+        assert!(!claims_unverified_tool_execution(content, &tools));
+    }
+
+    #[test]
+    fn test_has_tool_result_since_last_user_true_for_recent_tool_result() {
+        let messages = vec![
+            ChatMessage::user("Check PRs"),
+            ChatMessage::assistant("I'll check that."),
+            ChatMessage::tool_result("call_1", "github_list_pull_requests", "{\"ok\":true}"),
+            ChatMessage::assistant("Tool returned one open PR."),
+        ];
+        assert!(has_tool_result_since_last_user(&messages));
+    }
+
+    #[test]
+    fn test_has_tool_result_since_last_user_false_without_recent_tool_result() {
+        let messages = vec![
+            ChatMessage::user("Check PRs"),
+            ChatMessage::assistant("I'll check that."),
+            ChatMessage::assistant("I called the tool and got results."),
+        ];
+        assert!(!has_tool_result_since_last_user(&messages));
     }
 
     // ---- recover_tool_calls_from_content tests ----
