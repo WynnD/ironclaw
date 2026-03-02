@@ -1509,8 +1509,10 @@ fn recover_tool_calls_from_content_with_stats(
                 Some(name.clone())
             } else {
                 // Fuzzy match: model may invent a more specific name like
-                // "time_get_current_time" for tool "time". Try prefix match.
+                // "time_get_current_time" for tool "time", or prepend
+                // a server namespace like "home_assistant_time".
                 fuzzy_match_tool_name(&name, &tool_names)
+                    .or_else(|| canonical_match_tool_name(&name, &tool_names))
             };
 
             if matched_name.is_none() && is_placeholder_tool_name(&name) {
@@ -1699,6 +1701,19 @@ fn fuzzy_match_tool_name(
         {
             best = Some(tool);
         }
+
+        // Also handle server-prefixed model names, e.g.
+        // "home_assistant_ha_search_entities" for tool "ha_search_entities".
+        if model_name.len() > tool.len()
+            && model_name.ends_with(tool)
+            && model_name
+                .as_bytes()
+                .get(model_name.len().saturating_sub(tool.len() + 1))
+                == Some(&b'_')
+            && best.is_none_or(|b| tool.len() > b.len())
+        {
+            best = Some(tool);
+        }
     }
     if let Some(matched) = best {
         tracing::info!(
@@ -1708,6 +1723,46 @@ fn fuzzy_match_tool_name(
         );
     }
     best.map(|s| s.to_string())
+}
+
+fn canonicalize_tool_token(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut prev_was_sep = false;
+
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_was_sep = false;
+        } else if !prev_was_sep {
+            out.push('_');
+            prev_was_sep = true;
+        }
+    }
+
+    out.trim_matches('_').to_string()
+}
+
+fn canonical_match_tool_name(
+    model_name: &str,
+    tool_names: &std::collections::HashSet<&str>,
+) -> Option<String> {
+    let canonical_model = canonicalize_tool_token(model_name);
+    if canonical_model.is_empty() {
+        return None;
+    }
+
+    for &tool in tool_names {
+        if canonicalize_tool_token(tool) == canonical_model {
+            tracing::info!(
+                model_name = model_name,
+                matched_tool = tool,
+                "Canonical-matched model tool name to registered tool",
+            );
+            return Some(tool.to_string());
+        }
+    }
+
+    None
 }
 
 /// `<tool_call>tool_list</tool_call>` or `<|tool_call|>` in the content field
@@ -3018,6 +3073,33 @@ That's my plan."#;
         // Partial overlap but not at `_` boundary shouldn't match
         // "timer" doesn't start with "time_"
         assert_eq!(fuzzy_match_tool_name("timer", &tools), None);
+    }
+
+    #[test]
+    fn test_fuzzy_match_tool_name_suffix_server_prefix() {
+        let tools: std::collections::HashSet<&str> = ["ha_search_entities", "time"].into();
+        assert_eq!(
+            fuzzy_match_tool_name("home_assistant_ha_search_entities", &tools),
+            Some("ha_search_entities".to_string())
+        );
+    }
+
+    #[test]
+    fn test_canonical_match_tool_name_separator_variants() {
+        let tools: std::collections::HashSet<&str> = ["home-assistant_ha_search_entities"].into();
+        assert_eq!(
+            canonical_match_tool_name("home_assistant_ha_search_entities", &tools),
+            Some("home-assistant_ha_search_entities".to_string())
+        );
+    }
+
+    #[test]
+    fn test_recover_section_delimited_canonical_name_match() {
+        let tools = make_tools(&["home-assistant_ha_search_entities"]);
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>functions.home_assistant_ha_search_entities:2<|tool_call_argument_begin|>{\"query\":\"moisture\",\"domain_filter\":\"sensor\"}<|tool_call_end|><|tool_calls_section_end|>";
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "home-assistant_ha_search_entities");
     }
 
     // ---- clean_response section stripping tests ----
