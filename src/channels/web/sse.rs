@@ -22,6 +22,7 @@ pub struct SseManager {
     tx: broadcast::Sender<SseEvent>,
     connection_count: Arc<AtomicU64>,
     max_connections: u64,
+    next_event_id: Arc<AtomicU64>,
 }
 
 impl SseManager {
@@ -33,6 +34,7 @@ impl SseManager {
             tx,
             connection_count: Arc::new(AtomicU64::new(0)),
             max_connections: MAX_CONNECTIONS,
+            next_event_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -102,9 +104,10 @@ impl SseManager {
             .ok()?;
         let rx = self.tx.subscribe();
 
+        let next_event_id = Arc::clone(&self.next_event_id);
         let stream = BroadcastStream::new(rx)
             .filter_map(|result| result.ok())
-            .map(|event| {
+            .map(move |event| {
                 let data = serde_json::to_string(&event).unwrap_or_default();
                 let event_type = match &event {
                     SseEvent::Response { .. } => "response",
@@ -127,7 +130,8 @@ impl SseManager {
                     SseEvent::Heartbeat => "heartbeat",
                     SseEvent::ExtensionStatus { .. } => "extension_status",
                 };
-                Ok(Event::default().event(event_type).data(data))
+                let event_id = next_event_id.fetch_add(1, Ordering::Relaxed).to_string();
+                Ok(Event::default().id(event_id).event(event_type).data(data))
             });
 
         // Wrap in a stream that decrements on drop

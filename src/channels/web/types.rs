@@ -107,7 +107,11 @@ pub struct ApprovalRequest {
 #[serde(tag = "type")]
 pub enum SseEvent {
     #[serde(rename = "response")]
-    Response { content: String, thread_id: String },
+    Response {
+        content: String,
+        thread_id: String,
+        response_id: String,
+    },
     #[serde(rename = "thinking")]
     Thinking {
         message: String,
@@ -990,6 +994,7 @@ mod tests {
         let sse = SseEvent::Response {
             content: "hello".to_string(),
             thread_id: "t1".to_string(),
+            response_id: "resp-1".to_string(),
         };
         let ws = WsServerMessage::from_sse_event(&sse);
         match ws {
@@ -997,6 +1002,7 @@ mod tests {
                 assert_eq!(event_type, "response");
                 assert_eq!(data["content"], "hello");
                 assert_eq!(data["thread_id"], "t1");
+                assert_eq!(data["response_id"], "resp-1");
             }
             _ => panic!("Expected Event variant"),
         }

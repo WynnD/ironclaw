@@ -30,6 +30,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use uuid::Uuid;
 
 use crate::agent::SessionManager;
 use crate::channels::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
@@ -283,6 +284,7 @@ impl Channel for GatewayChannel {
         self.state.sse.broadcast(SseEvent::Response {
             content: response.content,
             thread_id,
+            response_id: Uuid::new_v4().to_string(),
         });
 
         Ok(())
@@ -384,6 +386,7 @@ impl Channel for GatewayChannel {
         self.state.sse.broadcast(SseEvent::Response {
             content: response.content,
             thread_id: String::new(),
+            response_id: Uuid::new_v4().to_string(),
         });
         Ok(())
     }

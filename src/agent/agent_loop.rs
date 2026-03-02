@@ -17,6 +17,7 @@ use crate::agent::context_monitor::{ContextMonitor, estimate_text_tokens};
 use crate::agent::heartbeat::spawn_heartbeat;
 use crate::agent::routine_engine::{RoutineEngine, spawn_cron_ticker};
 use crate::agent::self_repair::{DefaultSelfRepair, RepairResult, SelfRepair};
+use crate::agent::session::ThreadState;
 use crate::agent::session_manager::SessionManager;
 use crate::agent::submission::{Submission, SubmissionParser, SubmissionResult};
 use crate::agent::{HeartbeatConfig as AgentHeartbeatConfig, Router, Scheduler};
@@ -80,6 +81,25 @@ fn canonicalize_external_thread_id(
 
     let key = format!("{channel}:{user_id}:{external_thread_id}");
     Uuid::new_v5(&Uuid::NAMESPACE_URL, key.as_bytes()).to_string()
+}
+
+fn normalize_approval_submission_for_thread(
+    submission: Submission,
+    original_content: &str,
+    thread_state: Option<ThreadState>,
+) -> Result<Submission, String> {
+    if matches!(submission, Submission::ApprovalResponse { .. })
+        && thread_state != Some(ThreadState::AwaitingApproval)
+    {
+        if original_content.trim_start().starts_with('/') {
+            return Err("Error: No pending approval request.".to_string());
+        }
+        return Ok(Submission::UserInput {
+            content: original_content.to_string(),
+        });
+    }
+
+    Ok(submission)
 }
 
 /// Core dependencies for the agent.
@@ -799,6 +819,25 @@ impl Agent {
             )
             .await;
 
+        // Approval aliases like "yes"/"ok" should only be treated as approval
+        // responses when this thread is actually awaiting approval. Otherwise
+        // they are normal user messages and must not get dropped.
+        if matches!(submission, Submission::ApprovalResponse { .. }) {
+            let thread_state = {
+                let sess = session.lock().await;
+                sess.threads.get(&thread_id).map(|t| t.state)
+            };
+
+            submission = match normalize_approval_submission_for_thread(
+                submission,
+                &message.content,
+                thread_state,
+            ) {
+                Ok(s) => s,
+                Err(msg) => return Ok(Some(msg)),
+            };
+        }
+
         // Auth mode interception: if the thread is awaiting a token, route
         // the message directly to the credential store. Nothing touches
         // logs, turns, history, or compaction.
@@ -933,7 +972,10 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::canonicalize_external_thread_id;
+    use super::normalize_approval_submission_for_thread;
     use super::truncate_for_preview;
+    use crate::agent::session::ThreadState;
+    use crate::agent::submission::Submission;
     use uuid::Uuid;
 
     #[test]
@@ -1021,5 +1063,56 @@ mod tests {
 
         assert_ne!(base, diff_channel);
         assert_ne!(base, diff_user);
+    }
+
+    #[test]
+    fn test_approval_alias_becomes_user_input_when_not_awaiting() {
+        let submission = Submission::ApprovalResponse {
+            approved: true,
+            always: false,
+        };
+        let normalized =
+            normalize_approval_submission_for_thread(submission, "ok", Some(ThreadState::Idle))
+                .expect("should normalize");
+        assert!(matches!(
+            normalized,
+            Submission::UserInput { content } if content == "ok"
+        ));
+    }
+
+    #[test]
+    fn test_approval_alias_kept_when_awaiting() {
+        let submission = Submission::ApprovalResponse {
+            approved: true,
+            always: false,
+        };
+        let normalized = normalize_approval_submission_for_thread(
+            submission.clone(),
+            "yes",
+            Some(ThreadState::AwaitingApproval),
+        )
+        .expect("should preserve approval");
+        assert!(matches!(
+            normalized,
+            Submission::ApprovalResponse {
+                approved: true,
+                always: false
+            }
+        ));
+    }
+
+    #[test]
+    fn test_slash_approval_outside_pending_returns_error() {
+        let submission = Submission::ApprovalResponse {
+            approved: true,
+            always: false,
+        };
+        let err = normalize_approval_submission_for_thread(
+            submission,
+            "/approve",
+            Some(ThreadState::Idle),
+        )
+        .expect_err("slash approval should error without pending request");
+        assert_eq!(err, "Error: No pending approval request.");
     }
 }

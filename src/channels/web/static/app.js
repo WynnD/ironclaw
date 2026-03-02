@@ -14,10 +14,13 @@ let jobEvents = new Map(); // job_id -> Array of events
 let jobListRefreshTimer = null;
 let pairingPollInterval = null;
 const JOB_EVENTS_CAP = 500;
+const SEEN_RESPONSE_IDS_CAP = 1024;
 const MEMORY_SEARCH_QUERY_MAX_LENGTH = 100;
 const WEB_TABS = ['chat', 'memory', 'jobs', 'routines', 'extensions', 'skills', 'settings', 'logs'];
 const WEB_TABS_SET = new Set(WEB_TABS);
 let llmSettingsState = null;
+const seenResponseIds = new Set();
+const seenResponseIdsQueue = [];
 
 function normalizeTabName(tab) {
   if (!tab) return null;
@@ -239,6 +242,15 @@ function connectSSE() {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
     finalizeActivityGroup();
+    if (isDuplicateResponseId(data.response_id)) {
+      enableChatInput();
+      return;
+    }
+    markResponseIdSeen(data.response_id);
+    if (isImmediateDuplicateAssistantMessage(data.content)) {
+      enableChatInput();
+      return;
+    }
     addMessage('assistant', data.content);
     enableChatInput();
     // Refresh thread list so new titles appear after first message
@@ -549,6 +561,34 @@ function appendToLastAssistant(chunk) {
     container.scrollTop = container.scrollHeight;
   } else {
     addMessage('assistant', chunk);
+  }
+}
+
+function isImmediateDuplicateAssistantMessage(content) {
+  const container = document.getElementById('chat-messages');
+  const last = container.lastElementChild;
+  if (!last || !last.classList.contains('assistant')) return false;
+  const previous = (last.getAttribute('data-raw') || last.textContent || '').trim();
+  const next = String(content || '').trim();
+  return previous.length > 0 && previous === next;
+}
+
+function isDuplicateResponseId(responseId) {
+  if (typeof responseId !== 'string') return false;
+  const normalized = responseId.trim();
+  if (!normalized) return false;
+  return seenResponseIds.has(normalized);
+}
+
+function markResponseIdSeen(responseId) {
+  if (typeof responseId !== 'string') return;
+  const normalized = responseId.trim();
+  if (!normalized || seenResponseIds.has(normalized)) return;
+  seenResponseIds.add(normalized);
+  seenResponseIdsQueue.push(normalized);
+  while (seenResponseIdsQueue.length > SEEN_RESPONSE_IDS_CAP) {
+    const oldest = seenResponseIdsQueue.shift();
+    if (oldest) seenResponseIds.delete(oldest);
   }
 }
 
