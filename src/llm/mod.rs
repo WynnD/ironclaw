@@ -45,6 +45,120 @@ use secrecy::ExposeSecret;
 use crate::config::{LlmBackend, LlmConfig, NearAiConfig};
 use crate::error::LlmError;
 
+const KIMI_K25_DEFAULT_FALLBACK_MODEL: &str = "MiniMaxAI/MiniMax-M2.5";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailoverModelSource {
+    Configured,
+    AutoKimiPolicy,
+}
+
+fn normalize_model_id(model: &str) -> String {
+    model.trim().to_ascii_lowercase()
+}
+
+fn is_kimi_k2_5_model_id(model: &str) -> bool {
+    let normalized = normalize_model_id(model);
+    normalized.contains("kimi-k2.5")
+        || normalized.contains("kimi-k2-5")
+        || normalized.contains("kimi-k2p5")
+}
+
+fn active_backend_model(config: &LlmConfig) -> Option<&str> {
+    match config.backend {
+        LlmBackend::NearAi => Some(&config.nearai.model),
+        LlmBackend::OpenAi => config.openai.as_ref().map(|c| c.model.as_str()),
+        LlmBackend::Anthropic => config.anthropic.as_ref().map(|c| c.model.as_str()),
+        LlmBackend::Ollama => config.ollama.as_ref().map(|c| c.model.as_str()),
+        LlmBackend::OpenAiCompatible => config.openai_compatible.as_ref().map(|c| c.model.as_str()),
+        LlmBackend::Tinfoil => config.tinfoil.as_ref().map(|c| c.model.as_str()),
+    }
+}
+
+fn resolved_failover_model(config: &LlmConfig) -> Option<(String, FailoverModelSource)> {
+    if let Some(ref configured) = config.nearai.fallback_model {
+        return Some((configured.clone(), FailoverModelSource::Configured));
+    }
+
+    // OpenAI-compatible Kimi K2.5 stability policy:
+    // if this model is selected and no explicit fallback is configured,
+    // automatically fail over to MiniMax M2.5.
+    if config.backend == LlmBackend::OpenAiCompatible
+        && let Some(primary_model) = config.openai_compatible.as_ref().map(|c| c.model.as_str())
+        && is_kimi_k2_5_model_id(primary_model)
+    {
+        return Some((
+            KIMI_K25_DEFAULT_FALLBACK_MODEL.to_string(),
+            FailoverModelSource::AutoKimiPolicy,
+        ));
+    }
+
+    None
+}
+
+fn create_backend_fallback_provider(
+    config: &LlmConfig,
+    session: Arc<SessionManager>,
+    fallback_model: &str,
+) -> Result<Arc<dyn LlmProvider>, LlmError> {
+    let mut fallback_config = config.clone();
+
+    match fallback_config.backend {
+        LlmBackend::NearAi => {
+            fallback_config.nearai.model = fallback_model.to_string();
+        }
+        LlmBackend::OpenAi => {
+            let Some(ref mut openai) = fallback_config.openai else {
+                return Err(LlmError::RequestFailed {
+                    provider: "openai".to_string(),
+                    reason: "OpenAI backend selected but OpenAI config is missing".to_string(),
+                });
+            };
+            openai.model = fallback_model.to_string();
+        }
+        LlmBackend::Anthropic => {
+            let Some(ref mut anthropic) = fallback_config.anthropic else {
+                return Err(LlmError::RequestFailed {
+                    provider: "anthropic".to_string(),
+                    reason: "Anthropic backend selected but Anthropic config is missing"
+                        .to_string(),
+                });
+            };
+            anthropic.model = fallback_model.to_string();
+        }
+        LlmBackend::Ollama => {
+            let Some(ref mut ollama) = fallback_config.ollama else {
+                return Err(LlmError::RequestFailed {
+                    provider: "ollama".to_string(),
+                    reason: "Ollama backend selected but Ollama config is missing".to_string(),
+                });
+            };
+            ollama.model = fallback_model.to_string();
+        }
+        LlmBackend::OpenAiCompatible => {
+            let Some(ref mut compat) = fallback_config.openai_compatible else {
+                return Err(LlmError::RequestFailed {
+                    provider: "openai_compatible".to_string(),
+                    reason: "OpenAI-compatible backend selected but compatible config is missing"
+                        .to_string(),
+                });
+            };
+            compat.model = fallback_model.to_string();
+        }
+        LlmBackend::Tinfoil => {
+            let Some(ref mut tinfoil) = fallback_config.tinfoil else {
+                return Err(LlmError::RequestFailed {
+                    provider: "tinfoil".to_string(),
+                    reason: "Tinfoil backend selected but Tinfoil config is missing".to_string(),
+                });
+            };
+            tinfoil.model = fallback_model.to_string();
+        }
+    }
+
+    create_llm_provider(&fallback_config, session)
+}
+
 /// Create an LLM provider based on configuration.
 ///
 /// - `NearAi` backend: Uses session manager for authentication (Responses API)
@@ -370,20 +484,40 @@ pub fn build_provider_chain(
     };
 
     // 3. Failover
-    let llm: Arc<dyn LlmProvider> = if let Some(ref fallback_model) = config.nearai.fallback_model {
-        if fallback_model == &config.nearai.model {
+    let llm: Arc<dyn LlmProvider> = if let Some((fallback_model, fallback_source)) =
+        resolved_failover_model(config)
+    {
+        if let Some(primary_model) = active_backend_model(config)
+            && normalize_model_id(primary_model) == normalize_model_id(&fallback_model)
+        {
             tracing::warn!(
-                "fallback_model is the same as primary model, failover may not be effective"
+                primary_model = primary_model,
+                fallback_model = fallback_model,
+                "fallback model is the same as primary model, failover may not be effective"
             );
         }
-        let mut fallback_config = config.nearai.clone();
-        fallback_config.model = fallback_model.clone();
-        let fallback = create_llm_provider_with_config(&fallback_config, session.clone())?;
-        tracing::info!(
-            primary = %llm.model_name(),
-            fallback = %fallback.model_name(),
-            "LLM failover enabled"
-        );
+
+        let fallback = create_backend_fallback_provider(config, session.clone(), &fallback_model)?;
+
+        match fallback_source {
+            FailoverModelSource::Configured => {
+                tracing::info!(
+                    backend = %config.backend,
+                    primary = %llm.model_name(),
+                    fallback = %fallback.model_name(),
+                    "LLM failover enabled"
+                );
+            }
+            FailoverModelSource::AutoKimiPolicy => {
+                tracing::info!(
+                    backend = %config.backend,
+                    primary = %llm.model_name(),
+                    fallback = %fallback.model_name(),
+                    "LLM failover enabled via automatic Kimi policy"
+                );
+            }
+        }
+
         let fallback: Arc<dyn LlmProvider> = if retry_config.max_retries > 0 {
             Arc::new(RetryProvider::new(fallback, retry_config.clone()))
         } else {
@@ -449,7 +583,7 @@ pub fn build_provider_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{LlmBackend, NearAiConfig};
+    use crate::config::{LlmBackend, NearAiConfig, OpenAiCompatibleConfig};
     use std::path::PathBuf;
 
     fn test_nearai_config() -> NearAiConfig {
@@ -483,6 +617,18 @@ mod tests {
             openai_compatible: None,
             tinfoil: None,
         }
+    }
+
+    fn test_openai_compatible_llm_config(model: &str) -> LlmConfig {
+        let mut config = test_llm_config();
+        config.backend = LlmBackend::OpenAiCompatible;
+        config.openai_compatible = Some(OpenAiCompatibleConfig {
+            base_url: "https://inference.baseten.co/v1".to_string(),
+            api_key: None,
+            model: model.to_string(),
+            extra_headers: Vec::new(),
+        });
+        config
     }
 
     #[test]
@@ -520,5 +666,48 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_resolved_failover_model_prefers_configured_model() {
+        let mut config = test_openai_compatible_llm_config("moonshotai/Kimi-K2.5");
+        config.nearai.fallback_model = Some("configured/fallback".to_string());
+
+        let resolved = resolved_failover_model(&config).expect("fallback should be resolved");
+        assert_eq!(resolved.0, "configured/fallback");
+        assert_eq!(resolved.1, FailoverModelSource::Configured);
+    }
+
+    #[test]
+    fn test_resolved_failover_model_auto_kimi_policy() {
+        let config = test_openai_compatible_llm_config("moonshotai/Kimi-K2.5");
+
+        let resolved = resolved_failover_model(&config).expect("fallback should be resolved");
+        assert_eq!(resolved.0, KIMI_K25_DEFAULT_FALLBACK_MODEL);
+        assert_eq!(resolved.1, FailoverModelSource::AutoKimiPolicy);
+    }
+
+    #[test]
+    fn test_resolved_failover_model_auto_kimi_policy_alias() {
+        let config = test_openai_compatible_llm_config("kimi-k2-5");
+
+        let resolved = resolved_failover_model(&config).expect("fallback should be resolved");
+        assert_eq!(resolved.0, KIMI_K25_DEFAULT_FALLBACK_MODEL);
+        assert_eq!(resolved.1, FailoverModelSource::AutoKimiPolicy);
+    }
+
+    #[test]
+    fn test_resolved_failover_model_auto_kimi_policy_alias_compact() {
+        let config = test_openai_compatible_llm_config("kimi-k2p5");
+
+        let resolved = resolved_failover_model(&config).expect("fallback should be resolved");
+        assert_eq!(resolved.0, KIMI_K25_DEFAULT_FALLBACK_MODEL);
+        assert_eq!(resolved.1, FailoverModelSource::AutoKimiPolicy);
+    }
+
+    #[test]
+    fn test_resolved_failover_model_none_for_non_kimi_model() {
+        let config = test_openai_compatible_llm_config("moonshotai/Kimi-K2");
+        assert!(resolved_failover_model(&config).is_none());
     }
 }

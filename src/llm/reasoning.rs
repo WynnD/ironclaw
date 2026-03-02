@@ -264,7 +264,14 @@ pub enum RespondResult {
     /// include explanatory text alongside tool calls).
     ToolCalls {
         tool_calls: Vec<ToolCall>,
+        /// User-visible content (already cleaned/sanitized for display).
         content: Option<String>,
+        /// Raw assistant content to store in tool-turn context.
+        ///
+        /// This may include hidden `<thinking>...</thinking>` blocks that are
+        /// stripped from `content` but should be preserved in context for
+        /// interleaved-thinking models.
+        assistant_content: Option<String>,
     },
 }
 
@@ -566,10 +573,16 @@ Respond in JSON format:
 
             // If there were tool calls, return them for execution
             if !response.tool_calls.is_empty() {
+                let assistant_content = response.content.clone();
+                let display_content = assistant_content
+                    .as_ref()
+                    .map(|c| clean_response(c))
+                    .filter(|c| !c.is_empty());
                 return Ok(RespondOutput {
                     result: RespondResult::ToolCalls {
                         tool_calls: response.tool_calls,
-                        content: response.content.map(|c| clean_response(&c)),
+                        content: display_content,
+                        assistant_content,
                     },
                     usage,
                 });
@@ -608,6 +621,7 @@ Respond in JSON format:
                         } else {
                             Some(cleaned)
                         },
+                        assistant_content: Some(content),
                     },
                     usage,
                 });

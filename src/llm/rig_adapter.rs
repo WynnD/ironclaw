@@ -207,6 +207,15 @@ fn is_kimi_k2_5_model(model_name: &str) -> bool {
         || model.contains("moonshotai/kimi-k2.5")
 }
 
+fn is_kimi_k2_thinking_model(model_name: &str) -> bool {
+    let model = model_name.to_ascii_lowercase();
+    model.contains("kimi-k2-thinking") || model.contains("moonshotai/kimi-k2-thinking")
+}
+
+fn is_kimi_interleaved_thinking_model(model_name: &str) -> bool {
+    is_kimi_k2_5_model(model_name) || is_kimi_k2_thinking_model(model_name)
+}
+
 fn should_use_strict_tool_schema(model_name: &str) -> bool {
     // Gemini (including OpenRouter `google/gemini-*` models) has stricter
     // function-schema validation and is not compatible with our OpenAI strict
@@ -691,7 +700,12 @@ fn extract_response(
                     arguments: tc.function.arguments.clone(),
                 });
             }
-            // Reasoning and Image variants are not mapped to IronClaw types
+            AssistantContent::Reasoning(r) => {
+                if !r.reasoning.is_empty() {
+                    text_parts.push(format!("<thinking>{}</thinking>", r.reasoning.join("\n")));
+                }
+            }
+            // Image variant is not mapped to IronClaw types
             _ => {}
         }
     }
@@ -853,7 +867,7 @@ impl<M: CompletionModel + Send + Sync + 'static> RigAdapter<M> {
         let tools_json: Vec<JsonValue> = tools
             .iter()
             .map(|t| {
-                let params = simplify_schema_kimi_compat(&normalize_schema_lenient(&t.parameters));
+                let params = normalize_tool_parameters_for_model(&self.model_name, &t.parameters);
                 serde_json::json!({
                     "type": "function",
                     "function": {
@@ -1105,6 +1119,49 @@ fn inject_tools_into_system_prompt(messages: &mut Vec<ChatMessage>, tools: &[Iro
     }
 }
 
+/// Split hidden `<thinking>...</thinking>` blocks from assistant content.
+///
+/// Returns `(visible_content, reasoning_content)` where reasoning content is
+/// joined with newlines if multiple blocks are present.
+fn split_hidden_thinking(content: &str) -> (String, Option<String>) {
+    let mut visible = String::new();
+    let mut reasoning_parts: Vec<String> = Vec::new();
+    let mut cursor = content;
+
+    const OPEN: &str = "<thinking>";
+    const CLOSE: &str = "</thinking>";
+
+    loop {
+        let Some(open_idx) = cursor.find(OPEN) else {
+            visible.push_str(cursor);
+            break;
+        };
+
+        visible.push_str(&cursor[..open_idx]);
+        let after_open = &cursor[open_idx + OPEN.len()..];
+
+        let Some(close_rel) = after_open.find(CLOSE) else {
+            // Malformed tail: keep it as visible content.
+            visible.push_str(&cursor[open_idx..]);
+            break;
+        };
+
+        let reasoning = &after_open[..close_rel];
+        if !reasoning.trim().is_empty() {
+            reasoning_parts.push(reasoning.to_string());
+        }
+        cursor = &after_open[close_rel + CLOSE.len()..];
+    }
+
+    let reasoning_content = if reasoning_parts.is_empty() {
+        None
+    } else {
+        Some(reasoning_parts.join("\n"))
+    };
+
+    (visible, reasoning_content)
+}
+
 /// Build OpenAI-format messages with plain string content (not array).
 fn build_native_messages(messages: &[ChatMessage]) -> Vec<JsonValue> {
     let mut out = Vec::new();
@@ -1123,6 +1180,7 @@ fn build_native_messages(messages: &[ChatMessage]) -> Vec<JsonValue> {
                 }));
             }
             crate::llm::Role::Assistant => {
+                let (visible_content, reasoning_content) = split_hidden_thinking(&msg.content);
                 if let Some(ref tool_calls) = msg.tool_calls {
                     let tc_json: Vec<JsonValue> = tool_calls
                         .iter()
@@ -1143,21 +1201,29 @@ fn build_native_messages(messages: &[ChatMessage]) -> Vec<JsonValue> {
                             })
                         })
                         .collect();
-                    let content: JsonValue = if msg.content.is_empty() {
+                    let content: JsonValue = if visible_content.is_empty() {
                         JsonValue::Null
                     } else {
-                        JsonValue::String(msg.content.clone())
+                        JsonValue::String(visible_content)
                     };
-                    out.push(serde_json::json!({
+                    let mut payload = serde_json::json!({
                         "role": "assistant",
                         "content": content,
                         "tool_calls": tc_json,
-                    }));
+                    });
+                    if let Some(reasoning) = reasoning_content {
+                        payload["reasoning_content"] = JsonValue::String(reasoning);
+                    }
+                    out.push(payload);
                 } else {
-                    out.push(serde_json::json!({
+                    let mut payload = serde_json::json!({
                         "role": "assistant",
-                        "content": msg.content,
-                    }));
+                        "content": visible_content,
+                    });
+                    if let Some(reasoning) = reasoning_content {
+                        payload["reasoning_content"] = JsonValue::String(reasoning);
+                    }
+                    out.push(payload);
                 }
             }
             crate::llm::Role::Tool => {
@@ -1191,7 +1257,8 @@ fn parse_native_tool_response(
         })?;
 
     let message = &choice["message"];
-    let content = message["content"].as_str().map(String::from);
+    let message_content = message["content"].as_str().map(String::from);
+    let reasoning_content = message["reasoning_content"].as_str().map(String::from);
 
     let mut tool_calls = Vec::new();
     if let Some(tcs) = message["tool_calls"].as_array() {
@@ -1209,6 +1276,17 @@ fn parse_native_tool_response(
             });
         }
     }
+
+    let content = match (message_content, reasoning_content) {
+        // Keep reasoning in hidden tags so we can preserve it in context without
+        // exposing chain-of-thought to users.
+        (Some(content), Some(reasoning)) => {
+            Some(format!("{content}\n<thinking>{reasoning}</thinking>"))
+        }
+        (Some(content), None) => Some(content),
+        (None, Some(reasoning)) => Some(format!("<thinking>{reasoning}</thinking>")),
+        (None, None) => None,
+    };
 
     let finish_reason = if !tool_calls.is_empty() {
         FinishReason::ToolUse
@@ -1306,88 +1384,118 @@ where
         let mut messages = request.messages;
         crate::llm::provider::sanitize_tool_messages(&mut messages);
 
-        // K2.5 with native transport: bypass rig-core's array content serialization.
-        // vLLM/SGLang choke on [{"type":"text","text":"..."}] when tools are present.
-        if is_kimi_k2_5_model(&self.model_name) && self.native_transport.is_some() {
-            // Try full tools via native transport
-            match self
-                .send_kimi_native_tool_request(
-                    &messages,
-                    &request.tools,
-                    request.tool_choice.as_deref(),
-                    request.temperature,
-                    request.max_tokens,
-                )
-                .await
-            {
-                Ok(mut resp) => {
-                    normalize_tool_calls(&mut resp.tool_calls, &known_tool_names);
-                    return Ok(resp);
+        // Interleaved-thinking Kimi models: bypass rig-core's array content
+        // serialization for tool rounds, because these endpoints expect plain
+        // string content and emit reasoning in a provider-specific field.
+        if is_kimi_interleaved_thinking_model(&self.model_name) && self.native_transport.is_some() {
+            // K2-thinking: use native transport to preserve interleaved reasoning,
+            // but otherwise keep default behavior. If native call fails, fall
+            // through to the standard provider path below.
+            if is_kimi_k2_thinking_model(&self.model_name) {
+                match self
+                    .send_kimi_native_tool_request(
+                        &messages,
+                        &request.tools,
+                        request.tool_choice.as_deref(),
+                        request.temperature,
+                        request.max_tokens,
+                    )
+                    .await
+                {
+                    Ok(mut resp) => {
+                        normalize_tool_calls(&mut resp.tool_calls, &known_tool_names);
+                        return Ok(resp);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            model = %self.model_name,
+                            error = %e,
+                            "Kimi K2-thinking native transport failed; falling back to standard provider path"
+                        );
+                    }
                 }
-                Err(e) if is_server_error_retryable_for_kimi(&e.to_string()) => {
-                    tracing::warn!(
-                        model = %self.model_name,
-                        tools = request.tools.len(),
-                        error = %e,
-                        "K2.5 native transport hit 500; trying reduced tools"
-                    );
+            } else {
+                // K2.5 retains its existing resilience policy.
+                // Try full tools via native transport.
+                match self
+                    .send_kimi_native_tool_request(
+                        &messages,
+                        &request.tools,
+                        request.tool_choice.as_deref(),
+                        request.temperature,
+                        request.max_tokens,
+                    )
+                    .await
+                {
+                    Ok(mut resp) => {
+                        normalize_tool_calls(&mut resp.tool_calls, &known_tool_names);
+                        return Ok(resp);
+                    }
+                    Err(e) if is_server_error_retryable_for_kimi(&e.to_string()) => {
+                        tracing::warn!(
+                            model = %self.model_name,
+                            tools = request.tools.len(),
+                            error = %e,
+                            "K2.5 native transport hit 500; trying reduced tools"
+                        );
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
+
+                // Try reduced tools via native transport.
+                let reduced_tools = kimi_reduced_tool_set(&request.tools);
+                match self
+                    .send_kimi_native_tool_request(
+                        &messages,
+                        &reduced_tools,
+                        request.tool_choice.as_deref(),
+                        request.temperature,
+                        request.max_tokens,
+                    )
+                    .await
+                {
+                    Ok(mut resp) => {
+                        normalize_tool_calls(&mut resp.tool_calls, &known_tool_names);
+                        return Ok(resp);
+                    }
+                    Err(e) if is_server_error_retryable_for_kimi(&e.to_string()) => {
+                        tracing::warn!(
+                            model = %self.model_name,
+                            "K2.5 native reduced tools also failed; falling back to no tools"
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
+
+                // Fall back to text-based tool calling via native transport.
+                // Inject tool definitions into the system prompt so the model can
+                // still call tools using its native section-delimited format.
+                // The reasoning layer's recover_tool_calls_from_content() handles parsing.
+                //
+                // We use the native transport (string content) instead of rig-core
+                // (array content `[{"type":"text","text":"..."}]`) because K2.5 on
+                // vLLM/SGLang produces empty or think-only responses with array content.
+                let mut text_tool_messages = messages.clone();
+                inject_tools_into_system_prompt(&mut text_tool_messages, &request.tools);
+                tracing::info!(
+                    model = %self.model_name,
+                    tools = request.tools.len(),
+                    "K2.5 falling back to text-based tool calling via native transport (tools in system prompt)"
+                );
+
+                let mut resp = self
+                    .send_kimi_native_text_tool_request(
+                        &text_tool_messages,
+                        request.temperature,
+                        request.max_tokens,
+                    )
+                    .await?;
+                normalize_tool_calls(&mut resp.tool_calls, &known_tool_names);
+                return Ok(resp);
             }
-
-            // Try reduced tools via native transport
-            let reduced_tools = kimi_reduced_tool_set(&request.tools);
-            match self
-                .send_kimi_native_tool_request(
-                    &messages,
-                    &reduced_tools,
-                    request.tool_choice.as_deref(),
-                    request.temperature,
-                    request.max_tokens,
-                )
-                .await
-            {
-                Ok(mut resp) => {
-                    normalize_tool_calls(&mut resp.tool_calls, &known_tool_names);
-                    return Ok(resp);
-                }
-                Err(e) if is_server_error_retryable_for_kimi(&e.to_string()) => {
-                    tracing::warn!(
-                        model = %self.model_name,
-                        "K2.5 native reduced tools also failed; falling back to no tools"
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-
-            // Fall back to text-based tool calling via native transport.
-            // Inject tool definitions into the system prompt so the model can
-            // still call tools using its native section-delimited format.
-            // The reasoning layer's recover_tool_calls_from_content() handles parsing.
-            //
-            // We use the native transport (string content) instead of rig-core
-            // (array content `[{"type":"text","text":"..."}]`) because K2.5 on
-            // vLLM/SGLang produces empty or think-only responses with array content.
-            let mut text_tool_messages = messages.clone();
-            inject_tools_into_system_prompt(&mut text_tool_messages, &request.tools);
-            tracing::info!(
-                model = %self.model_name,
-                tools = request.tools.len(),
-                "K2.5 falling back to text-based tool calling via native transport (tools in system prompt)"
-            );
-
-            let mut resp = self
-                .send_kimi_native_text_tool_request(
-                    &text_tool_messages,
-                    request.temperature,
-                    request.max_tokens,
-                )
-                .await?;
-            normalize_tool_calls(&mut resp.tool_calls, &known_tool_names);
-            return Ok(resp);
         }
 
-        // Standard rig-core path (non-K2.5 or K2.5 without native transport)
+        // Standard rig-core path (non-interleaved models, or native fallback).
         let (preamble, history) = convert_messages(&messages);
         let tools = convert_tools(&self.model_name, &request.tools);
         let tool_choice = convert_tool_choice(request.tool_choice.as_deref());
@@ -1834,6 +1942,72 @@ mod tests {
         assert!(!is_server_error_retryable_for_kimi(
             "HttpError: Invalid status code 400 Bad Request"
         ));
+    }
+
+    #[test]
+    fn test_is_kimi_interleaved_thinking_model() {
+        assert!(is_kimi_interleaved_thinking_model("moonshotai/kimi-k2.5"));
+        assert!(is_kimi_interleaved_thinking_model("kimi-k2.5"));
+        assert!(is_kimi_interleaved_thinking_model("kimi-k2-5"));
+        assert!(is_kimi_interleaved_thinking_model("kimi-k2p5"));
+        assert!(is_kimi_interleaved_thinking_model(
+            "moonshotai/kimi-k2-thinking"
+        ));
+        assert!(is_kimi_k2_thinking_model("kimi-k2-thinking"));
+        assert!(!is_kimi_interleaved_thinking_model("moonshotai/kimi-k2"));
+    }
+
+    #[test]
+    fn test_split_hidden_thinking() {
+        let (visible, reasoning) = split_hidden_thinking(
+            "Visible content<thinking>first thought</thinking>\n<thinking>second thought</thinking>",
+        );
+        assert_eq!(visible, "Visible content\n");
+        assert_eq!(reasoning, Some("first thought\nsecond thought".to_string()));
+    }
+
+    #[test]
+    fn test_parse_native_tool_response_wraps_reasoning_hidden() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "I'll use tools.",
+                    "reasoning_content": "Need current date and web search",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "time",
+                            "arguments": "{}"
+                        }
+                    }]
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5
+            }
+        })
+        .to_string();
+
+        let parsed = parse_native_tool_response("moonshotai/kimi-k2-thinking", &body)
+            .expect("response should parse");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        let content = parsed.content.expect("content should be present");
+        assert!(content.contains("I'll use tools."));
+        assert!(content.contains("<thinking>Need current date and web search</thinking>"));
+    }
+
+    #[test]
+    fn test_build_native_messages_exposes_reasoning_content_field() {
+        let messages = vec![ChatMessage::assistant(
+            "Visible reply<thinking>hidden reasoning</thinking>",
+        )];
+
+        let out = build_native_messages(&messages);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["role"], "assistant");
+        assert_eq!(out[0]["content"], "Visible reply");
+        assert_eq!(out[0]["reasoning_content"], "hidden reasoning");
     }
 
     #[test]

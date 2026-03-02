@@ -449,6 +449,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     RespondResult::ToolCalls {
                         tool_calls,
                         content,
+                        assistant_content,
                     } => {
                         // Model returned tool calls - execute them
                         tracing::debug!(
@@ -471,7 +472,7 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                         reason_ctx
                             .messages
                             .push(ChatMessage::assistant_with_tool_calls(
-                                content,
+                                assistant_content.or(content),
                                 tool_calls.clone(),
                             ));
 

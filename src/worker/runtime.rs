@@ -284,6 +284,7 @@ Work independently to complete this job. Report when done."#,
                     RespondResult::ToolCalls {
                         tool_calls,
                         content,
+                        assistant_content,
                     } => {
                         if let Some(ref text) = content {
                             self.post_event(
@@ -300,7 +301,7 @@ Work independently to complete this job. Report when done."#,
                         reason_ctx
                             .messages
                             .push(ChatMessage::assistant_with_tool_calls(
-                                content,
+                                assistant_content.or(content),
                                 tool_calls.clone(),
                             ));
 

@@ -374,11 +374,12 @@ impl Agent {
                 RespondResult::ToolCalls {
                     tool_calls,
                     content,
+                    assistant_content,
                 } => {
                     // Add the assistant message with tool_calls to context.
                     // OpenAI protocol requires this before tool-result messages.
                     context_messages.push(ChatMessage::assistant_with_tool_calls(
-                        content,
+                        assistant_content.or(content),
                         tool_calls.clone(),
                     ));
 
