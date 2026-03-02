@@ -660,13 +660,17 @@ fn extract_tar_gz(
     #[cfg(any(unix, target_os = "redox"))]
     archive.set_unpack_xattrs(false);
 
-    // 100 MB cap on decompressed entry size to prevent decompression bombs
+    // Defense-in-depth limits for compressed bundles.
     const MAX_ENTRY_SIZE: u64 = 100 * 1024 * 1024;
+    const MAX_TOTAL_EXTRACTED_SIZE: u64 = 128 * 1024 * 1024;
+    const MAX_ENTRY_COUNT: u64 = 2_048;
 
     let wasm_filename = format!("{}.wasm", name);
     let caps_filename = format!("{}.capabilities.json", name);
     let mut found_wasm = false;
     let mut found_caps = false;
+    let mut entry_count = 0_u64;
+    let mut total_extracted_size = 0_u64;
 
     let entries = archive
         .entries()
@@ -676,18 +680,42 @@ fn extract_tar_gz(
         })?;
 
     for entry in entries {
+        entry_count += 1;
+        if entry_count > MAX_ENTRY_COUNT {
+            return Err(RegistryError::DownloadFailed {
+                url: url.to_string(),
+                reason: format!("archive has too many entries (max {})", MAX_ENTRY_COUNT),
+            });
+        }
+
         let mut entry = entry.map_err(|e| RegistryError::DownloadFailed {
             url: url.to_string(),
             reason: format!("failed to read tar.gz entry: {}", e),
         })?;
 
-        if entry.size() > MAX_ENTRY_SIZE {
+        let entry_size = entry.size();
+        if entry_size > MAX_ENTRY_SIZE {
             return Err(RegistryError::DownloadFailed {
                 url: url.to_string(),
                 reason: format!(
                     "archive entry too large ({} bytes, max {} bytes)",
-                    entry.size(),
-                    MAX_ENTRY_SIZE
+                    entry_size, MAX_ENTRY_SIZE
+                ),
+            });
+        }
+
+        total_extracted_size = total_extracted_size
+            .checked_add(entry_size)
+            .ok_or_else(|| RegistryError::DownloadFailed {
+                url: url.to_string(),
+                reason: "archive size accounting overflow".to_string(),
+            })?;
+        if total_extracted_size > MAX_TOTAL_EXTRACTED_SIZE {
+            return Err(RegistryError::DownloadFailed {
+                url: url.to_string(),
+                reason: format!(
+                    "archive decompressed size too large ({} bytes, max {} bytes)",
+                    total_extracted_size, MAX_TOTAL_EXTRACTED_SIZE
                 ),
             });
         }
@@ -724,6 +752,11 @@ fn extract_tar_gz(
                 })?;
             std::fs::write(target_caps, &data).map_err(RegistryError::Io)?;
             found_caps = true;
+        }
+
+        // Stop scanning once all expected artifacts are extracted.
+        if found_wasm && found_caps {
+            break;
         }
     }
 

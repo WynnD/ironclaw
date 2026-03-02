@@ -32,6 +32,9 @@ use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput, requi
 /// Solves the chicken-and-egg: tools are registered before the Scheduler exists
 /// (Scheduler needs the ToolRegistry). Created empty, filled after Agent::new.
 pub type SchedulerSlot = Arc<RwLock<Option<Arc<crate::agent::Scheduler>>>>;
+const MESSAGE_CONTEXT_META_KEY: &str = "message_context";
+const MESSAGE_CHANNEL_META_KEY: &str = "message_channel";
+const MESSAGE_TARGET_META_KEY: &str = "message_target";
 
 /// Resolve a job ID from a full UUID or a short prefix (like git short SHAs).
 ///
@@ -71,6 +74,48 @@ async fn resolve_job_id(input: &str, context_manager: &ContextManager) -> Result
             "ambiguous prefix '{}' matches {} jobs, provide more characters",
             input, n
         ))),
+    }
+}
+
+fn metadata_string(metadata: &serde_json::Value, key: &str) -> Option<String> {
+    metadata
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+}
+
+fn inherited_message_context_metadata(ctx: &JobContext) -> Option<serde_json::Value> {
+    let channel = metadata_string(&ctx.metadata, MESSAGE_CHANNEL_META_KEY).or_else(|| {
+        ctx.metadata
+            .get(MESSAGE_CONTEXT_META_KEY)
+            .and_then(|v| v.get("channel"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+    });
+    let target = metadata_string(&ctx.metadata, MESSAGE_TARGET_META_KEY).or_else(|| {
+        ctx.metadata
+            .get(MESSAGE_CONTEXT_META_KEY)
+            .and_then(|v| v.get("target"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+    });
+
+    match (channel, target) {
+        (Some(channel), Some(target)) => Some(serde_json::json!({
+            MESSAGE_CHANNEL_META_KEY: channel,
+            MESSAGE_TARGET_META_KEY: target,
+            MESSAGE_CONTEXT_META_KEY: {
+                "channel": channel,
+                "target": target
+            }
+        })),
+        _ => None,
     }
 }
 
@@ -342,8 +387,9 @@ impl CreateJobTool {
         if let Some(ref slot) = self.scheduler_slot
             && let Some(ref scheduler) = *slot.read().await
         {
+            let inherited_metadata = inherited_message_context_metadata(ctx);
             return match scheduler
-                .dispatch_job(&ctx.user_id, title, description, None)
+                .dispatch_job(&ctx.user_id, title, description, inherited_metadata)
                 .await
             {
                 Ok(job_id) => {
@@ -371,6 +417,20 @@ impl CreateJobTool {
             .await
         {
             Ok(job_id) => {
+                if let Some(meta) = inherited_message_context_metadata(ctx) {
+                    self.context_manager
+                        .update_context(job_id, |job_ctx| {
+                            job_ctx.metadata = meta;
+                        })
+                        .await
+                        .map_err(|e| {
+                            ToolError::ExecutionFailed(format!(
+                                "failed to propagate message context to job: {}",
+                                e
+                            ))
+                        })?;
+                }
+
                 let result = serde_json::json!({
                     "job_id": job_id.to_string(),
                     "title": title,

@@ -9,13 +9,13 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-use crate::agent::Agent;
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::dispatcher::{
     AgenticLoopResult, check_auth_required, execute_chat_tool_standalone, parse_auth_result,
 };
 use crate::agent::session::{PendingApproval, Session, ThreadState};
 use crate::agent::submission::SubmissionResult;
+use crate::agent::{Agent, tool_params_preview};
 use crate::channels::web::util::truncate_preview;
 use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
@@ -857,8 +857,24 @@ impl Agent {
             }
 
             // Execute the approved tool and continue the loop
-            let job_ctx =
+            let message_target = message
+                .metadata
+                .get("signal_target")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| message.user_id.clone());
+            let mut job_ctx =
                 JobContext::with_user(&message.user_id, "chat", "Interactive chat session");
+            job_ctx.metadata = serde_json::json!({
+                "message_channel": message.channel,
+                "message_target": message_target,
+                "message_context": {
+                    "channel": message.channel,
+                    "target": message_target
+                }
+            });
 
             let _ = self
                 .channels
@@ -866,6 +882,7 @@ impl Agent {
                     &message.channel,
                     StatusUpdate::ToolStarted {
                         name: pending.tool_name.clone(),
+                        params_preview: Some(tool_params_preview(&pending.parameters, 100)),
                     },
                     &message.metadata,
                 )
@@ -1018,6 +1035,7 @@ impl Agent {
                             &message.channel,
                             StatusUpdate::ToolStarted {
                                 name: tc.name.clone(),
+                                params_preview: Some(tool_params_preview(&tc.arguments, 100)),
                             },
                             &message.metadata,
                         )
@@ -1062,6 +1080,7 @@ impl Agent {
                                 &channel,
                                 StatusUpdate::ToolStarted {
                                     name: tc.name.clone(),
+                                    params_preview: Some(tool_params_preview(&tc.arguments, 100)),
                                 },
                                 &metadata,
                             )

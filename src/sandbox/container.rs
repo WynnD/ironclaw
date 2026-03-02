@@ -228,12 +228,9 @@ impl ContainerRunner {
             .map(|(k, v)| format!("{}={}", k, v))
             .collect();
 
-        // Add proxy environment (uses host.docker.internal for Mac/Windows, 172.17.0.1 for Linux)
-        let proxy_host = if cfg!(target_os = "linux") {
-            "172.17.0.1"
-        } else {
-            "host.docker.internal"
-        };
+        // Route proxy traffic through host.docker.internal across all platforms.
+        // On Linux this requires extra_hosts host-gateway mapping (set below).
+        let proxy_host = "host.docker.internal";
 
         if self.proxy_port > 0 && policy.is_sandboxed() {
             env_vec.push(format!(
@@ -277,6 +274,7 @@ impl ContainerRunner {
             cpu_shares: Some(limits.cpu_shares as i64),
             auto_remove: Some(true),
             network_mode: Some("bridge".to_string()),
+            extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
             // Security: drop all capabilities and add back only what's needed
             cap_drop: Some(vec!["ALL".to_string()]),
             cap_add: Some(vec!["CHOWN".to_string()]),

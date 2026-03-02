@@ -297,11 +297,9 @@ impl ContainerJobManager {
         let docker = self.docker().await?;
 
         // Build container configuration
-        let orchestrator_host = if cfg!(target_os = "linux") {
-            "172.17.0.1"
-        } else {
-            "host.docker.internal"
-        };
+        // Use host.docker.internal everywhere; Linux resolution is provided by
+        // `extra_hosts: host-gateway` in HostConfig below.
+        let orchestrator_host = "host.docker.internal";
 
         let orchestrator_url = format!(
             "http://{}:{}",

@@ -10,9 +10,9 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-use crate::agent::Agent;
 use crate::agent::context_monitor::estimate_text_tokens;
 use crate::agent::session::{PendingApproval, Session, ThreadState};
+use crate::agent::{Agent, tool_params_preview};
 use crate::channels::{IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
 use crate::error::Error;
@@ -137,8 +137,27 @@ impl Agent {
         // Build context with messages that we'll mutate during the loop
         let mut context_messages = initial_messages;
 
-        // Create a JobContext for tool execution (chat doesn't have a real job)
-        let job_ctx = JobContext::with_user(&message.user_id, "chat", "Interactive chat session");
+        // Create a JobContext for tool execution (chat doesn't have a real job).
+        // Message routing context lives in metadata so tool execution is per-turn,
+        // not shared across concurrent jobs/users.
+        let message_target = message
+            .metadata
+            .get("signal_target")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| message.user_id.clone());
+        let mut job_ctx =
+            JobContext::with_user(&message.user_id, "chat", "Interactive chat session");
+        job_ctx.metadata = serde_json::json!({
+            "message_channel": message.channel,
+            "message_target": message_target,
+            "message_context": {
+                "channel": message.channel,
+                "target": message_target
+            }
+        });
 
         let max_tool_iterations = self.config.max_tool_iterations;
         let deferred_tool_loading = self.config.deferred_tool_loading;
@@ -499,6 +518,10 @@ impl Agent {
                                     &message.channel,
                                     StatusUpdate::ToolStarted {
                                         name: tc.name.clone(),
+                                        params_preview: Some(tool_params_preview(
+                                            &tc.arguments,
+                                            100,
+                                        )),
                                     },
                                     &message.metadata,
                                 )
@@ -542,6 +565,10 @@ impl Agent {
                                         &channel,
                                         StatusUpdate::ToolStarted {
                                             name: tc.name.clone(),
+                                            params_preview: Some(tool_params_preview(
+                                                &tc.arguments,
+                                                100,
+                                            )),
                                         },
                                         &metadata,
                                     )

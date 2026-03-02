@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::RwLock;
 
 use crate::bootstrap::ironclaw_base_dir;
 use crate::channels::{ChannelManager, OutgoingResponse};
@@ -18,10 +17,6 @@ use crate::tools::tool::{
 /// Tool for sending messages to channels.
 pub struct MessageTool {
     channel_manager: Arc<ChannelManager>,
-    /// Default channel for current conversation (set per-turn).
-    default_channel: Arc<RwLock<Option<String>>>,
-    /// Default target (user_id or group_id) for current conversation (set per-turn).
-    default_target: Arc<RwLock<Option<String>>>,
     /// Base directory for attachment path validation (sandbox).
     pub(crate) base_dir: PathBuf,
 }
@@ -32,8 +27,6 @@ impl MessageTool {
 
         Self {
             channel_manager,
-            default_channel: Arc::new(RwLock::new(None)),
-            default_target: Arc::new(RwLock::new(None)),
             base_dir,
         }
     }
@@ -45,11 +38,37 @@ impl MessageTool {
         self
     }
 
-    /// Set the default channel and target for the current conversation turn.
-    /// Call this before each agent turn with the incoming message's channel/target.
-    pub async fn set_context(&self, channel: Option<String>, target: Option<String>) {
-        *self.default_channel.write().await = channel;
-        *self.default_target.write().await = target;
+    fn metadata_string(metadata: &serde_json::Value, key: &str) -> Option<String> {
+        metadata
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+    }
+
+    fn context_channel(ctx: &JobContext) -> Option<String> {
+        Self::metadata_string(&ctx.metadata, "message_channel").or_else(|| {
+            ctx.metadata
+                .get("message_context")
+                .and_then(|v| v.get("channel"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+        })
+    }
+
+    fn context_target(ctx: &JobContext) -> Option<String> {
+        Self::metadata_string(&ctx.metadata, "message_target").or_else(|| {
+            ctx.metadata
+                .get("message_context")
+                .and_then(|v| v.get("target"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+        })
     }
 }
 
@@ -96,31 +115,33 @@ impl Tool for MessageTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
         let content = require_str(&params, "content")?;
 
-        // Get channel: use param or fall back to default
+        // Resolve channel: explicit params first, then per-execution job context metadata.
         let channel = if let Some(c) = params.get("channel").and_then(|v| v.as_str()) {
             c.to_string()
         } else {
-            self.default_channel.read().await.clone().ok_or_else(|| {
+            Self::context_channel(ctx).ok_or_else(|| {
                 ToolError::ExecutionFailed(
-                    "No channel specified and no active conversation. Provide channel parameter."
+                    "No channel specified and no message context available. Provide channel \
+                     parameter or run from a channel-backed conversation."
                         .to_string(),
                 )
             })?
         };
 
-        // Get target: use param or fall back to default
+        // Resolve target: explicit params first, then per-execution job context metadata.
         let target = if let Some(t) = params.get("target").and_then(|v| v.as_str()) {
             t.to_string()
         } else {
-            self.default_target.read().await.clone().ok_or_else(|| {
+            Self::context_target(ctx).ok_or_else(|| {
                 ToolError::ExecutionFailed(
-                    "No target specified and no active conversation. Provide target parameter."
+                    "No target specified and no message context available. Provide target \
+                     parameter or run from a channel-backed conversation."
                         .to_string(),
                 )
             })?
@@ -194,21 +215,11 @@ impl Tool for MessageTool {
     }
 
     fn requires_approval(&self, params: &serde_json::Value) -> ApprovalRequirement {
-        // Require approval when sending to a different channel than the default
-        // (cross-channel messages are more sensitive)
-        let param_channel = params.get("channel").and_then(|v| v.as_str());
-        if let Some(channel) = param_channel {
-            // Check if it differs from the default channel
-            let default_channel = self.default_channel.blocking_read();
-            if let Some(default) = default_channel.as_ref()
-                && channel != default
-            {
-                return ApprovalRequirement::Always;
-            }
-            // No default set - require approval for explicit channel selection
+        // Explicit channel selection is always sensitive and requires approval.
+        if params.get("channel").and_then(|v| v.as_str()).is_some() {
             return ApprovalRequirement::Always;
         }
-        // No channel specified in params - uses default, less risky
+        // Using per-execution context defaults is less sensitive.
         ApprovalRequirement::UnlessAutoApproved
     }
 
@@ -268,40 +279,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_tool_set_context_updates_defaults() {
+    async fn message_tool_uses_context_metadata_when_channel_and_target_omitted() {
         let tool = MessageTool::new(Arc::new(ChannelManager::new()));
 
-        // Initially no defaults set
         let ctx = crate::context::JobContext::new("test", "test description");
         let result = tool
             .execute(serde_json::json!({"content": "hello"}), &ctx)
             .await;
-        assert!(result.is_err()); // Should fail without defaults
+        assert!(result.is_err());
 
-        // Set context
-        tool.set_context(Some("signal".to_string()), Some("+1234567890".to_string()))
-            .await;
+        let mut ctx_with_message = crate::context::JobContext::new("test", "test description");
+        ctx_with_message.metadata = serde_json::json!({
+            "message_context": {
+                "channel": "signal",
+                "target": "+1234567890"
+            }
+        });
 
-        // Now execute should use the defaults (though it will fail because channel doesn't exist)
         let result = tool
-            .execute(serde_json::json!({"content": "hello"}), &ctx)
+            .execute(serde_json::json!({"content": "hello"}), &ctx_with_message)
             .await;
-        // Will fail because channel doesn't exist, but should attempt to use the defaults
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("signal") || err.contains("No channels connected"));
     }
 
     #[tokio::test]
-    async fn message_tool_explicit_params_override_defaults() {
+    async fn message_tool_explicit_params_override_context_metadata() {
         let tool = MessageTool::new(Arc::new(ChannelManager::new()));
 
-        // Set defaults
-        tool.set_context(Some("signal".to_string()), Some("+1234567890".to_string()))
-            .await;
+        let mut ctx = crate::context::JobContext::new("test", "test description");
+        ctx.metadata = serde_json::json!({
+            "message_context": {
+                "channel": "signal",
+                "target": "+1234567890"
+            }
+        });
 
-        // Execute with explicit params - should fail but check that it uses explicit params
-        let ctx = crate::context::JobContext::new("test", "test description");
         let result = tool
             .execute(
                 serde_json::json!({
@@ -313,10 +327,8 @@ mod tests {
             )
             .await;
 
-        // Will fail because channel doesn't exist
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        // Should reference telegram, not signal
         assert!(err.contains("telegram") || err.contains("No channels connected"));
     }
 
@@ -324,12 +336,14 @@ mod tests {
     async fn message_tool_with_attachments_outside_sandbox() {
         let tool = MessageTool::new(Arc::new(ChannelManager::new()));
 
-        // Set context
-        tool.set_context(Some("signal".to_string()), Some("+1234567890".to_string()))
-            .await;
+        let mut ctx = crate::context::JobContext::new("test", "test description");
+        ctx.metadata = serde_json::json!({
+            "message_context": {
+                "channel": "signal",
+                "target": "+1234567890"
+            }
+        });
 
-        // Execute with attachments outside sandbox
-        let ctx = crate::context::JobContext::new("test", "test description");
         let result = tool
             .execute(
                 serde_json::json!({
@@ -350,9 +364,16 @@ mod tests {
     async fn message_tool_with_attachments_inside_sandbox_no_channel() {
         use std::fs;
 
-        let tool = MessageTool::new(Arc::new(ChannelManager::new()));
-        tool.set_context(Some("signal".to_string()), Some("+1234567890".to_string()))
-            .await;
+        let sandbox_root = tempfile::tempdir().unwrap();
+        let tool = MessageTool::new(Arc::new(ChannelManager::new()))
+            .with_base_dir(sandbox_root.path().to_path_buf());
+        let mut ctx = crate::context::JobContext::new("test", "test description");
+        ctx.metadata = serde_json::json!({
+            "message_context": {
+                "channel": "signal",
+                "target": "+1234567890"
+            }
+        });
 
         // Create temp files inside the sandbox
         let sandbox_dir = &tool.base_dir;
@@ -362,7 +383,6 @@ mod tests {
         fs::write(&file1, "test").unwrap();
         fs::write(&file2, "test").unwrap();
 
-        let ctx = crate::context::JobContext::new("test", "test description");
         let result = tool
             .execute(
                 serde_json::json!({
@@ -424,10 +444,13 @@ mod tests {
     #[tokio::test]
     async fn message_tool_rejects_path_traversal_attachments() {
         let tool = MessageTool::new(Arc::new(ChannelManager::new()));
-        tool.set_context(Some("signal".to_string()), Some("+1234567890".to_string()))
-            .await;
-
-        let ctx = crate::context::JobContext::new("test", "test description");
+        let mut ctx = crate::context::JobContext::new("test", "test description");
+        ctx.metadata = serde_json::json!({
+            "message_context": {
+                "channel": "signal",
+                "target": "+1234567890"
+            }
+        });
         let result = tool
             .execute(
                 serde_json::json!({
@@ -447,9 +470,16 @@ mod tests {
     async fn message_tool_passes_attachment_to_broadcast() {
         use std::fs;
 
-        let tool = MessageTool::new(Arc::new(ChannelManager::new()));
-        tool.set_context(Some("signal".to_string()), Some("+1234567890".to_string()))
-            .await;
+        let sandbox_root = tempfile::tempdir().unwrap();
+        let tool = MessageTool::new(Arc::new(ChannelManager::new()))
+            .with_base_dir(sandbox_root.path().to_path_buf());
+        let mut ctx = crate::context::JobContext::new("test", "test description");
+        ctx.metadata = serde_json::json!({
+            "message_context": {
+                "channel": "signal",
+                "target": "+1234567890"
+            }
+        });
 
         // Create a temp file within the sandbox directory
         let sandbox_dir = &tool.base_dir;
@@ -458,7 +488,6 @@ mod tests {
         fs::write(&temp_path, "test content").unwrap();
         let temp_path_str = temp_path.to_string_lossy().to_string();
 
-        let ctx = crate::context::JobContext::new("test", "test description");
         let result = tool
             .execute(
                 serde_json::json!({
@@ -484,9 +513,16 @@ mod tests {
     async fn message_tool_passes_multiple_attachments_to_broadcast() {
         use std::fs;
 
-        let tool = MessageTool::new(Arc::new(ChannelManager::new()));
-        tool.set_context(Some("signal".to_string()), Some("+1234567890".to_string()))
-            .await;
+        let sandbox_root = tempfile::tempdir().unwrap();
+        let tool = MessageTool::new(Arc::new(ChannelManager::new()))
+            .with_base_dir(sandbox_root.path().to_path_buf());
+        let mut ctx = crate::context::JobContext::new("test", "test description");
+        ctx.metadata = serde_json::json!({
+            "message_context": {
+                "channel": "signal",
+                "target": "+1234567890"
+            }
+        });
 
         // Create temp files within the sandbox directory
         let sandbox_dir = &tool.base_dir;
@@ -498,7 +534,6 @@ mod tests {
         let path1 = temp_path1.to_string_lossy().to_string();
         let path2 = temp_path2.to_string_lossy().to_string();
 
-        let ctx = crate::context::JobContext::new("test", "test description");
         let result = tool
             .execute(
                 serde_json::json!({

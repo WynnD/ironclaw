@@ -84,8 +84,6 @@ pub struct ToolRegistry {
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
     /// Shared rate limiter for built-in tool invocations.
     rate_limiter: RateLimiter,
-    /// Reference to the message tool for setting context per-turn.
-    message_tool: RwLock<Option<Arc<crate::tools::builtin::MessageTool>>>,
 }
 
 impl ToolRegistry {
@@ -97,7 +95,6 @@ impl ToolRegistry {
             credential_registry: None,
             secrets_store: None,
             rate_limiter: RateLimiter::new(),
-            message_tool: RwLock::new(None),
         }
     }
 
@@ -502,7 +499,6 @@ impl ToolRegistry {
     ) {
         use crate::tools::builtin::MessageTool;
         let tool = Arc::new(MessageTool::new(channel_manager));
-        *self.message_tool.write().await = Some(Arc::clone(&tool));
         self.tools
             .write()
             .await
@@ -512,14 +508,6 @@ impl ToolRegistry {
             .await
             .insert("message".to_string());
         tracing::info!("Registered message tool");
-    }
-
-    /// Set the default channel and target for the message tool.
-    /// Call this before each agent turn with the current conversation's context.
-    pub async fn set_message_tool_context(&self, channel: Option<String>, target: Option<String>) {
-        if let Some(tool) = self.message_tool.read().await.as_ref() {
-            tool.set_context(channel, target).await;
-        }
     }
 
     /// Register the software builder tool.

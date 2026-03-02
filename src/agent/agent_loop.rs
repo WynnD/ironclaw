@@ -56,6 +56,12 @@ pub(crate) fn truncate_for_preview(output: &str, max_chars: usize) -> String {
     }
 }
 
+/// Render tool parameters as a very short one-line JSON preview for status UIs.
+pub(crate) fn tool_params_preview(params: &serde_json::Value, max_chars: usize) -> String {
+    let serialized = serde_json::to_string(params).unwrap_or_else(|_| params.to_string());
+    truncate_for_preview(&serialized, max_chars)
+}
+
 /// Convert external channel thread IDs into a stable internal UUID string.
 ///
 /// - If `external_thread_id` is already a UUID, preserve it.
@@ -742,19 +748,6 @@ impl Agent {
     }
 
     async fn handle_message(&self, message: &IncomingMessage) -> Result<Option<String>, Error> {
-        // Set message tool context for this turn (current channel and target)
-        // For Signal, use signal_target from metadata (group:ID or phone number),
-        // otherwise fall back to user_id
-        let target = message
-            .metadata
-            .get("signal_target")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| message.user_id.clone());
-        self.tools()
-            .set_message_tool_context(Some(message.channel.clone()), Some(target))
-            .await;
-
         // Parse submission type first
         let mut submission = SubmissionParser::parse(&message.content);
 
