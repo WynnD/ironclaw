@@ -46,6 +46,10 @@ use crate::config::{LlmBackend, LlmConfig, NearAiConfig};
 use crate::error::LlmError;
 
 const KIMI_K25_DEFAULT_FALLBACK_MODEL: &str = "MiniMaxAI/MiniMax-M2.5";
+const GLM_TOOL_CALL_PARSER_HEADER: &str = "tool-call-parser";
+const GLM_REASONING_PARSER_HEADER: &str = "reasoning-parser";
+const GLM_TOOL_CALL_PARSER_VALUE: &str = "glm47";
+const GLM_REASONING_PARSER_VALUE: &str = "glm45";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailoverModelSource {
@@ -62,6 +66,80 @@ fn is_kimi_k2_5_model_id(model: &str) -> bool {
     normalized.contains("kimi-k2.5")
         || normalized.contains("kimi-k2-5")
         || normalized.contains("kimi-k2p5")
+}
+
+fn parse_glm_major_minor(model: &str) -> Option<(u32, u32)> {
+    let lower = model.to_ascii_lowercase();
+    let glm_idx = lower.find("glm")?;
+    let mut chars = lower[glm_idx + 3..].chars().peekable();
+
+    while let Some(ch) = chars.peek() {
+        if ch.is_ascii_digit() {
+            break;
+        }
+        chars.next();
+    }
+
+    let mut major = String::new();
+    while let Some(ch) = chars.peek() {
+        if !ch.is_ascii_digit() {
+            break;
+        }
+        major.push(*ch);
+        chars.next();
+    }
+    if major.is_empty() {
+        return None;
+    }
+
+    let major = major.parse::<u32>().ok()?;
+    let mut minor = 0u32;
+    if matches!(chars.peek(), Some('.' | '-' | '_')) {
+        chars.next();
+        let mut minor_digits = String::new();
+        while let Some(ch) = chars.peek() {
+            if !ch.is_ascii_digit() {
+                break;
+            }
+            minor_digits.push(*ch);
+            chars.next();
+        }
+        if !minor_digits.is_empty() {
+            minor = minor_digits.parse::<u32>().ok()?;
+        }
+    }
+
+    Some((major, minor))
+}
+
+pub(crate) fn is_glm_4_7_or_newer_model_id(model: &str) -> bool {
+    let normalized = normalize_model_id(model);
+    if normalized.contains("glm-latest") {
+        return true;
+    }
+
+    parse_glm_major_minor(&normalized)
+        .map(|(major, minor)| major > 4 || (major == 4 && minor >= 7))
+        .unwrap_or(false)
+}
+
+fn maybe_apply_glm_parser_headers(headers: &mut reqwest::header::HeaderMap, model: &str) {
+    if !is_glm_4_7_or_newer_model_id(model) {
+        return;
+    }
+
+    if !headers.contains_key(GLM_TOOL_CALL_PARSER_HEADER) {
+        headers.insert(
+            reqwest::header::HeaderName::from_static(GLM_TOOL_CALL_PARSER_HEADER),
+            reqwest::header::HeaderValue::from_static(GLM_TOOL_CALL_PARSER_VALUE),
+        );
+    }
+    if !headers.contains_key(GLM_REASONING_PARSER_HEADER) {
+        headers.insert(
+            reqwest::header::HeaderName::from_static(GLM_REASONING_PARSER_HEADER),
+            reqwest::header::HeaderValue::from_static(GLM_REASONING_PARSER_VALUE),
+        );
+    }
 }
 
 fn active_backend_model(config: &LlmConfig) -> Option<&str> {
@@ -361,6 +439,7 @@ fn create_openai_compatible_provider(
         };
         extra_headers.insert(name, val);
     }
+    maybe_apply_glm_parser_headers(&mut extra_headers, &compat.model);
 
     let api_key_str = compat
         .api_key
@@ -714,5 +793,55 @@ mod tests {
     fn test_resolved_failover_model_none_for_non_kimi_model() {
         let config = test_openai_compatible_llm_config("moonshotai/Kimi-K2");
         assert!(resolved_failover_model(&config).is_none());
+    }
+
+    #[test]
+    fn test_is_glm_4_7_or_newer_model_id() {
+        assert!(is_glm_4_7_or_newer_model_id("zai-org/GLM-4.7"));
+        assert!(is_glm_4_7_or_newer_model_id("glm-5"));
+        assert!(is_glm_4_7_or_newer_model_id("zai-org/GLM-latest"));
+        assert!(!is_glm_4_7_or_newer_model_id("zai-org/GLM-4.6"));
+        assert!(!is_glm_4_7_or_newer_model_id("zai-org/GLM-4"));
+        assert!(!is_glm_4_7_or_newer_model_id("moonshotai/Kimi-K2.5"));
+    }
+
+    #[test]
+    fn test_maybe_apply_glm_parser_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        maybe_apply_glm_parser_headers(&mut headers, "zai-org/GLM-5");
+        assert_eq!(
+            headers
+                .get(GLM_TOOL_CALL_PARSER_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(GLM_TOOL_CALL_PARSER_VALUE)
+        );
+        assert_eq!(
+            headers
+                .get(GLM_REASONING_PARSER_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(GLM_REASONING_PARSER_VALUE)
+        );
+    }
+
+    #[test]
+    fn test_maybe_apply_glm_parser_headers_preserves_existing_values() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::HeaderName::from_static(GLM_TOOL_CALL_PARSER_HEADER),
+            reqwest::header::HeaderValue::from_static("custom"),
+        );
+        maybe_apply_glm_parser_headers(&mut headers, "zai-org/GLM-5");
+        assert_eq!(
+            headers
+                .get(GLM_TOOL_CALL_PARSER_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("custom")
+        );
+        assert_eq!(
+            headers
+                .get(GLM_REASONING_PARSER_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(GLM_REASONING_PARSER_VALUE)
+        );
     }
 }

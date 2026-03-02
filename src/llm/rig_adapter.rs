@@ -220,6 +220,18 @@ fn should_use_kimi_text_tool_primary(model_name: &str) -> bool {
     is_kimi_k2_5_model(model_name)
 }
 
+fn should_use_glm_native_tool_rounds(model_name: &str) -> bool {
+    crate::llm::is_glm_4_7_or_newer_model_id(model_name)
+}
+
+fn maybe_chat_template_kwargs_for_model(model_name: &str) -> Option<JsonValue> {
+    if should_use_glm_native_tool_rounds(model_name) {
+        Some(serde_json::json!({ "clear_thinking": false }))
+    } else {
+        None
+    }
+}
+
 fn should_use_strict_tool_schema(model_name: &str) -> bool {
     // Gemini (including OpenRouter `google/gemini-*` models) has stricter
     // function-schema validation and is not compatible with our OpenAI strict
@@ -891,6 +903,9 @@ impl<M: CompletionModel + Send + Sync + 'static> RigAdapter<M> {
             "tools": tools_json,
             "tool_choice": tool_choice.unwrap_or("auto"),
         });
+        if let Some(kwargs) = maybe_chat_template_kwargs_for_model(&self.model_name) {
+            payload["chat_template_kwargs"] = kwargs;
+        }
 
         if let Some(t) = temperature {
             payload["temperature"] = serde_json::json!(t);
@@ -975,6 +990,9 @@ impl<M: CompletionModel + Send + Sync + 'static> RigAdapter<M> {
             "model": self.model_name,
             "messages": json_messages,
         });
+        if let Some(kwargs) = maybe_chat_template_kwargs_for_model(&self.model_name) {
+            payload["chat_template_kwargs"] = kwargs;
+        }
 
         if let Some(t) = temperature {
             payload["temperature"] = serde_json::json!(t);
@@ -1263,7 +1281,10 @@ fn parse_native_tool_response(
 
     let message = &choice["message"];
     let message_content = message["content"].as_str().map(String::from);
-    let reasoning_content = message["reasoning_content"].as_str().map(String::from);
+    let reasoning_content = message["reasoning_content"]
+        .as_str()
+        .or_else(|| message["reasoning"].as_str())
+        .map(String::from);
 
     let mut tool_calls = Vec::new();
     if let Some(tcs) = message["tool_calls"].as_array() {
@@ -1392,6 +1413,31 @@ where
         // Interleaved-thinking Kimi models: bypass rig-core's array content
         // serialization for tool rounds, because these endpoints expect plain
         // string content and emit reasoning in a provider-specific field.
+        if should_use_glm_native_tool_rounds(&self.model_name) && self.native_transport.is_some() {
+            match self
+                .send_kimi_native_tool_request(
+                    &messages,
+                    &request.tools,
+                    request.tool_choice.as_deref(),
+                    request.temperature,
+                    request.max_tokens,
+                )
+                .await
+            {
+                Ok(mut resp) => {
+                    normalize_tool_calls(&mut resp.tool_calls, &known_tool_names);
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        model = %self.model_name,
+                        error = %e,
+                        "GLM native tool request failed; falling back to standard provider path"
+                    );
+                }
+            }
+        }
+
         if is_kimi_interleaved_thinking_model(&self.model_name) && self.native_transport.is_some() {
             // K2.5 on some OpenAI-compatible gateways (Baseten/vLLM/SGLang) is
             // unstable when using the structured `tools` field and often returns
@@ -1952,6 +1998,13 @@ mod tests {
     }
 
     #[test]
+    fn test_maybe_chat_template_kwargs_for_model_glm() {
+        let kwargs = maybe_chat_template_kwargs_for_model("zai-org/GLM-5").expect("glm kwargs");
+        assert_eq!(kwargs, serde_json::json!({"clear_thinking": false}));
+        assert!(maybe_chat_template_kwargs_for_model("moonshotai/Kimi-K2.5").is_none());
+    }
+
+    #[test]
     fn test_split_hidden_thinking() {
         let (visible, reasoning) = split_hidden_thinking(
             "Visible content<thinking>first thought</thinking>\n<thinking>second thought</thinking>",
@@ -1989,6 +2042,24 @@ mod tests {
         let content = parsed.content.expect("content should be present");
         assert!(content.contains("I'll use tools."));
         assert!(content.contains("<thinking>Need current date and web search</thinking>"));
+    }
+
+    #[test]
+    fn test_parse_native_tool_response_supports_reasoning_alias() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "reasoning": "Need to think first",
+                    "tool_calls": []
+                }
+            }]
+        })
+        .to_string();
+
+        let parsed = parse_native_tool_response("zai-org/GLM-5", &body).expect("response parses");
+        let content = parsed.content.expect("content should be present");
+        assert_eq!(content, "<thinking>Need to think first</thinking>");
     }
 
     #[test]
