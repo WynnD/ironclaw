@@ -136,10 +136,7 @@ mod tests {
             cfg.max_parallel_jobs,
             settings.agent.max_parallel_jobs as usize
         );
-        assert_eq!(
-            cfg.max_tool_iterations,
-            settings.agent.max_tool_iterations
-        );
+        assert_eq!(cfg.max_tool_iterations, settings.agent.max_tool_iterations);
         assert_eq!(cfg.auto_approve_tools, settings.agent.auto_approve_tools);
     }
 
