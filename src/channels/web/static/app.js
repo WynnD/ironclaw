@@ -103,6 +103,7 @@ let _slashMatches = [];
 let _activeGroup = null;
 let _activeToolCards = {};
 let _activityThinking = null;
+const TERMINAL_CHAT_STATUSES = new Set(['Done', 'Awaiting approval', 'Interrupted', 'Rejected']);
 
 // --- Auth ---
 
@@ -278,14 +279,13 @@ function connectSSE() {
   eventSource.addEventListener('status', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
-    // "Done" and "Awaiting approval" are terminal signals from the agent:
-    // the agentic loop finished, so re-enable input as a safety net in case
-    // the response SSE event is empty or lost.
-    // Status text is not displayed — inline activity cards handle visual feedback.
-    if (data.message === 'Done' || data.message === 'Awaiting approval') {
+    const message = (data.message || '').trim();
+    if (TERMINAL_CHAT_STATUSES.has(message)) {
       finalizeActivityGroup();
       enableChatInput();
+      return;
     }
+    if (message) showActivityThinking(message);
   });
 
   eventSource.addEventListener('job_started', (e) => {
@@ -375,6 +375,7 @@ function sendMessage() {
   if (!content) return;
 
   addMessage('user', content);
+  showActivityThinking('Working...');
   input.value = '';
   autoResizeTextarea(input);
   input.focus();
@@ -383,6 +384,7 @@ function sendMessage() {
     method: 'POST',
     body: { content, thread_id: currentThreadId || undefined },
   }).catch((err) => {
+    finalizeActivityGroup();
     addMessage('system', 'Failed to send: ' + err.message);
   });
 }

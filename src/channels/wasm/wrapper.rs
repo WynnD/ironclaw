@@ -28,7 +28,7 @@
 //! └──────────────────────────────────────────────────────────────┘
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -547,6 +547,10 @@ pub struct WasmChannel {
     /// Telegram's "typing..." indicator expires after ~5s, so we refresh it.
     typing_task: RwLock<Option<tokio::task::JoinHandle<()>>>,
 
+    /// Per-target guard to avoid spamming repeated "Working..." fallback messages
+    /// when a channel does not support `on_status` typing indicators.
+    fallback_progress_sent: RwLock<HashSet<String>>,
+
     /// Pairing store for DM pairing (guest access control).
     pairing_store: Arc<PairingStore>,
 
@@ -617,6 +621,7 @@ impl WasmChannel {
             endpoints: RwLock::new(Vec::new()),
             credentials: Arc::new(RwLock::new(HashMap::new())),
             typing_task: RwLock::new(None),
+            fallback_progress_sent: RwLock::new(HashSet::new()),
             pairing_store,
             workspace_store: Arc::new(ChannelWorkspaceStore::new()),
             last_broadcast_metadata: Arc::new(tokio::sync::RwLock::new(None)),
@@ -1451,6 +1456,63 @@ impl WasmChannel {
         }
     }
 
+    /// Build a best-effort routing key for per-target status fallbacks.
+    fn status_target_key(metadata: &serde_json::Value) -> String {
+        for key in [
+            "chat_id",
+            "signal_target",
+            "sender_id",
+            "user_id",
+            "thread_id",
+        ] {
+            if let Some(value) = metadata.get(key) {
+                if let Some(s) = value.as_str()
+                    && !s.trim().is_empty()
+                {
+                    return format!("{key}:{s}");
+                }
+                if let Some(i) = value.as_i64() {
+                    return format!("{key}:{i}");
+                }
+                if let Some(u) = value.as_u64() {
+                    return format!("{key}:{u}");
+                }
+            }
+        }
+        "default".to_string()
+    }
+
+    /// Mark that a fallback progress message has been sent for this target.
+    /// Returns true only for the first send.
+    async fn mark_fallback_progress_sent(&self, target_key: &str) -> bool {
+        let mut sent = self.fallback_progress_sent.write().await;
+        sent.insert(target_key.to_string())
+    }
+
+    /// Clear fallback progress marker for a target (turn completed/interrupted).
+    async fn clear_fallback_progress_sent(&self, metadata: &serde_json::Value) {
+        let target_key = Self::status_target_key(metadata);
+        self.fallback_progress_sent
+            .write()
+            .await
+            .remove(&target_key);
+    }
+
+    /// Emit a one-shot progress fallback when typing/status callbacks are unavailable.
+    async fn send_progress_fallback_message(&self, metadata: &serde_json::Value) {
+        let metadata_json = serde_json::to_string(metadata).unwrap_or_default();
+        if let Err(e) = self
+            .call_on_respond(uuid::Uuid::new_v4(), "Working...", None, &metadata_json)
+            .await
+        {
+            tracing::debug!(
+                channel = %self.name,
+                error = %e,
+                "Failed to send fallback progress message via on_respond"
+            );
+        }
+    }
+
     /// Handle a status update, managing the typing repeat timer.
     ///
     /// On Thinking: fires on_status once, then spawns a background task
@@ -1481,57 +1543,69 @@ impl WasmChannel {
                 // Cancel any existing typing task
                 self.cancel_typing_task().await;
 
+                let mut on_status_ok = true;
                 // Fire once immediately
                 if let Err(e) = self.call_on_status(&status, metadata).await {
+                    on_status_ok = false;
                     tracing::debug!(
                         channel = %self.name,
                         error = %e,
                         "on_status(Thinking) failed (best-effort)"
                     );
-                }
-
-                // Spawn background repeater
-                let channel_name = self.name.clone();
-                let runtime = Arc::clone(&self.runtime);
-                let prepared = Arc::clone(&self.prepared);
-                let capabilities = self.capabilities.clone();
-                let credentials = self.credentials.clone();
-                let pairing_store = self.pairing_store.clone();
-                let callback_timeout = self.runtime.config().callback_timeout;
-                let wit_update = status_to_wit(&status, metadata);
-
-                let handle = tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(Duration::from_secs(4));
-                    // Skip the first tick (we already fired above)
-                    interval.tick().await;
-
-                    loop {
-                        interval.tick().await;
-
-                        let wit_update_clone = clone_wit_status_update(&wit_update);
-
-                        if let Err(e) = Self::execute_status(
-                            &channel_name,
-                            &runtime,
-                            &prepared,
-                            &capabilities,
-                            &credentials,
-                            pairing_store.clone(),
-                            callback_timeout,
-                            wit_update_clone,
-                        )
-                        .await
-                        {
-                            tracing::debug!(
-                                channel = %channel_name,
-                                error = %e,
-                                "Typing repeat on_status failed (best-effort)"
-                            );
+                    // Telegram fallback: if typing callback isn't available,
+                    // send one visible progress message so work is still obvious.
+                    if self.name == "telegram" {
+                        let target_key = Self::status_target_key(metadata);
+                        if self.mark_fallback_progress_sent(&target_key).await {
+                            self.send_progress_fallback_message(metadata).await;
                         }
                     }
-                });
+                }
 
-                *self.typing_task.write().await = Some(handle);
+                if on_status_ok {
+                    // Spawn background repeater
+                    let channel_name = self.name.clone();
+                    let runtime = Arc::clone(&self.runtime);
+                    let prepared = Arc::clone(&self.prepared);
+                    let capabilities = self.capabilities.clone();
+                    let credentials = self.credentials.clone();
+                    let pairing_store = self.pairing_store.clone();
+                    let callback_timeout = self.runtime.config().callback_timeout;
+                    let wit_update = status_to_wit(&status, metadata);
+
+                    let handle = tokio::spawn(async move {
+                        let mut interval = tokio::time::interval(Duration::from_secs(4));
+                        // Skip the first tick (we already fired above)
+                        interval.tick().await;
+
+                        loop {
+                            interval.tick().await;
+
+                            let wit_update_clone = clone_wit_status_update(&wit_update);
+
+                            if let Err(e) = Self::execute_status(
+                                &channel_name,
+                                &runtime,
+                                &prepared,
+                                &capabilities,
+                                &credentials,
+                                pairing_store.clone(),
+                                callback_timeout,
+                                wit_update_clone,
+                            )
+                            .await
+                            {
+                                tracing::debug!(
+                                    channel = %channel_name,
+                                    error = %e,
+                                    "Typing repeat on_status failed (best-effort)"
+                                );
+                            }
+                        }
+                    });
+
+                    *self.typing_task.write().await = Some(handle);
+                }
             }
             StatusUpdate::ToolStarted {
                 name,
@@ -1574,6 +1648,7 @@ impl WasmChannel {
                 // interactive approval overlays.  Send the approval prompt
                 // as an actual message so the user can reply yes/no.
                 self.cancel_typing_task().await;
+                self.clear_fallback_progress_sent(metadata).await;
 
                 let params_preview = parameters
                     .as_object()
@@ -1633,6 +1708,7 @@ impl WasmChannel {
             StatusUpdate::AuthRequired { .. } => {
                 // Waiting on user action: stop typing and fire once.
                 self.cancel_typing_task().await;
+                self.clear_fallback_progress_sent(metadata).await;
 
                 if let Err(e) = self.call_on_status(&status, metadata).await {
                     tracing::debug!(
@@ -1645,6 +1721,7 @@ impl WasmChannel {
             StatusUpdate::Status(msg) if is_terminal_text_status(msg) => {
                 // Waiting on user or terminal states: stop typing and fire once.
                 self.cancel_typing_task().await;
+                self.clear_fallback_progress_sent(metadata).await;
 
                 if let Err(e) = self.call_on_status(&status, metadata).await {
                     tracing::debug!(
@@ -2100,6 +2177,7 @@ impl Channel for WasmChannel {
     ) -> Result<(), ChannelError> {
         // Stop the typing indicator, we're about to send the actual response
         self.cancel_typing_task().await;
+        self.clear_fallback_progress_sent(&msg.metadata).await;
 
         // Check if there's a pending synchronous response waiter
         if let Some(tx) = self.pending_responses.write().await.remove(&msg.id) {
@@ -2223,6 +2301,7 @@ impl Channel for WasmChannel {
     async fn shutdown(&self) -> Result<(), ChannelError> {
         // Cancel typing indicator
         self.cancel_typing_task().await;
+        self.fallback_progress_sent.write().await.clear();
 
         // Send shutdown signal
         if let Some(tx) = self.shutdown_tx.write().await.take() {
