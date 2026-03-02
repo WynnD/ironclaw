@@ -14,6 +14,10 @@ on:
       - 'LICENSE*'
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   tests:
     name: Tests (${{ matrix.name }})
@@ -61,7 +65,25 @@ jobs:
         uses: actions/checkout@v6
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+      - name: Check if this run is latest main commit
+        id: main_head
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          latest_main_sha="$(git ls-remote --heads origin main | awk '{print $1}')"
+          if [[ -z "$latest_main_sha" ]]; then
+            echo "Could not resolve origin/main head"
+            exit 1
+          fi
+          if [[ "$GITHUB_SHA" == "$latest_main_sha" ]]; then
+            echo "is_latest=true" >> "$GITHUB_OUTPUT"
+            echo "This run is at latest main commit: $GITHUB_SHA"
+          else
+            echo "is_latest=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping docker-build for stale commit $GITHUB_SHA (latest main: $latest_main_sha)"
+          fi
       - name: Build image
+        if: github.event_name != 'push' || github.ref != 'refs/heads/main' || steps.main_head.outputs.is_latest == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -75,17 +97,37 @@ jobs:
   push-image:
     name: Push Image
     needs: [tests, telegram-tests, docker-build]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    if: >
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: arc-runner-set-ironclaw
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+      - name: Check if this run is latest main commit
+        id: main_head
+        run: |
+          set -euo pipefail
+          latest_main_sha="$(git ls-remote --heads origin main | awk '{print $1}')"
+          if [[ -z "$latest_main_sha" ]]; then
+            echo "Could not resolve origin/main head"
+            exit 1
+          fi
+          if [[ "$GITHUB_SHA" == "$latest_main_sha" ]]; then
+            echo "is_latest=true" >> "$GITHUB_OUTPUT"
+            echo "This run is at latest main commit: $GITHUB_SHA"
+          else
+            echo "is_latest=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping push-image for stale commit $GITHUB_SHA (latest main: $latest_main_sha)"
+          fi
       - name: Derive image tag
         id: meta
+        if: steps.main_head.outputs.is_latest == 'true'
         run: echo "tag=sha-$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
       - name: Build and push image
+        if: steps.main_head.outputs.is_latest == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
