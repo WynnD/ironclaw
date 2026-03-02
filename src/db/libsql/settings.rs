@@ -206,3 +206,101 @@ impl SettingsStore for LibSqlBackend {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    use crate::db::libsql::LibSqlBackend;
+    use crate::db::{Database, SettingsStore};
+
+    async fn test_backend() -> (LibSqlBackend, tempfile::TempDir) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("settings-tests.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        (backend, tempdir)
+    }
+
+    #[tokio::test]
+    async fn settings_are_isolated_by_user_id() {
+        let (backend, _tempdir) = test_backend().await;
+
+        backend
+            .set_setting(
+                "gateway-user-1",
+                "agent.auto_approved_tools",
+                &json!(["shell"]),
+            )
+            .await
+            .unwrap();
+        backend
+            .set_setting("default", "agent.auto_approved_tools", &json!(["none"]))
+            .await
+            .unwrap();
+
+        let user_one = backend
+            .get_setting("gateway-user-1", "agent.auto_approved_tools")
+            .await
+            .unwrap()
+            .unwrap();
+        let default_user = backend
+            .get_setting("default", "agent.auto_approved_tools")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(user_one, json!(["shell"]));
+        assert_eq!(default_user, json!(["none"]));
+
+        let list = backend.list_settings("gateway-user-1").await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].key, "agent.auto_approved_tools");
+    }
+
+    #[tokio::test]
+    async fn set_all_settings_upserts_without_deleting_other_keys() {
+        let (backend, _tempdir) = test_backend().await;
+
+        backend.set_setting("user-1", "a", &json!(1)).await.unwrap();
+        backend.set_setting("user-1", "b", &json!(2)).await.unwrap();
+
+        let mut incoming = HashMap::new();
+        incoming.insert("a".to_string(), json!(10));
+        incoming.insert("c".to_string(), json!(3));
+        backend.set_all_settings("user-1", &incoming).await.unwrap();
+
+        let all = backend.get_all_settings("user-1").await.unwrap();
+        assert_eq!(all.get("a"), Some(&json!(10)));
+        assert_eq!(all.get("b"), Some(&json!(2)));
+        assert_eq!(all.get("c"), Some(&json!(3)));
+    }
+
+    #[tokio::test]
+    async fn has_settings_and_delete_setting_follow_expected_lifecycle() {
+        let (backend, _tempdir) = test_backend().await;
+
+        assert!(!backend.has_settings("user-1").await.unwrap());
+
+        backend
+            .set_setting("user-1", "feature.flag", &json!(true))
+            .await
+            .unwrap();
+        assert!(backend.has_settings("user-1").await.unwrap());
+
+        let deleted = backend
+            .delete_setting("user-1", "feature.flag")
+            .await
+            .unwrap();
+        assert!(deleted);
+        assert!(!backend.has_settings("user-1").await.unwrap());
+
+        let deleted_again = backend
+            .delete_setting("user-1", "feature.flag")
+            .await
+            .unwrap();
+        assert!(!deleted_again);
+    }
+}

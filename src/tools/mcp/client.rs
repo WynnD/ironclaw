@@ -20,8 +20,9 @@ use crate::tools::mcp::protocol::{
 use crate::tools::mcp::session::McpSessionManager;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput};
 
-const DEFAULT_MCP_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_MCP_TIMEOUT_SECS: u64 = 60;
 const LONG_RUNNING_MCP_TIMEOUT_SECS: u64 = 300;
+const HOME_ASSISTANT_MCP_TIMEOUT_SECS: u64 = 120;
 
 fn is_high_risk_mcp_server(server_name: &str, server_url: &str) -> bool {
     let server_id = format!(
@@ -33,17 +34,30 @@ fn is_high_risk_mcp_server(server_name: &str, server_url: &str) -> bool {
     server_id.contains("gemini") || server_id.contains("codex")
 }
 
+fn is_home_assistant_mcp_server(server_name: &str, server_url: &str) -> bool {
+    let server_id = format!(
+        "{} {}",
+        server_name.to_ascii_lowercase(),
+        server_url.to_ascii_lowercase()
+    );
+
+    server_id.contains("home-assistant")
+        || server_id.contains("home_assistant")
+        || server_id.contains("ha-mcp")
+}
+
 fn request_timeout_for_server(server_name: &str, server_url: &str) -> Duration {
     if is_high_risk_mcp_server(server_name, server_url) {
         Duration::from_secs(LONG_RUNNING_MCP_TIMEOUT_SECS)
+    } else if is_home_assistant_mcp_server(server_name, server_url) {
+        Duration::from_secs(HOME_ASSISTANT_MCP_TIMEOUT_SECS)
     } else {
         Duration::from_secs(DEFAULT_MCP_TIMEOUT_SECS)
     }
 }
 
-fn build_http_client(server_name: &str, server_url: &str) -> reqwest::Client {
+fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .timeout(request_timeout_for_server(server_name, server_url))
         .build()
         .expect("Failed to create HTTP client")
 }
@@ -90,7 +104,7 @@ impl McpClient {
         let url = server_url.into();
         let name = extract_server_name(&url);
         let session_manager = Arc::new(McpSessionManager::new());
-        let http_client = build_http_client(&name, &url);
+        let http_client = build_http_client();
 
         Self {
             server_url: url,
@@ -112,7 +126,7 @@ impl McpClient {
         let session_manager = Arc::new(McpSessionManager::new());
         let server_name = server_name.into();
         let server_url = server_url.into();
-        let http_client = build_http_client(&server_name, &server_url);
+        let http_client = build_http_client();
 
         Self {
             server_url,
@@ -138,7 +152,7 @@ impl McpClient {
     ) -> Self {
         let server_url = config.url.clone();
         let server_name = config.name.clone();
-        let http_client = build_http_client(&server_name, &server_url);
+        let http_client = build_http_client();
 
         Self {
             server_url,
@@ -198,6 +212,9 @@ impl McpClient {
     /// Send a request to the MCP server with auth and session headers.
     /// Automatically attempts token refresh on 401 errors.
     async fn send_request(&self, request: McpRequest) -> Result<McpResponse, ToolError> {
+        let request_timeout = request_timeout_for_server(&self.server_name, &self.server_url);
+        let request_method = request.method.clone();
+
         // Try up to 2 times: first attempt, then retry after token refresh
         for attempt in 0..2 {
             // Request both JSON and SSE as per MCP spec
@@ -206,6 +223,7 @@ impl McpClient {
                 .post(&self.server_url)
                 .header("Accept", "application/json, text/event-stream")
                 .header("Content-Type", "application/json")
+                .timeout(request_timeout)
                 .json(&request);
 
             // Add Authorization header if we have a token
@@ -221,7 +239,20 @@ impl McpClient {
             }
 
             let response = req_builder.send().await.map_err(|e| {
-                let mut chain = format!("MCP request failed: {}", e);
+                let mut chain = if e.is_timeout() {
+                    format!(
+                        "MCP request timed out after {}s (server='{}', method='{}'): {}",
+                        request_timeout.as_secs(),
+                        self.server_name,
+                        request_method,
+                        e
+                    )
+                } else {
+                    format!(
+                        "MCP request failed (server='{}', method='{}'): {}",
+                        self.server_name, request_method, e
+                    )
+                };
                 let mut source = std::error::Error::source(&e);
                 while let Some(cause) = source {
                     chain.push_str(&format!(" -> {}", cause));
@@ -648,7 +679,15 @@ mod tests {
         );
         assert_eq!(
             request_timeout_for_server("mcp-firecrawl", "http://example.com").as_secs(),
-            30
+            60
+        );
+        assert_eq!(
+            request_timeout_for_server("home-assistant", "http://example.com").as_secs(),
+            120
+        );
+        assert_eq!(
+            request_timeout_for_server("ha-mcp", "http://example.com").as_secs(),
+            120
         );
     }
 
@@ -663,6 +702,23 @@ mod tests {
             "https://gemini.example.com/mcp"
         ));
         assert!(!is_high_risk_mcp_server(
+            "mcp-firecrawl",
+            "http://example.com"
+        ));
+    }
+
+    #[test]
+    fn test_is_home_assistant_mcp_server() {
+        assert!(is_home_assistant_mcp_server(
+            "home-assistant",
+            "http://example.com"
+        ));
+        assert!(is_home_assistant_mcp_server("ha-mcp", "http://example.com"));
+        assert!(is_home_assistant_mcp_server(
+            "foo",
+            "https://example.com/home_assistant/mcp"
+        ));
+        assert!(!is_home_assistant_mcp_server(
             "mcp-firecrawl",
             "http://example.com"
         ));
@@ -691,7 +747,7 @@ mod tests {
             readonly_wrapper.requires_approval(&serde_json::json!({})),
             ApprovalRequirement::Never
         );
-        // Default MCP timeout is 30s, but wrapper keeps a 60s execution floor.
+        // Default MCP timeout is 60s, and wrapper keeps a 60s execution floor.
         assert_eq!(readonly_wrapper.execution_timeout().as_secs(), 60);
 
         let side_effect_tool = McpTool {

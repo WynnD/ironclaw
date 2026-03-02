@@ -131,3 +131,159 @@ pub async fn settings_import_handler(
 
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use axum::{
+        Json,
+        extract::{Path, State},
+        http::StatusCode,
+    };
+    use serde_json::json;
+
+    use super::*;
+    use crate::channels::web::server::{GatewayState, RateLimiter};
+    use crate::channels::web::sse::SseManager;
+    use crate::db::Database;
+    use crate::db::libsql::LibSqlBackend;
+
+    async fn test_backend() -> (Arc<dyn Database>, tempfile::TempDir) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("settings-handler-tests.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        (Arc::new(backend), tempdir)
+    }
+
+    fn make_state(store: Option<Arc<dyn Database>>, user_id: &str) -> Arc<GatewayState> {
+        Arc::new(GatewayState {
+            msg_tx: tokio::sync::RwLock::new(None),
+            sse: SseManager::new(),
+            workspace: None,
+            session_manager: None,
+            log_broadcaster: None,
+            log_level_handle: None,
+            extension_manager: None,
+            tool_registry: None,
+            store,
+            secrets_store: None,
+            job_manager: None,
+            prompt_queue: None,
+            user_id: user_id.to_string(),
+            shutdown_tx: tokio::sync::RwLock::new(None),
+            ws_tracker: None,
+            llm_provider: None,
+            skill_registry: None,
+            skill_catalog: None,
+            chat_rate_limiter: RateLimiter::new(30, 60),
+            registry_entries: Vec::new(),
+            cost_guard: None,
+            startup_time: std::time::Instant::now(),
+            restart_requested: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    #[tokio::test]
+    async fn settings_handlers_scope_to_gateway_user_id() {
+        let (store, _tempdir) = test_backend().await;
+        store
+            .set_setting(
+                "gateway-user-123",
+                "agent.auto_approved_tools",
+                &json!(["shell"]),
+            )
+            .await
+            .unwrap();
+        store
+            .set_setting("default", "agent.auto_approved_tools", &json!(["http"]))
+            .await
+            .unwrap();
+
+        let state = make_state(Some(store), "gateway-user-123");
+
+        let export = settings_export_handler(State(state.clone()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            export.settings.get("agent.auto_approved_tools"),
+            Some(&json!(["shell"]))
+        );
+
+        let missing_default =
+            settings_get_handler(State(state.clone()), Path("only.for.default".to_string())).await;
+        assert_eq!(missing_default.unwrap_err(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn settings_set_get_delete_roundtrip() {
+        let (store, _tempdir) = test_backend().await;
+        let state = make_state(Some(store), "gateway-user-123");
+
+        let set_status = settings_set_handler(
+            State(state.clone()),
+            Path("feature.flag".to_string()),
+            Json(SettingWriteRequest { value: json!(true) }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(set_status, StatusCode::NO_CONTENT);
+
+        let got = settings_get_handler(State(state.clone()), Path("feature.flag".to_string()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(got.key, "feature.flag");
+        assert_eq!(got.value, json!(true));
+
+        let mut import = HashMap::new();
+        import.insert("other.setting".to_string(), json!("x"));
+        let import_status = settings_import_handler(
+            State(state.clone()),
+            Json(SettingsImportRequest { settings: import }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(import_status, StatusCode::NO_CONTENT);
+
+        let listed = settings_list_handler(State(state.clone())).await.unwrap().0;
+        assert!(listed.settings.iter().any(|s| s.key == "feature.flag"));
+        assert!(listed.settings.iter().any(|s| s.key == "other.setting"));
+
+        let delete_status =
+            settings_delete_handler(State(state.clone()), Path("feature.flag".to_string()))
+                .await
+                .unwrap();
+        assert_eq!(delete_status, StatusCode::NO_CONTENT);
+
+        let missing = settings_get_handler(State(state), Path("feature.flag".to_string())).await;
+        assert_eq!(missing.unwrap_err(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn settings_handlers_return_service_unavailable_without_store() {
+        let state = make_state(None, "gateway-user-123");
+
+        assert_eq!(
+            settings_list_handler(State(state.clone()))
+                .await
+                .unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            settings_export_handler(State(state.clone()))
+                .await
+                .unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            settings_get_handler(State(state), Path("k".to_string()))
+                .await
+                .unwrap_err(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+}

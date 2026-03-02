@@ -416,3 +416,209 @@ impl JobStore for LibSqlBackend {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use libsql::params;
+    use rust_decimal::Decimal;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use crate::context::{ActionRecord, JobContext, JobState};
+    use crate::db::libsql::LibSqlBackend;
+    use crate::db::{Database, JobStore};
+
+    async fn test_backend() -> (LibSqlBackend, tempfile::TempDir) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("jobs-tests.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        (backend, tempdir)
+    }
+
+    async fn job_status_and_reason(
+        backend: &LibSqlBackend,
+        job_id: Uuid,
+    ) -> (String, Option<String>, Option<String>) {
+        let conn = backend.connect().await.unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT status, failure_reason, completed_at FROM agent_jobs WHERE id = ?1",
+                params![job_id.to_string()],
+            )
+            .await
+            .unwrap();
+
+        let row = rows.next().await.unwrap().unwrap();
+        (
+            row.get::<String>(0).unwrap_or_default(),
+            row.get::<String>(1).ok(),
+            row.get::<String>(2).ok(),
+        )
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_agent_jobs_only_updates_direct_active_statuses() {
+        let (backend, _tempdir) = test_backend().await;
+
+        let pending = JobContext::with_user("u1", "pending", "desc");
+        let pending_id = pending.job_id;
+        backend.save_job(&pending).await.unwrap();
+
+        let mut in_progress = JobContext::with_user("u1", "in-progress", "desc");
+        in_progress
+            .transition_to(JobState::InProgress, None)
+            .unwrap();
+        let in_progress_id = in_progress.job_id;
+        backend.save_job(&in_progress).await.unwrap();
+
+        let stuck = JobContext::with_user("u1", "stuck", "desc");
+        let stuck_id = stuck.job_id;
+        backend.save_job(&stuck).await.unwrap();
+        backend.mark_job_stuck(stuck_id).await.unwrap();
+
+        let mut completed = JobContext::with_user("u1", "completed", "desc");
+        completed.transition_to(JobState::InProgress, None).unwrap();
+        completed.transition_to(JobState::Completed, None).unwrap();
+        let completed_id = completed.job_id;
+        backend.save_job(&completed).await.unwrap();
+
+        let sandbox_id = Uuid::new_v4();
+        let conn = backend.connect().await.unwrap();
+        conn.execute(
+            "INSERT INTO agent_jobs (id, title, description, status, source, user_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                sandbox_id.to_string(),
+                "sandbox-pending",
+                "sandbox",
+                "pending",
+                "sandbox",
+                "u1"
+            ],
+        )
+        .await
+        .unwrap();
+
+        let updated = backend.cleanup_stale_agent_jobs().await.unwrap();
+        assert_eq!(updated, 3);
+
+        let (status_pending, reason_pending, completed_pending) =
+            job_status_and_reason(&backend, pending_id).await;
+        assert_eq!(status_pending, "failed");
+        assert_eq!(reason_pending.as_deref(), Some("Process restarted"));
+        assert!(completed_pending.is_some());
+
+        let (status_in_progress, _, completed_in_progress) =
+            job_status_and_reason(&backend, in_progress_id).await;
+        assert_eq!(status_in_progress, "failed");
+        assert!(completed_in_progress.is_some());
+
+        let (status_stuck, _, completed_stuck) = job_status_and_reason(&backend, stuck_id).await;
+        assert_eq!(status_stuck, "failed");
+        assert!(completed_stuck.is_some());
+
+        let (status_completed, _, _) = job_status_and_reason(&backend, completed_id).await;
+        assert_eq!(status_completed, "completed");
+
+        let (status_sandbox, _, _) = job_status_and_reason(&backend, sandbox_id).await;
+        assert_eq!(status_sandbox, "pending");
+    }
+
+    #[tokio::test]
+    async fn get_stuck_jobs_ignores_invalid_uuid_rows() {
+        let (backend, _tempdir) = test_backend().await;
+
+        let valid = JobContext::with_user("u1", "valid-stuck", "desc");
+        let valid_id = valid.job_id;
+        backend.save_job(&valid).await.unwrap();
+        backend.mark_job_stuck(valid_id).await.unwrap();
+
+        let conn = backend.connect().await.unwrap();
+        conn.execute(
+            "INSERT INTO agent_jobs (id, title, description, status, source, user_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params!["not-a-uuid", "bad", "bad", "stuck", "direct", "u1"],
+        )
+        .await
+        .unwrap();
+
+        let stuck = backend.get_stuck_jobs().await.unwrap();
+        assert_eq!(stuck, vec![valid_id]);
+    }
+
+    #[tokio::test]
+    async fn save_and_get_job_actions_preserve_order_and_fields() {
+        let (backend, _tempdir) = test_backend().await;
+
+        let ctx = JobContext::with_user("u1", "actions-job", "desc");
+        let job_id = ctx.job_id;
+        backend.save_job(&ctx).await.unwrap();
+
+        let action_two = ActionRecord::new(2, "tool-b", json!({"input": 2}))
+            .succeed(
+                Some("raw-output".to_string()),
+                json!({"sanitized": true}),
+                Duration::from_millis(250),
+            )
+            .with_warnings(vec!["warn-b".to_string()])
+            .with_cost(Decimal::new(250, 2));
+        let action_one = ActionRecord::new(1, "tool-a", json!({"input": 1}))
+            .fail("boom", Duration::from_millis(100))
+            .with_warnings(vec!["warn-a".to_string()]);
+
+        backend.save_action(job_id, &action_two).await.unwrap();
+        backend.save_action(job_id, &action_one).await.unwrap();
+
+        let actions = backend.get_job_actions(job_id).await.unwrap();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].sequence, 1);
+        assert_eq!(actions[0].tool_name, "tool-a");
+        assert!(!actions[0].success);
+        assert_eq!(actions[0].error.as_deref(), Some("boom"));
+        assert_eq!(actions[0].sanitization_warnings, vec!["warn-a".to_string()]);
+
+        assert_eq!(actions[1].sequence, 2);
+        assert_eq!(actions[1].tool_name, "tool-b");
+        assert!(actions[1].success);
+        assert_eq!(actions[1].output_raw.as_deref(), Some("raw-output"));
+        assert_eq!(
+            actions[1].output_sanitized,
+            Some(json!({"sanitized": true}))
+        );
+        assert_eq!(actions[1].sanitization_warnings, vec!["warn-b".to_string()]);
+        assert_eq!(actions[1].cost, Some(Decimal::new(250, 2)));
+    }
+
+    #[tokio::test]
+    async fn agent_job_summary_maps_status_buckets_correctly() {
+        let (backend, _tempdir) = test_backend().await;
+        let conn = backend.connect().await.unwrap();
+
+        for status in [
+            "pending",
+            "in_progress",
+            "submitted",
+            "accepted",
+            "completed",
+            "cancelled",
+            "failed",
+            "stuck",
+        ] {
+            conn.execute(
+                "INSERT INTO agent_jobs (id, title, description, status, source, user_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![Uuid::new_v4().to_string(), status, "desc", status, "direct", "u1"],
+            )
+            .await
+            .unwrap();
+        }
+
+        let summary = backend.agent_job_summary().await.unwrap();
+        assert_eq!(summary.total, 8);
+        assert_eq!(summary.pending, 1);
+        assert_eq!(summary.in_progress, 1);
+        assert_eq!(summary.completed, 3);
+        assert_eq!(summary.failed, 2);
+        assert_eq!(summary.stuck, 1);
+    }
+}

@@ -27,7 +27,8 @@ impl ToolFailureStore for LibSqlBackend {
                 ON CONFLICT (tool_name) DO UPDATE SET
                     error_message = ?3,
                     error_count = tool_failures.error_count + 1,
-                    last_failure = ?4
+                    last_failure = ?4,
+                    repaired_at = NULL
                 "#,
             params![Uuid::new_v4().to_string(), tool_name, error_message, now],
         )
@@ -93,5 +94,81 @@ impl ToolFailureStore for LibSqlBackend {
         .await
         .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::libsql::LibSqlBackend;
+    use crate::db::{Database, ToolFailureStore};
+
+    async fn test_backend() -> (LibSqlBackend, tempfile::TempDir) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("tool-failures-tests.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        (backend, tempdir)
+    }
+
+    #[tokio::test]
+    async fn record_tool_failure_increments_count_and_updates_last_error() {
+        let (backend, _tempdir) = test_backend().await;
+
+        backend
+            .record_tool_failure("tool-a", "error-one")
+            .await
+            .unwrap();
+        backend
+            .record_tool_failure("tool-a", "error-two")
+            .await
+            .unwrap();
+        backend
+            .record_tool_failure("tool-b", "only-once")
+            .await
+            .unwrap();
+
+        let broken = backend.get_broken_tools(2).await.unwrap();
+        assert_eq!(broken.len(), 1);
+        assert_eq!(broken[0].name, "tool-a");
+        assert_eq!(broken[0].failure_count, 2);
+        assert_eq!(broken[0].last_error.as_deref(), Some("error-two"));
+    }
+
+    #[tokio::test]
+    async fn repaired_tool_reappears_after_new_failure() {
+        let (backend, _tempdir) = test_backend().await;
+
+        backend
+            .record_tool_failure("tool-a", "error")
+            .await
+            .unwrap();
+        backend.mark_tool_repaired("tool-a").await.unwrap();
+        assert!(backend.get_broken_tools(1).await.unwrap().is_empty());
+
+        backend
+            .record_tool_failure("tool-a", "error-again")
+            .await
+            .unwrap();
+        let broken = backend.get_broken_tools(1).await.unwrap();
+        assert_eq!(broken.len(), 1);
+        assert_eq!(broken[0].name, "tool-a");
+        assert_eq!(broken[0].failure_count, 1);
+        assert_eq!(broken[0].last_error.as_deref(), Some("error-again"));
+    }
+
+    #[tokio::test]
+    async fn increment_repair_attempts_updates_counter() {
+        let (backend, _tempdir) = test_backend().await;
+
+        backend
+            .record_tool_failure("tool-a", "error")
+            .await
+            .unwrap();
+        backend.increment_repair_attempts("tool-a").await.unwrap();
+        backend.increment_repair_attempts("tool-a").await.unwrap();
+
+        let broken = backend.get_broken_tools(1).await.unwrap();
+        assert_eq!(broken.len(), 1);
+        assert_eq!(broken[0].repair_attempts, 2);
     }
 }

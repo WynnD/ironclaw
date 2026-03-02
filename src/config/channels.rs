@@ -196,3 +196,105 @@ impl ChannelsConfig {
 fn default_channels_dir() -> PathBuf {
     ironclaw_base_dir().join("channels")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::helpers::ENV_MUTEX;
+    use crate::error::ConfigError;
+    use crate::settings::Settings;
+
+    fn clear_channel_env() {
+        // SAFETY: Called only while holding ENV_MUTEX.
+        unsafe {
+            for key in [
+                "HTTP_PORT",
+                "HTTP_HOST",
+                "HTTP_WEBHOOK_SECRET",
+                "HTTP_USER_ID",
+                "GATEWAY_ENABLED",
+                "GATEWAY_HOST",
+                "GATEWAY_PORT",
+                "GATEWAY_AUTH_TOKEN",
+                "GATEWAY_USER_ID",
+                "SIGNAL_HTTP_URL",
+                "SIGNAL_ACCOUNT",
+                "SIGNAL_ALLOW_FROM",
+                "SIGNAL_DM_POLICY",
+                "SIGNAL_GROUP_POLICY",
+                "SIGNAL_ALLOW_FROM_GROUPS",
+                "SIGNAL_GROUP_ALLOW_FROM",
+                "SIGNAL_IGNORE_ATTACHMENTS",
+                "SIGNAL_IGNORE_STORIES",
+                "CLI_ENABLED",
+                "WASM_CHANNELS_DIR",
+                "WASM_CHANNELS_ENABLED",
+                "TELEGRAM_OWNER_ID",
+            ] {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    #[test]
+    fn gateway_user_id_uses_env_override() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_channel_env();
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("GATEWAY_USER_ID", "gateway-abc");
+        }
+
+        let cfg = ChannelsConfig::resolve(&Settings::default()).expect("resolve should succeed");
+        let gateway = cfg.gateway.expect("gateway should be enabled by default");
+        assert_eq!(gateway.user_id, "gateway-abc");
+    }
+
+    #[test]
+    fn signal_requires_account_when_http_url_set() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_channel_env();
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("SIGNAL_HTTP_URL", "http://127.0.0.1:8080");
+        }
+
+        let err = ChannelsConfig::resolve(&Settings::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue { ref key, .. } if key == "SIGNAL_ACCOUNT"
+        ));
+    }
+
+    #[test]
+    fn signal_allow_from_defaults_to_account_when_unset() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_channel_env();
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("SIGNAL_HTTP_URL", "http://127.0.0.1:8080");
+            std::env::set_var("SIGNAL_ACCOUNT", "+15551230000");
+        }
+
+        let cfg = ChannelsConfig::resolve(&Settings::default()).expect("resolve should succeed");
+        let signal = cfg.signal.expect("signal config should be present");
+        assert_eq!(signal.account, "+15551230000");
+        assert_eq!(signal.allow_from, vec!["+15551230000".to_string()]);
+    }
+
+    #[test]
+    fn telegram_owner_id_invalid_value_errors() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_channel_env();
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("TELEGRAM_OWNER_ID", "not-a-number");
+        }
+
+        let err = ChannelsConfig::resolve(&Settings::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue { ref key, .. } if key == "TELEGRAM_OWNER_ID"
+        ));
+    }
+}

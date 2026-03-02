@@ -517,13 +517,55 @@ impl SandboxStore for LibSqlBackend {
 
     async fn delete_job(&self, id: Uuid, user_id: &str) -> Result<bool, DatabaseError> {
         let conn = self.connect().await?;
-        conn.execute(
-            "DELETE FROM job_events WHERE job_id = ?1",
-            params![id.to_string()],
-        )
-        .await
-        .map_err(|e| DatabaseError::Query(e.to_string()))?;
-        let count = conn
+        conn.execute("BEGIN IMMEDIATE", ())
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+
+        let mut eligible_rows = match conn
+            .query(
+                r#"
+                SELECT 1
+                FROM agent_jobs
+                WHERE id = ?1 AND user_id = ?2
+                  AND status NOT IN ('running', 'creating', 'in_progress', 'pending')
+                LIMIT 1
+                "#,
+                params![id.to_string(), user_id],
+            )
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(DatabaseError::Query(e.to_string()));
+            }
+        };
+
+        let is_eligible = match eligible_rows.next().await {
+            Ok(row) => row.is_some(),
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(DatabaseError::Query(e.to_string()));
+            }
+        };
+
+        if !is_eligible {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            return Ok(false);
+        }
+
+        if let Err(e) = conn
+            .execute(
+                "DELETE FROM job_events WHERE job_id = ?1",
+                params![id.to_string()],
+            )
+            .await
+        {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            return Err(DatabaseError::Query(e.to_string()));
+        }
+
+        let count = match conn
             .execute(
                 r#"
                 DELETE FROM agent_jobs
@@ -533,8 +575,23 @@ impl SandboxStore for LibSqlBackend {
                 params![id.to_string(), user_id],
             )
             .await
+        {
+            Ok(count) => count,
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(DatabaseError::Query(e.to_string()));
+            }
+        };
+
+        if count == 0 {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            return Ok(false);
+        }
+
+        conn.execute("COMMIT", ())
+            .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
-        Ok(count > 0)
+        Ok(true)
     }
 
     async fn update_job_title(
@@ -552,5 +609,197 @@ impl SandboxStore for LibSqlBackend {
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(count > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    use crate::db::libsql::LibSqlBackend;
+    use crate::db::{Database, SandboxStore};
+    use crate::history::SandboxJobRecord;
+
+    async fn test_backend() -> (LibSqlBackend, tempfile::TempDir) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("sandbox-tests.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        (backend, tempdir)
+    }
+
+    fn sandbox_job(id: Uuid, user_id: &str, status: &str) -> SandboxJobRecord {
+        SandboxJobRecord {
+            id,
+            task: format!("task-{status}"),
+            status: status.to_string(),
+            user_id: user_id.to_string(),
+            project_dir: "/tmp/work".to_string(),
+            success: None,
+            failure_reason: None,
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            credential_grants_json: "[]".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_sandbox_jobs_only_updates_creating_and_running() {
+        let (backend, _tempdir) = test_backend().await;
+
+        let creating_id = Uuid::new_v4();
+        let running_id = Uuid::new_v4();
+        let completed_id = Uuid::new_v4();
+
+        backend
+            .save_sandbox_job(&sandbox_job(creating_id, "u1", "creating"))
+            .await
+            .unwrap();
+        backend
+            .save_sandbox_job(&sandbox_job(running_id, "u1", "running"))
+            .await
+            .unwrap();
+        backend
+            .save_sandbox_job(&sandbox_job(completed_id, "u1", "completed"))
+            .await
+            .unwrap();
+
+        let conn = backend.connect().await.unwrap();
+        let direct_id = Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO agent_jobs (id, title, description, status, source, user_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            libsql::params![direct_id.to_string(), "direct", "direct", "running", "direct", "u1"],
+        )
+        .await
+        .unwrap();
+
+        let updated = backend.cleanup_stale_sandbox_jobs().await.unwrap();
+        assert_eq!(updated, 2);
+
+        let creating = backend.get_sandbox_job(creating_id).await.unwrap().unwrap();
+        let running = backend.get_sandbox_job(running_id).await.unwrap().unwrap();
+        let completed = backend
+            .get_sandbox_job(completed_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(creating.status, "interrupted");
+        assert_eq!(running.status, "interrupted");
+        assert_eq!(completed.status, "completed");
+
+        let mut rows = conn
+            .query(
+                "SELECT status FROM agent_jobs WHERE id = ?1",
+                libsql::params![direct_id.to_string()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let status: String = row.get(0).unwrap_or_default();
+        assert_eq!(status, "running");
+    }
+
+    #[tokio::test]
+    async fn list_job_events_limit_returns_latest_n_in_ascending_order() {
+        let (backend, _tempdir) = test_backend().await;
+        let job_id = Uuid::new_v4();
+        backend
+            .save_sandbox_job(&sandbox_job(job_id, "u1", "running"))
+            .await
+            .unwrap();
+
+        backend
+            .save_job_event(job_id, "created", &serde_json::json!({"n": 1}))
+            .await
+            .unwrap();
+        backend
+            .save_job_event(job_id, "heartbeat", &serde_json::json!({"n": 2}))
+            .await
+            .unwrap();
+        backend
+            .save_job_event(job_id, "done", &serde_json::json!({"n": 3}))
+            .await
+            .unwrap();
+
+        let all = backend.list_job_events(job_id, None).await.unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            all.iter()
+                .map(|e| e.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["created", "heartbeat", "done"]
+        );
+
+        let limited = backend.list_job_events(job_id, Some(2)).await.unwrap();
+        assert_eq!(limited.len(), 2);
+        assert_eq!(
+            limited
+                .iter()
+                .map(|e| e.event_type.as_str())
+                .collect::<Vec<_>>(),
+            vec!["heartbeat", "done"]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_job_rejects_non_terminal_without_deleting_events() {
+        let (backend, _tempdir) = test_backend().await;
+        let job_id = Uuid::new_v4();
+        backend
+            .save_sandbox_job(&sandbox_job(job_id, "u1", "running"))
+            .await
+            .unwrap();
+        backend
+            .save_job_event(job_id, "progress", &serde_json::json!({"pct": 50}))
+            .await
+            .unwrap();
+
+        let deleted = backend.delete_job(job_id, "u1").await.unwrap();
+        assert!(!deleted);
+
+        let job = backend.get_sandbox_job(job_id).await.unwrap();
+        assert!(job.is_some());
+
+        let events = backend.list_job_events(job_id, None).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "progress");
+    }
+
+    #[tokio::test]
+    async fn all_jobs_summary_for_user_maps_both_agent_and_sandbox_statuses() {
+        let (backend, _tempdir) = test_backend().await;
+        let conn = backend.connect().await.unwrap();
+
+        let statuses = [
+            "pending",
+            "creating",
+            "in_progress",
+            "running",
+            "stuck",
+            "submitted",
+            "accepted",
+            "completed",
+            "cancelled",
+            "failed",
+            "interrupted",
+        ];
+        for status in statuses {
+            conn.execute(
+                "INSERT INTO agent_jobs (id, title, description, status, source, user_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                libsql::params![Uuid::new_v4().to_string(), status, "desc", status, "sandbox", "u1"],
+            )
+            .await
+            .unwrap();
+        }
+
+        let summary = backend.all_jobs_summary_for_user("u1").await.unwrap();
+        assert_eq!(summary.total, 11);
+        assert_eq!(summary.creating, 2);
+        assert_eq!(summary.running, 3);
+        assert_eq!(summary.completed, 3);
+        assert_eq!(summary.failed, 2);
+        assert_eq!(summary.interrupted, 1);
     }
 }

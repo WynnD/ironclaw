@@ -424,3 +424,241 @@ impl RoutineStore for LibSqlBackend {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use chrono::{DateTime, Utc};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use crate::agent::routine::{
+        NotifyConfig, Routine, RoutineAction, RoutineGuardrails, RoutineRun, RunStatus, Trigger,
+    };
+    use crate::db::libsql::LibSqlBackend;
+    use crate::db::{Database, RoutineStore};
+
+    async fn test_backend() -> (LibSqlBackend, tempfile::TempDir) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("routines-tests.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        (backend, tempdir)
+    }
+
+    fn build_routine(
+        user_id: &str,
+        name: &str,
+        enabled: bool,
+        trigger: Trigger,
+        next_fire_at: Option<DateTime<Utc>>,
+    ) -> Routine {
+        let now = Utc::now();
+        Routine {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            description: format!("routine-{name}"),
+            user_id: user_id.to_string(),
+            enabled,
+            trigger,
+            action: RoutineAction::Lightweight {
+                prompt: "do work".to_string(),
+                context_paths: vec!["context/ops.md".to_string()],
+                max_tokens: 512,
+            },
+            guardrails: RoutineGuardrails {
+                cooldown: Duration::from_secs(60),
+                max_concurrent: 2,
+                dedup_window: Some(Duration::from_secs(300)),
+            },
+            notify: NotifyConfig::default(),
+            last_run_at: None,
+            next_fire_at,
+            run_count: 0,
+            consecutive_failures: 0,
+            state: json!({"seed": true}),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn build_run(
+        routine_id: Uuid,
+        status: RunStatus,
+        started_at: DateTime<Utc>,
+        trigger_type: &str,
+    ) -> RoutineRun {
+        RoutineRun {
+            id: Uuid::new_v4(),
+            routine_id,
+            trigger_type: trigger_type.to_string(),
+            trigger_detail: None,
+            started_at,
+            completed_at: None,
+            status,
+            result_summary: None,
+            tokens_used: None,
+            job_id: None,
+            created_at: started_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_event_and_due_cron_routines_filters_correctly() {
+        let (backend, _tempdir) = test_backend().await;
+        let now = Utc::now();
+
+        let event_enabled = build_routine(
+            "u1",
+            "event-enabled",
+            true,
+            Trigger::Event {
+                channel: Some("telegram".to_string()),
+                pattern: "deploy".to_string(),
+            },
+            None,
+        );
+        let event_disabled = build_routine(
+            "u1",
+            "event-disabled",
+            false,
+            Trigger::Event {
+                channel: None,
+                pattern: "backup".to_string(),
+            },
+            None,
+        );
+        let cron_due = build_routine(
+            "u1",
+            "cron-due",
+            true,
+            Trigger::Cron {
+                schedule: "* * * * * *".to_string(),
+            },
+            Some(now - chrono::Duration::seconds(5)),
+        );
+        let cron_future = build_routine(
+            "u1",
+            "cron-future",
+            true,
+            Trigger::Cron {
+                schedule: "* * * * * *".to_string(),
+            },
+            Some(now + chrono::Duration::hours(1)),
+        );
+
+        backend.create_routine(&event_enabled).await.unwrap();
+        backend.create_routine(&event_disabled).await.unwrap();
+        backend.create_routine(&cron_due).await.unwrap();
+        backend.create_routine(&cron_future).await.unwrap();
+
+        let event_routines = backend.list_event_routines().await.unwrap();
+        assert_eq!(event_routines.len(), 1);
+        assert_eq!(event_routines[0].name, "event-enabled");
+
+        let due = backend.list_due_cron_routines().await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].name, "cron-due");
+
+        let by_name = backend.get_routine_by_name("u1", "cron-due").await.unwrap();
+        assert!(by_name.is_some());
+        assert_eq!(by_name.unwrap().id, cron_due.id);
+    }
+
+    #[tokio::test]
+    async fn complete_routine_run_updates_running_count_and_persists_fields() {
+        let (backend, _tempdir) = test_backend().await;
+        let routine = build_routine(
+            "u1",
+            "run-completion",
+            true,
+            Trigger::Manual,
+            Some(Utc::now()),
+        );
+        backend.create_routine(&routine).await.unwrap();
+
+        let older = build_run(
+            routine.id,
+            RunStatus::Running,
+            Utc::now() - chrono::Duration::minutes(2),
+            "manual",
+        );
+        let newer = build_run(
+            routine.id,
+            RunStatus::Running,
+            Utc::now() - chrono::Duration::minutes(1),
+            "manual",
+        );
+        backend.create_routine_run(&older).await.unwrap();
+        backend.create_routine_run(&newer).await.unwrap();
+
+        let before = backend
+            .count_running_routine_runs(routine.id)
+            .await
+            .unwrap();
+        assert_eq!(before, 2);
+
+        backend
+            .complete_routine_run(
+                newer.id,
+                RunStatus::Attention,
+                Some("needs review"),
+                Some(42),
+            )
+            .await
+            .unwrap();
+
+        let after = backend
+            .count_running_routine_runs(routine.id)
+            .await
+            .unwrap();
+        assert_eq!(after, 1);
+
+        let runs = backend.list_routine_runs(routine.id, 10).await.unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].id, newer.id);
+        assert_eq!(runs[0].status, RunStatus::Attention);
+        assert_eq!(runs[0].result_summary.as_deref(), Some("needs review"));
+        assert_eq!(runs[0].tokens_used, Some(42));
+        assert!(runs[0].completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn update_routine_runtime_persists_state_and_counters() {
+        let (backend, _tempdir) = test_backend().await;
+        let routine = build_routine("u1", "runtime-update", true, Trigger::Manual, None);
+        backend.create_routine(&routine).await.unwrap();
+
+        let last_run = Utc::now();
+        let next_fire = Some(Utc::now() + chrono::Duration::minutes(30));
+        backend
+            .update_routine_runtime(routine.id, last_run, next_fire, 7, 3, &json!({"k":"v"}))
+            .await
+            .unwrap();
+
+        let updated = backend.get_routine(routine.id).await.unwrap().unwrap();
+        assert_eq!(updated.run_count, 7);
+        assert_eq!(updated.consecutive_failures, 3);
+        assert_eq!(updated.state, json!({"k":"v"}));
+        assert!(updated.last_run_at.is_some());
+        assert!(updated.next_fire_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_routine_removes_associated_runs() {
+        let (backend, _tempdir) = test_backend().await;
+        let routine = build_routine("u1", "delete-cascade", true, Trigger::Manual, None);
+        backend.create_routine(&routine).await.unwrap();
+
+        let run = build_run(routine.id, RunStatus::Running, Utc::now(), "manual");
+        backend.create_routine_run(&run).await.unwrap();
+
+        let deleted = backend.delete_routine(routine.id).await.unwrap();
+        assert!(deleted);
+        assert!(backend.get_routine(routine.id).await.unwrap().is_none());
+
+        let runs_after = backend.list_routine_runs(routine.id, 10).await.unwrap();
+        assert!(runs_after.is_empty());
+    }
+}

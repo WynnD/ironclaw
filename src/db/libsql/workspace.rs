@@ -605,3 +605,253 @@ impl WorkspaceStore for LibSqlBackend {
         Ok(reciprocal_rank_fusion(fts_results, vector_results, config))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use uuid::Uuid;
+
+    use crate::db::libsql::LibSqlBackend;
+    use crate::db::{Database, WorkspaceStore};
+    use crate::error::WorkspaceError;
+    use crate::workspace::SearchConfig;
+
+    async fn test_backend() -> (LibSqlBackend, tempfile::TempDir) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("workspace-tests.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        (backend, tempdir)
+    }
+
+    #[tokio::test]
+    async fn get_or_create_document_by_path_is_idempotent_per_user_and_agent() {
+        let (backend, _tempdir) = test_backend().await;
+        let agent_a = Uuid::new_v4();
+        let agent_b = Uuid::new_v4();
+
+        let first = backend
+            .get_or_create_document_by_path("user-1", Some(agent_a), "context/vision.md")
+            .await
+            .unwrap();
+        let second = backend
+            .get_or_create_document_by_path("user-1", Some(agent_a), "context/vision.md")
+            .await
+            .unwrap();
+        let other_agent = backend
+            .get_or_create_document_by_path("user-1", Some(agent_b), "context/vision.md")
+            .await
+            .unwrap();
+        let other_user = backend
+            .get_or_create_document_by_path("user-2", Some(agent_a), "context/vision.md")
+            .await
+            .unwrap();
+
+        assert_eq!(first.id, second.id);
+        assert_ne!(first.id, other_agent.id);
+        assert_ne!(first.id, other_user.id);
+    }
+
+    #[tokio::test]
+    async fn list_directory_collapses_children_into_single_directory_entry() {
+        let (backend, _tempdir) = test_backend().await;
+
+        let docs = [
+            "README.md",
+            "projects/a.md",
+            "projects/b.md",
+            "projects/nested/c.md",
+            "notes/todo.md",
+        ];
+        for path in docs {
+            let doc = backend
+                .get_or_create_document_by_path("user-1", None, path)
+                .await
+                .unwrap();
+            backend
+                .update_document(doc.id, &format!("content for {path}"))
+                .await
+                .unwrap();
+        }
+
+        let root_entries = backend.list_directory("user-1", None, "").await.unwrap();
+        assert_eq!(
+            root_entries
+                .iter()
+                .map(|e| e.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["README.md", "notes", "projects"]
+        );
+
+        let projects = root_entries
+            .iter()
+            .find(|e| e.path == "projects")
+            .expect("projects entry should exist");
+        assert!(projects.is_directory);
+        assert!(projects.content_preview.is_none());
+
+        let projects_entries = backend
+            .list_directory("user-1", None, "projects")
+            .await
+            .unwrap();
+        assert_eq!(
+            projects_entries
+                .iter()
+                .map(|e| e.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["projects/a.md", "projects/b.md", "projects/nested"]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_document_by_path_removes_document_and_chunks() {
+        let (backend, _tempdir) = test_backend().await;
+
+        let doc = backend
+            .get_or_create_document_by_path("user-1", None, "daily/2026-03-02.md")
+            .await
+            .unwrap();
+        backend
+            .insert_chunk(doc.id, 0, "chunk-0", None)
+            .await
+            .unwrap();
+        backend
+            .insert_chunk(doc.id, 1, "chunk-1", None)
+            .await
+            .unwrap();
+
+        let chunks_before = backend
+            .get_chunks_without_embeddings("user-1", None, 10)
+            .await
+            .unwrap();
+        assert_eq!(chunks_before.len(), 2);
+
+        backend
+            .delete_document_by_path("user-1", None, "daily/2026-03-02.md")
+            .await
+            .unwrap();
+
+        let missing = backend
+            .get_document_by_path("user-1", None, "daily/2026-03-02.md")
+            .await;
+        assert!(matches!(
+            missing,
+            Err(WorkspaceError::DocumentNotFound { .. })
+        ));
+
+        let chunks_after = backend
+            .get_chunks_without_embeddings("user-1", None, 10)
+            .await
+            .unwrap();
+        assert!(chunks_after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_all_paths_respects_user_and_agent_scope() {
+        let (backend, _tempdir) = test_backend().await;
+        let agent_a = Uuid::new_v4();
+        let agent_b = Uuid::new_v4();
+
+        backend
+            .get_or_create_document_by_path("user-1", Some(agent_a), "a.md")
+            .await
+            .unwrap();
+        backend
+            .get_or_create_document_by_path("user-1", Some(agent_a), "z.md")
+            .await
+            .unwrap();
+        backend
+            .get_or_create_document_by_path("user-1", Some(agent_b), "b.md")
+            .await
+            .unwrap();
+        backend
+            .get_or_create_document_by_path("user-2", Some(agent_a), "c.md")
+            .await
+            .unwrap();
+
+        let user1_agent_a = backend
+            .list_all_paths("user-1", Some(agent_a))
+            .await
+            .unwrap();
+        assert_eq!(user1_agent_a, vec!["a.md".to_string(), "z.md".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_fts_only_respects_user_and_agent_scope() {
+        let (backend, _tempdir) = test_backend().await;
+        let agent_a = Uuid::new_v4();
+        let agent_b = Uuid::new_v4();
+
+        let doc_user1_a = backend
+            .get_or_create_document_by_path("user-1", Some(agent_a), "notes/a.md")
+            .await
+            .unwrap();
+        let doc_user1_b = backend
+            .get_or_create_document_by_path("user-1", Some(agent_b), "notes/b.md")
+            .await
+            .unwrap();
+        let doc_user2_a = backend
+            .get_or_create_document_by_path("user-2", Some(agent_a), "notes/c.md")
+            .await
+            .unwrap();
+
+        backend
+            .insert_chunk(
+                doc_user1_a.id,
+                0,
+                "kubernetes incident runbook and rollback notes",
+                None,
+            )
+            .await
+            .unwrap();
+        backend
+            .insert_chunk(
+                doc_user1_b.id,
+                0,
+                "kubernetes notes for a different agent",
+                None,
+            )
+            .await
+            .unwrap();
+        backend
+            .insert_chunk(doc_user2_a.id, 0, "kubernetes notes for another user", None)
+            .await
+            .unwrap();
+
+        let cfg = SearchConfig::default().fts_only().with_limit(10);
+        let results = backend
+            .hybrid_search("user-1", Some(agent_a), "kubernetes", None, &cfg)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].document_id, doc_user1_a.id);
+        assert!(results[0].from_fts());
+        assert!(!results[0].from_vector());
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_with_embedding_and_vector_disabled_uses_fts_results() {
+        let (backend, _tempdir) = test_backend().await;
+
+        let doc = backend
+            .get_or_create_document_by_path("user-1", None, "notes/search.md")
+            .await
+            .unwrap();
+        backend
+            .insert_chunk(doc.id, 0, "database migration rollback checklist", None)
+            .await
+            .unwrap();
+
+        let cfg = SearchConfig::default().fts_only().with_limit(5);
+        let embedding = vec![0.1_f32, 0.2, 0.3];
+        let results = backend
+            .hybrid_search("user-1", None, "rollback", Some(embedding.as_slice()), &cfg)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].document_id, doc.id);
+        assert!(results[0].from_fts());
+        assert!(!results[0].from_vector());
+    }
+}

@@ -353,3 +353,177 @@ impl ConversationStore for LibSqlBackend {
         Ok(found.is_some())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use serde_json::json;
+
+    use crate::db::libsql::LibSqlBackend;
+    use crate::db::{ConversationStore, Database};
+
+    async fn test_backend() -> (LibSqlBackend, tempfile::TempDir) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("conversations-tests.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+        (backend, tempdir)
+    }
+
+    #[tokio::test]
+    async fn update_conversation_metadata_field_preserves_other_top_level_keys() {
+        let (backend, _tempdir) = test_backend().await;
+        let conversation_id = backend
+            .create_conversation_with_metadata(
+                "web",
+                "user-1",
+                &json!({
+                    "thread_type": "assistant",
+                    "title": "Assistant",
+                    "prefs": { "theme": "light", "density": "comfortable" }
+                }),
+            )
+            .await
+            .unwrap();
+
+        backend
+            .update_conversation_metadata_field(
+                conversation_id,
+                "prefs",
+                &json!({ "theme": "dark" }),
+            )
+            .await
+            .unwrap();
+
+        let metadata = backend
+            .get_conversation_metadata(conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(metadata.get("thread_type"), Some(&json!("assistant")));
+        assert_eq!(metadata.get("title"), Some(&json!("Assistant")));
+        assert_eq!(
+            metadata.get("prefs"),
+            Some(&json!({ "theme": "dark", "density": "comfortable" }))
+        );
+    }
+
+    #[tokio::test]
+    async fn get_or_create_assistant_conversation_is_idempotent_per_user_and_channel() {
+        let (backend, _tempdir) = test_backend().await;
+
+        let first = backend
+            .get_or_create_assistant_conversation("user-1", "web")
+            .await
+            .unwrap();
+        let second = backend
+            .get_or_create_assistant_conversation("user-1", "web")
+            .await
+            .unwrap();
+        let other_channel = backend
+            .get_or_create_assistant_conversation("user-1", "signal")
+            .await
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_ne!(first, other_channel);
+
+        let metadata = backend
+            .get_conversation_metadata(first)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.get("thread_type"), Some(&json!("assistant")));
+    }
+
+    #[tokio::test]
+    async fn list_conversation_messages_paginated_returns_stable_pages() {
+        let (backend, _tempdir) = test_backend().await;
+        let conversation_id = backend
+            .create_conversation("web", "user-1", None)
+            .await
+            .unwrap();
+
+        backend
+            .add_conversation_message(conversation_id, "user", "m1")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        backend
+            .add_conversation_message(conversation_id, "assistant", "m2")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        backend
+            .add_conversation_message(conversation_id, "user", "m3")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        backend
+            .add_conversation_message(conversation_id, "assistant", "m4")
+            .await
+            .unwrap();
+
+        let (page_one, has_more_one) = backend
+            .list_conversation_messages_paginated(conversation_id, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            page_one
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m3", "m4"]
+        );
+        assert!(has_more_one);
+
+        let before = page_one.first().map(|m| m.created_at);
+        let (page_two, has_more_two) = backend
+            .list_conversation_messages_paginated(conversation_id, before, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            page_two
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m1", "m2"]
+        );
+        assert!(!has_more_two);
+    }
+
+    #[tokio::test]
+    async fn conversation_belongs_to_user_checks_owner() {
+        let (backend, _tempdir) = test_backend().await;
+
+        let a = backend
+            .create_conversation("web", "owner-a", None)
+            .await
+            .unwrap();
+        let b = backend
+            .create_conversation("web", "owner-b", None)
+            .await
+            .unwrap();
+
+        assert!(
+            backend
+                .conversation_belongs_to_user(a, "owner-a")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !backend
+                .conversation_belongs_to_user(a, "owner-b")
+                .await
+                .unwrap()
+        );
+        assert!(
+            backend
+                .conversation_belongs_to_user(b, "owner-b")
+                .await
+                .unwrap()
+        );
+    }
+}

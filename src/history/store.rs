@@ -1842,7 +1842,8 @@ impl Store {
             ON CONFLICT (tool_name) DO UPDATE SET
                 error_message = $2,
                 error_count = tool_failures.error_count + 1,
-                last_failure = NOW()
+                last_failure = NOW(),
+                repaired_at = NULL
             "#,
             &[&tool_name, &error_message],
         )

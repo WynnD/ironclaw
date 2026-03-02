@@ -89,3 +89,78 @@ pub(crate) fn parse_string_env(
 ) -> Result<String, ConfigError> {
     Ok(optional_env(key)?.unwrap_or_else(|| default.into()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::helpers::ENV_MUTEX;
+
+    fn clear_keys() {
+        // SAFETY: Called only while holding ENV_MUTEX.
+        unsafe {
+            std::env::remove_var("TEST_BOOL");
+            std::env::remove_var("TEST_NUM");
+            std::env::remove_var("TEST_STR");
+        }
+    }
+
+    #[test]
+    fn parse_bool_env_parses_and_uses_default() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_keys();
+
+        assert!(!parse_bool_env("TEST_BOOL", false).unwrap());
+        assert!(parse_bool_env("TEST_BOOL", true).unwrap());
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("TEST_BOOL", "TrUe");
+        }
+        assert!(parse_bool_env("TEST_BOOL", false).unwrap());
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("TEST_BOOL", "0");
+        }
+        assert!(!parse_bool_env("TEST_BOOL", true).unwrap());
+    }
+
+    #[test]
+    fn parse_bool_env_invalid_value_returns_error() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_keys();
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("TEST_BOOL", "maybe");
+        }
+
+        let err = parse_bool_env("TEST_BOOL", false).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidValue { ref key, .. } if key == "TEST_BOOL"));
+    }
+
+    #[test]
+    fn parse_optional_and_option_env_parse_values() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_keys();
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("TEST_NUM", "42");
+        }
+
+        let parsed_u64: u64 = parse_optional_env("TEST_NUM", 7_u64).unwrap();
+        assert_eq!(parsed_u64, 42);
+
+        let parsed_opt: Option<u64> = parse_option_env("TEST_NUM").unwrap();
+        assert_eq!(parsed_opt, Some(42));
+    }
+
+    #[test]
+    fn parse_string_env_uses_default_when_unset() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_keys();
+
+        let s = parse_string_env("TEST_STR", "fallback").unwrap();
+        assert_eq!(s, "fallback");
+    }
+}
