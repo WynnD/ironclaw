@@ -289,6 +289,31 @@ impl Store {
         Ok(rows.iter().map(|r| r.get("id")).collect())
     }
 
+    /// Mark direct jobs left in active states as failed after a restart.
+    ///
+    /// Direct jobs execute in-process. If the process restarts, any direct jobs
+    /// still marked pending/in-progress/stuck are no longer running and should
+    /// be finalized so they do not linger indefinitely in the UI.
+    pub async fn cleanup_stale_agent_jobs(&self) -> Result<u64, DatabaseError> {
+        let conn = self.conn().await?;
+        let count = conn
+            .execute(
+                r#"
+                UPDATE agent_jobs SET
+                    status = 'failed',
+                    failure_reason = COALESCE(failure_reason, 'Process restarted'),
+                    completed_at = COALESCE(completed_at, NOW())
+                WHERE source = 'direct' AND status IN ('pending', 'in_progress', 'stuck')
+                "#,
+                &[],
+            )
+            .await?;
+        if count > 0 {
+            tracing::info!("Marked {} stale direct jobs as failed", count);
+        }
+        Ok(count)
+    }
+
     // ==================== Actions ====================
 
     /// Save a job action.

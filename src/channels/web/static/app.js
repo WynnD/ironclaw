@@ -2640,7 +2640,7 @@ function renderJobsList(jobs) {
     } else if (job.state === 'failed' || job.state === 'interrupted') {
       actionBtns = '<button class="btn-restart" onclick="event.stopPropagation(); restartJob(\'' + job.id + '\')">Restart</button>';
     }
-    if (['completed', 'failed', 'interrupted', 'cancelled', 'Completed', 'Failed', 'Cancelled'].indexOf(job.state) !== -1) {
+    if (['completed', 'failed', 'interrupted', 'cancelled', 'stuck', 'Completed', 'Failed', 'Cancelled', 'Stuck'].indexOf(job.state) !== -1) {
       actionBtns += '<button class="btn-cancel btn-delete" onclick="event.stopPropagation(); deleteJob(\'' + job.id + '\')">Delete</button>';
     }
 

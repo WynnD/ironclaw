@@ -176,6 +176,28 @@ impl JobStore for LibSqlBackend {
         Ok(ids)
     }
 
+    async fn cleanup_stale_agent_jobs(&self) -> Result<u64, DatabaseError> {
+        let conn = self.connect().await?;
+        let now = fmt_ts(&Utc::now());
+        let count = conn
+            .execute(
+                r#"
+                UPDATE agent_jobs SET
+                    status = 'failed',
+                    failure_reason = COALESCE(failure_reason, 'Process restarted'),
+                    completed_at = COALESCE(completed_at, ?1)
+                WHERE source = 'direct' AND status IN ('pending', 'in_progress', 'stuck')
+                "#,
+                params![now],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        if count > 0 {
+            tracing::info!("Marked {} stale direct jobs as failed", count);
+        }
+        Ok(count)
+    }
+
     async fn list_agent_jobs(&self) -> Result<Vec<AgentJobRecord>, DatabaseError> {
         let conn = self.connect().await?;
         let mut rows = conn

@@ -175,6 +175,7 @@ pub trait JobStore: Send + Sync {
     ) -> Result<(), DatabaseError>;
     async fn mark_job_stuck(&self, id: Uuid) -> Result<(), DatabaseError>;
     async fn get_stuck_jobs(&self) -> Result<Vec<Uuid>, DatabaseError>;
+    async fn cleanup_stale_agent_jobs(&self) -> Result<u64, DatabaseError>;
     async fn list_agent_jobs(&self) -> Result<Vec<AgentJobRecord>, DatabaseError>;
     async fn agent_job_summary(&self) -> Result<AgentJobSummary, DatabaseError>;
     async fn save_action(&self, job_id: Uuid, action: &ActionRecord) -> Result<(), DatabaseError>;

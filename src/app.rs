@@ -229,6 +229,9 @@ impl AppBuilder {
         // Fire-and-forget housekeeping — no need to block startup.
         let db_cleanup = db.clone();
         tokio::spawn(async move {
+            if let Err(e) = db_cleanup.cleanup_stale_agent_jobs().await {
+                tracing::warn!("Failed to cleanup stale direct jobs: {}", e);
+            }
             if let Err(e) = db_cleanup.cleanup_stale_sandbox_jobs().await {
                 tracing::warn!("Failed to cleanup stale sandbox jobs: {}", e);
             }

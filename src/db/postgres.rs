@@ -215,6 +215,10 @@ impl JobStore for PgBackend {
         self.store.get_stuck_jobs().await
     }
 
+    async fn cleanup_stale_agent_jobs(&self) -> Result<u64, DatabaseError> {
+        self.store.cleanup_stale_agent_jobs().await
+    }
+
     async fn list_agent_jobs(&self) -> Result<Vec<AgentJobRecord>, DatabaseError> {
         self.store.list_agent_jobs().await
     }
