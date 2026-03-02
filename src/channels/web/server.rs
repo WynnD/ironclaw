@@ -800,6 +800,7 @@ async fn chat_history_handler(
                         name: tc.name.clone(),
                         has_result: tc.result.is_some(),
                         has_error: tc.error.is_some(),
+                        params_preview: Some(truncate_preview(&tc.parameters.to_string(), 300)),
                         result_preview: tc.result.as_ref().map(|r| {
                             let s = match r {
                                 serde_json::Value::String(s) => s.clone(),

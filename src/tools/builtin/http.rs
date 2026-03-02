@@ -457,11 +457,16 @@ impl Tool for HttpTool {
             return ApprovalRequirement::Always;
         }
         // 2. Target host has credential mappings (will be auto-injected)
+        //
+        // This path should still require an explicit allowlist decision, but it
+        // must remain usable in autonomous jobs (e.g. background workers making
+        // authenticated GitHub API calls). `UnlessAutoApproved` keeps the default
+        // safe while allowing operators to opt in via auto-approval.
         if let Some(ref registry) = self.credential_registry
             && let Some(host) = extract_host_from_params(params)
             && registry.has_credentials_for_host(&host)
         {
-            return ApprovalRequirement::Always;
+            return ApprovalRequirement::UnlessAutoApproved;
         }
         // Default: outbound HTTP still needs approval unless auto-approved
         ApprovalRequirement::UnlessAutoApproved
@@ -725,7 +730,7 @@ mod tests {
     // ── Credential registry approval tests ─────────────────────────────
 
     #[test]
-    fn test_host_with_credential_mapping_returns_always() {
+    fn test_host_with_credential_mapping_returns_unless_auto_approved() {
         use crate::secrets::CredentialMapping;
         use crate::tools::wasm::SharedCredentialRegistry;
 
@@ -750,7 +755,10 @@ mod tests {
             "method": "GET",
             "url": "https://api.openai.com/v1/models"
         });
-        assert_eq!(tool.requires_approval(&params), ApprovalRequirement::Always);
+        assert_eq!(
+            tool.requires_approval(&params),
+            ApprovalRequirement::UnlessAutoApproved
+        );
     }
 
     #[test]

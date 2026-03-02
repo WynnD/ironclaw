@@ -53,6 +53,7 @@ pub fn build_turns_from_db_messages(
                                 name: c["name"].as_str().unwrap_or("unknown").to_string(),
                                 has_result: c.get("result_preview").is_some(),
                                 has_error: c.get("error").is_some(),
+                                params_preview: c["params_preview"].as_str().map(String::from),
                                 result_preview: c["result_preview"].as_str().map(String::from),
                                 error: c["error"].as_str().map(String::from),
                             })

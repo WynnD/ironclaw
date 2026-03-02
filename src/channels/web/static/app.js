@@ -253,7 +253,7 @@ function connectSSE() {
   eventSource.addEventListener('tool_started', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
-    addToolCard(data.name);
+    addToolCard(data.name, data.params_preview);
   });
 
   eventSource.addEventListener('tool_completed', (e) => {
@@ -594,7 +594,7 @@ function removeActivityThinking() {
   }
 }
 
-function addToolCard(name) {
+function addToolCard(name, paramsPreview) {
   // Hide thinking instead of destroying — it may reappear between tool rounds
   if (_activityThinking) _activityThinking.style.display = 'none';
   const group = getOrCreateActivityGroup();
@@ -634,6 +634,13 @@ function addToolCard(name) {
 
   const output = document.createElement('pre');
   output.className = 'activity-tool-output';
+
+  if (paramsPreview) {
+    const params = document.createElement('pre');
+    params.className = 'activity-tool-output';
+    params.textContent = 'Params: ' + paramsPreview;
+    body.appendChild(params);
+  }
   body.appendChild(output);
 
   header.addEventListener('click', () => {
@@ -1139,6 +1146,13 @@ function createToolCallsSummaryElement(toolCalls) {
     nameSpan.className = 'tool-call-name';
     nameSpan.textContent = icon + ' ' + tc.name;
     item.appendChild(nameSpan);
+
+    if (tc.params_preview) {
+      const params = document.createElement('div');
+      params.className = 'tool-call-preview';
+      params.textContent = 'Params: ' + tc.params_preview;
+      item.appendChild(params);
+    }
 
     if (tc.result_preview) {
       const preview = document.createElement('div');

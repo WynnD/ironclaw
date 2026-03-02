@@ -56,6 +56,8 @@ pub struct ToolCallInfo {
     pub has_result: bool,
     pub has_error: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub params_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub result_preview: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -115,6 +117,8 @@ pub enum SseEvent {
     #[serde(rename = "tool_started")]
     ToolStarted {
         name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        params_preview: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         thread_id: Option<String>,
     },

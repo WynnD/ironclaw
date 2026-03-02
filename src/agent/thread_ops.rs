@@ -585,6 +585,11 @@ impl Agent {
             .iter()
             .map(|tc| {
                 let mut obj = serde_json::json!({ "name": tc.name });
+                let params_preview = match &tc.parameters {
+                    serde_json::Value::String(s) => truncate_preview(s, 300),
+                    other => truncate_preview(&other.to_string(), 300),
+                };
+                obj["params_preview"] = serde_json::Value::String(params_preview);
                 if let Some(ref result) = tc.result {
                     let preview = match result {
                         serde_json::Value::String(s) => truncate_preview(s, 500),
