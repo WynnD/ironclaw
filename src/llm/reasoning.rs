@@ -715,7 +715,8 @@ Respond in JSON format:
                     EMPTY_RESPONSE_RECOVERY_STATS
                         .fallback_emitted
                         .fetch_add(1, Ordering::Relaxed);
-                    EMPTY_RESPONSE_FALLBACK.to_string()
+                    synthesize_empty_response_fallback(&context.messages)
+                        .unwrap_or_else(|| EMPTY_RESPONSE_FALLBACK.to_string())
                 }
             } else {
                 cleaned
@@ -761,7 +762,8 @@ Respond in JSON format:
                     EMPTY_RESPONSE_RECOVERY_STATS
                         .fallback_emitted
                         .fetch_add(1, Ordering::Relaxed);
-                    EMPTY_RESPONSE_FALLBACK.to_string()
+                    synthesize_empty_response_fallback(&context.messages)
+                        .unwrap_or_else(|| EMPTY_RESPONSE_FALLBACK.to_string())
                 }
             } else {
                 cleaned
@@ -1728,6 +1730,133 @@ fn has_tool_result_since_last_user(messages: &[ChatMessage]) -> bool {
     false
 }
 
+fn synthesize_empty_response_fallback(messages: &[ChatMessage]) -> Option<String> {
+    let (tool_name, tool_content) = latest_tool_result_since_last_user(messages)?;
+
+    if tool_name == "discover_tools"
+        && let Some(summary) = summarize_discover_tools_fallback(&tool_content)
+    {
+        return Some(summary);
+    }
+
+    let payload = unwrap_tool_output_payload(&tool_content);
+    if payload.is_empty() {
+        return None;
+    }
+    let preview = truncate_plaintext_preview(&payload, 600);
+    if preview.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "I ran `{tool_name}`, but the model returned no visible final response. \
+         Latest tool output:\n\n{preview}"
+    ))
+}
+
+fn latest_tool_result_since_last_user(messages: &[ChatMessage]) -> Option<(String, String)> {
+    for msg in messages.iter().rev() {
+        if msg.role == crate::llm::Role::User {
+            break;
+        }
+        if msg.role == crate::llm::Role::Tool {
+            let name = msg.name.as_deref().unwrap_or("tool").trim();
+            let content = msg.content.trim();
+            if !name.is_empty() && !content.is_empty() {
+                return Some((name.to_string(), content.to_string()));
+            }
+        }
+    }
+    None
+}
+
+fn summarize_discover_tools_fallback(content: &str) -> Option<String> {
+    let payload = unwrap_tool_output_payload(content);
+    if payload.is_empty() {
+        return None;
+    }
+
+    let parsed: JsonValue = serde_json::from_str(&payload).ok()?;
+    let found = parsed.get("found").and_then(|v| v.as_u64())?;
+    if found == 0 {
+        return Some("I searched available tools but found no matches.".to_string());
+    }
+
+    let names: Vec<String> = parsed
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool.get("name").and_then(|n| n.as_str()))
+                .map(|name| name.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if names.is_empty() {
+        return Some(format!("I found {found} matching tools."));
+    }
+
+    let shown_names: Vec<String> = names.into_iter().take(8).collect();
+    let shown_count = shown_names.len() as u64;
+    let listed = shown_names.join(", ");
+    let remaining = found.saturating_sub(shown_count);
+
+    if remaining > 0 {
+        Some(format!(
+            "I found {found} matching tools: {listed} (and {remaining} more)."
+        ))
+    } else {
+        Some(format!("I found {found} matching tools: {listed}."))
+    }
+}
+
+fn unwrap_tool_output_payload(content: &str) -> String {
+    let trimmed = content.trim();
+    if !trimmed.starts_with("<tool_output") {
+        return trimmed.to_string();
+    }
+
+    let Some(open_end) = trimmed.find('>') else {
+        return trimmed.to_string();
+    };
+    let close_start = trimmed.rfind("</tool_output>").unwrap_or(trimmed.len());
+    if close_start <= open_end {
+        return trimmed.to_string();
+    }
+
+    decode_basic_xml_entities(trimmed[open_end + 1..close_start].trim())
+}
+
+fn decode_basic_xml_entities(input: &str) -> String {
+    input
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn truncate_plaintext_preview(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let normalized = collapse_newlines(text);
+    let char_count = normalized.chars().count();
+    if char_count <= max_chars {
+        return normalized;
+    }
+
+    let cut = normalized
+        .char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(normalized.len());
+    format!("{}...", &normalized[..cut])
+}
+
 /// Detects unverifiable tool-use claims in plain text.
 ///
 /// This is only used when the model returned no executable tool calls, to
@@ -2602,6 +2731,74 @@ mod tests {
             .expect("respond_with_tools should succeed");
         match output.result {
             RespondResult::Text(text) => assert_eq!(text, EMPTY_RESPONSE_FALLBACK),
+            _ => panic!("Expected text response"),
+        }
+        assert_eq!(output.usage.input_tokens, 4);
+        assert_eq!(output.usage.output_tokens, 5);
+        assert_eq!(
+            empty_response_recovery_snapshot(),
+            EmptyResponseRecoverySnapshot {
+                recovery_attempts: 1,
+                recovery_successes: 0,
+                fallback_emitted: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_respond_with_tools_uses_discover_tools_fallback_summary_when_recovery_empty() {
+        let _guard = EMPTY_RESPONSE_TEST_GUARD.lock().await;
+        reset_empty_response_recovery_stats_for_tests();
+        let llm: Arc<dyn LlmProvider> = Arc::new(SequencedLlm::new(
+            vec![CompletionResponse {
+                content: "<think>still hidden</think>".to_string(),
+                input_tokens: 1,
+                output_tokens: 1,
+                finish_reason: FinishReason::Stop,
+            }],
+            vec![ToolCompletionResponse {
+                content: Some("<think>hidden tool response</think>".to_string()),
+                tool_calls: Vec::new(),
+                input_tokens: 3,
+                output_tokens: 4,
+                finish_reason: FinishReason::Stop,
+            }],
+        ));
+        let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 100_000,
+            injection_check_enabled: false,
+        }));
+        let reasoning = Reasoning::new(llm, safety);
+        let context = ReasoningContext::new()
+            .with_message(ChatMessage::user("Please try again"))
+            .with_message(ChatMessage::tool_result(
+                "call_1",
+                "discover_tools",
+                r#"<tool_output name="discover_tools" sanitized="false">
+{"found":2,"tools":[{"name":"codex_search"},{"name":"codex_apply_patch"}]}
+</tool_output>"#,
+            ))
+            .with_tools(vec![ToolDefinition {
+                name: "discover_tools".to_string(),
+                description: "Search and activate tools".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"}
+                    }
+                }),
+            }]);
+
+        let output = reasoning
+            .respond_with_tools(&context)
+            .await
+            .expect("respond_with_tools should succeed");
+        match output.result {
+            RespondResult::Text(text) => {
+                assert!(text.contains("I found 2 matching tools"));
+                assert!(text.contains("codex_search"));
+                assert!(text.contains("codex_apply_patch"));
+            }
             _ => panic!("Expected text response"),
         }
         assert_eq!(output.usage.input_tokens, 4);
