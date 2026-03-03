@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::dispatcher::{
     AgenticLoopResult, ChatToolDispatchMode, check_auth_required, execute_chat_tool_standalone,
-    parse_auth_result,
+    missing_required_tool_params_error, parse_auth_result,
 };
 use crate::agent::session::{PendingApproval, Session, ThreadState};
 use crate::agent::submission::SubmissionResult;
@@ -882,69 +882,83 @@ impl Agent {
                 }
             });
 
-            let pending_dispatch_mode = self
-                .chat_tool_dispatch_mode(&pending.tool_name, &pending.parameters)
-                .await;
-
-            let tool_result = if pending_dispatch_mode == ChatToolDispatchMode::Blocking {
-                let _ = self
-                    .channels
-                    .send_status(
-                        &message.channel,
-                        StatusUpdate::ToolStarted {
-                            name: pending.tool_name.clone(),
-                            params_preview: Some(tool_params_preview(&pending.parameters, 100)),
-                        },
-                        &message.metadata,
-                    )
+            let tool_result: Result<String, Error> =
+                if let Some(tool) = self.tools().get(&pending.tool_name).await
+                && let Some(param_error) = missing_required_tool_params_error(
+                    &pending.tool_name,
+                    tool.as_ref(),
+                    &pending.parameters,
+                ) {
+                Err(crate::error::ToolError::InvalidParameters {
+                    name: pending.tool_name.clone(),
+                    reason: param_error,
+                }
+                .into())
+            } else {
+                let pending_dispatch_mode = self
+                    .chat_tool_dispatch_mode(&pending.tool_name, &pending.parameters)
                     .await;
 
-                let result = self
-                    .execute_chat_tool(&pending.tool_name, &pending.parameters, &job_ctx)
-                    .await;
-
-                let _ = self
-                    .channels
-                    .send_status(
-                        &message.channel,
-                        StatusUpdate::ToolCompleted {
-                            name: pending.tool_name.clone(),
-                            success: result.is_ok(),
-                        },
-                        &message.metadata,
-                    )
-                    .await;
-
-                if let Ok(ref output) = result
-                    && !output.is_empty()
-                {
+                if pending_dispatch_mode == ChatToolDispatchMode::Blocking {
                     let _ = self
                         .channels
                         .send_status(
                             &message.channel,
-                            StatusUpdate::ToolResult {
+                            StatusUpdate::ToolStarted {
                                 name: pending.tool_name.clone(),
-                                preview: output.clone(),
+                                params_preview: Some(tool_params_preview(&pending.parameters, 100)),
                             },
                             &message.metadata,
                         )
                         .await;
+
+                    let result = self
+                        .execute_chat_tool(&pending.tool_name, &pending.parameters, &job_ctx)
+                        .await;
+
+                    let _ = self
+                        .channels
+                        .send_status(
+                            &message.channel,
+                            StatusUpdate::ToolCompleted {
+                                name: pending.tool_name.clone(),
+                                success: result.is_ok(),
+                            },
+                            &message.metadata,
+                        )
+                        .await;
+
+                    if let Ok(ref output) = result
+                        && !output.is_empty()
+                    {
+                        let _ = self
+                            .channels
+                            .send_status(
+                                &message.channel,
+                                StatusUpdate::ToolResult {
+                                    name: pending.tool_name.clone(),
+                                    preview: output.clone(),
+                                },
+                                &message.metadata,
+                            )
+                            .await;
+                    }
+                    result
+                } else {
+                    let placeholder = self.dispatch_chat_tool_non_blocking(
+                        pending_dispatch_mode,
+                        message,
+                        session.clone(),
+                        thread_id,
+                        crate::llm::ToolCall {
+                            id: pending.tool_call_id.clone(),
+                            name: pending.tool_name.clone(),
+                            arguments: pending.parameters.clone(),
+                        },
+                        &job_ctx,
+                    );
+                    Ok(placeholder)
                 }
-                result
-            } else {
-                let placeholder = self.dispatch_chat_tool_non_blocking(
-                    pending_dispatch_mode,
-                    message,
-                    session.clone(),
-                    thread_id,
-                    crate::llm::ToolCall {
-                        id: pending.tool_call_id.clone(),
-                        name: pending.tool_name.clone(),
-                        arguments: pending.parameters.clone(),
-                    },
-                    &job_ctx,
-                );
-                Ok(placeholder)
             };
 
             // Build context including the tool result
@@ -1031,6 +1045,16 @@ impl Agent {
 
             for (idx, tc) in deferred_tool_calls.iter().enumerate() {
                 if let Some(tool) = self.tools().get(&tc.name).await {
+                    if let Some(param_error) =
+                        missing_required_tool_params_error(&tc.name, tool.as_ref(), &tc.arguments)
+                    {
+                        preflight.push((
+                            tc.clone(),
+                            DeferredPreflightOutcome::ImmediateResult(param_error),
+                        ));
+                        continue;
+                    }
+
                     use crate::tools::ApprovalRequirement;
                     let needs_approval = match tool.requires_approval(&tc.arguments) {
                         ApprovalRequirement::Never => false,

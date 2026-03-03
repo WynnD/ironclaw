@@ -602,6 +602,15 @@ impl Agent {
                         // Check if tool requires approval on the final (post-hook)
                         // parameters.
                         if let Some(tool) = self.tools().get(&tc.name).await {
+                            if let Some(param_error) = missing_required_tool_params_error(
+                                &tc.name,
+                                tool.as_ref(),
+                                &tc.arguments,
+                            ) {
+                                preflight.push((tc, PreflightOutcome::Rejected(param_error)));
+                                continue;
+                            }
+
                             use crate::tools::ApprovalRequirement;
                             let needs_approval = match tool.requires_approval(&tc.arguments) {
                                 ApprovalRequirement::Never => false,
@@ -1059,6 +1068,54 @@ pub(super) async fn execute_chat_tool_standalone(
     })
 }
 
+pub(super) fn missing_required_tool_params(
+    tool: &dyn crate::tools::Tool,
+    params: &serde_json::Value,
+) -> Vec<String> {
+    let schema = tool.parameters_schema();
+    let required = schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if required.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(obj) = params.as_object() else {
+        return required;
+    };
+
+    required
+        .into_iter()
+        .filter(|k| !obj.contains_key(k))
+        .collect()
+}
+
+pub(super) fn missing_required_tool_params_error(
+    tool_name: &str,
+    tool: &dyn crate::tools::Tool,
+    params: &serde_json::Value,
+) -> Option<String> {
+    let missing = missing_required_tool_params(tool, params);
+    if missing.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Tool `{}` missing required parameter(s): {}. Provided params: {}",
+            tool_name,
+            missing.join(", "),
+            params
+        ))
+    }
+}
+
 fn background_turn_user_input(tool_name: &str) -> String {
     format!("[background:mcp:{}]", tool_name)
 }
@@ -1350,9 +1407,9 @@ mod tests {
         ToolCompletionRequest, ToolCompletionResponse,
     };
     use crate::safety::SafetyLayer;
-    use crate::tools::ToolRegistry;
+    use crate::tools::{Tool, ToolOutput, ToolRegistry};
 
-    use super::check_auth_required;
+    use super::{check_auth_required, missing_required_tool_params};
 
     /// Minimal LLM provider for unit tests that always returns a static response.
     struct StaticLlmProvider;
@@ -1447,6 +1504,46 @@ mod tests {
     fn test_make_test_agent_succeeds() {
         // Verify that a test agent can be constructed without panicking.
         let _agent = make_test_agent();
+    }
+
+    struct RequiredParamTool;
+
+    #[async_trait]
+    impl Tool for RequiredParamTool {
+        fn name(&self) -> &str {
+            "required_param_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Requires repo and owner params"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "owner": {"type":"string"},
+                    "repo": {"type":"string"},
+                    "optional": {"type":"string"}
+                },
+                "required": ["owner", "repo"]
+            })
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &crate::context::JobContext,
+        ) -> Result<ToolOutput, crate::tools::ToolError> {
+            Ok(ToolOutput::text("ok", Duration::from_millis(1)))
+        }
+    }
+
+    #[test]
+    fn test_missing_required_tool_params_detects_missing_fields() {
+        let tool = RequiredParamTool;
+        let missing = missing_required_tool_params(&tool, &serde_json::json!({"owner":"acme"}));
+        assert_eq!(missing, vec!["repo".to_string()]);
     }
 
     #[test]
