@@ -266,6 +266,14 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether this tool supports asynchronous non-blocking/background execution hints.
+    ///
+    /// Tools that return `true` can be dispatched in chat without waiting for completion
+    /// when execution metadata requests it (for example, MCP tools).
+    fn supports_background_execution(&self) -> bool {
+        false
+    }
+
     /// Get the tool schema for LLM function calling.
     fn schema(&self) -> ToolSchema {
         ToolSchema {

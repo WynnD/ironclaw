@@ -11,7 +11,8 @@ use uuid::Uuid;
 
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::dispatcher::{
-    AgenticLoopResult, check_auth_required, execute_chat_tool_standalone, parse_auth_result,
+    AgenticLoopResult, ChatToolDispatchMode, check_auth_required, execute_chat_tool_standalone,
+    parse_auth_result,
 };
 use crate::agent::session::{PendingApproval, Session, ThreadState};
 use crate::agent::submission::SubmissionResult;
@@ -881,49 +882,70 @@ impl Agent {
                 }
             });
 
-            let _ = self
-                .channels
-                .send_status(
-                    &message.channel,
-                    StatusUpdate::ToolStarted {
-                        name: pending.tool_name.clone(),
-                        params_preview: Some(tool_params_preview(&pending.parameters, 100)),
-                    },
-                    &message.metadata,
-                )
+            let pending_dispatch_mode = self
+                .chat_tool_dispatch_mode(&pending.tool_name, &pending.parameters)
                 .await;
 
-            let tool_result = self
-                .execute_chat_tool(&pending.tool_name, &pending.parameters, &job_ctx)
-                .await;
-
-            let _ = self
-                .channels
-                .send_status(
-                    &message.channel,
-                    StatusUpdate::ToolCompleted {
-                        name: pending.tool_name.clone(),
-                        success: tool_result.is_ok(),
-                    },
-                    &message.metadata,
-                )
-                .await;
-
-            if let Ok(ref output) = tool_result
-                && !output.is_empty()
-            {
+            let tool_result = if pending_dispatch_mode == ChatToolDispatchMode::Blocking {
                 let _ = self
                     .channels
                     .send_status(
                         &message.channel,
-                        StatusUpdate::ToolResult {
+                        StatusUpdate::ToolStarted {
                             name: pending.tool_name.clone(),
-                            preview: output.clone(),
+                            params_preview: Some(tool_params_preview(&pending.parameters, 100)),
                         },
                         &message.metadata,
                     )
                     .await;
-            }
+
+                let result = self
+                    .execute_chat_tool(&pending.tool_name, &pending.parameters, &job_ctx)
+                    .await;
+
+                let _ = self
+                    .channels
+                    .send_status(
+                        &message.channel,
+                        StatusUpdate::ToolCompleted {
+                            name: pending.tool_name.clone(),
+                            success: result.is_ok(),
+                        },
+                        &message.metadata,
+                    )
+                    .await;
+
+                if let Ok(ref output) = result
+                    && !output.is_empty()
+                {
+                    let _ = self
+                        .channels
+                        .send_status(
+                            &message.channel,
+                            StatusUpdate::ToolResult {
+                                name: pending.tool_name.clone(),
+                                preview: output.clone(),
+                            },
+                            &message.metadata,
+                        )
+                        .await;
+                }
+                result
+            } else {
+                let placeholder = self.dispatch_chat_tool_non_blocking(
+                    pending_dispatch_mode,
+                    message,
+                    session.clone(),
+                    thread_id,
+                    crate::llm::ToolCall {
+                        id: pending.tool_call_id.clone(),
+                        name: pending.tool_name.clone(),
+                        arguments: pending.parameters.clone(),
+                    },
+                    &job_ctx,
+                );
+                Ok(placeholder)
+            };
 
             // Build context including the tool result
             let mut context_messages = pending.context_messages;
@@ -993,9 +1015,14 @@ impl Agent {
             }
 
             // === Phase 1: Preflight (sequential) ===
-            // Walk deferred tools checking approval. Collect runnable
-            // tools; stop at the first that needs approval.
-            let mut runnable: Vec<crate::llm::ToolCall> = Vec::new();
+            // Walk deferred tools checking approval/dispatch mode.
+            // Collect runnable tools; stop at the first that needs approval.
+            enum DeferredPreflightOutcome {
+                Runnable,
+                ImmediateResult(String),
+            }
+            let mut preflight: Vec<(crate::llm::ToolCall, DeferredPreflightOutcome)> = Vec::new();
+            let mut runnable: Vec<(usize, crate::llm::ToolCall)> = Vec::new();
             let mut approval_needed: Option<(
                 usize,
                 crate::llm::ToolCall,
@@ -1022,18 +1049,36 @@ impl Agent {
                         approval_needed = Some((idx, tc.clone(), tool));
                         break; // remaining tools stay deferred
                     }
+
+                    let dispatch_mode = self.chat_tool_dispatch_mode(&tc.name, &tc.arguments).await;
+                    if dispatch_mode != ChatToolDispatchMode::Blocking {
+                        let immediate = self.dispatch_chat_tool_non_blocking(
+                            dispatch_mode,
+                            message,
+                            session.clone(),
+                            thread_id,
+                            tc.clone(),
+                            &job_ctx,
+                        );
+                        preflight.push((
+                            tc.clone(),
+                            DeferredPreflightOutcome::ImmediateResult(immediate),
+                        ));
+                        continue;
+                    }
                 }
 
-                runnable.push(tc.clone());
+                let pf_idx = preflight.len();
+                preflight.push((tc.clone(), DeferredPreflightOutcome::Runnable));
+                runnable.push((pf_idx, tc.clone()));
             }
 
             // === Phase 2: Parallel execution ===
-            let exec_results: Vec<(crate::llm::ToolCall, Result<String, Error>)> = if runnable.len()
-                <= 1
-            {
+            let mut exec_results: Vec<Option<Result<String, Error>>> =
+                (0..preflight.len()).map(|_| None).collect();
+            if runnable.len() <= 1 {
                 // Single tool (or none): execute inline
-                let mut results = Vec::new();
-                for tc in &runnable {
+                for (pf_idx, tc) in &runnable {
                     let _ = self
                         .channels
                         .send_status(
@@ -1062,15 +1107,15 @@ impl Agent {
                         )
                         .await;
 
-                    results.push((tc.clone(), result));
+                    exec_results[*pf_idx] = Some(result);
                 }
-                results
             } else {
                 // Multiple tools: execute in parallel via JoinSet
                 let mut join_set = JoinSet::new();
                 let runnable_count = runnable.len();
 
-                for (spawn_idx, tc) in runnable.iter().enumerate() {
+                for (spawn_idx, (pf_idx, tc)) in runnable.iter().enumerate() {
+                    let pf_idx = *pf_idx;
                     let tools = self.tools().clone();
                     let safety = self.safety().clone();
                     let channels = self.channels.clone();
@@ -1111,17 +1156,17 @@ impl Agent {
                             )
                             .await;
 
-                        (spawn_idx, tc, result)
+                        (spawn_idx, pf_idx, tc, result)
                     });
                 }
 
                 // Collect and reorder by original index
-                let mut ordered: Vec<Option<(crate::llm::ToolCall, Result<String, Error>)>> =
+                let mut ordered: Vec<Option<(usize, Result<String, Error>)>> =
                     (0..runnable_count).map(|_| None).collect();
                 while let Some(join_result) = join_set.join_next().await {
                     match join_result {
-                        Ok((idx, tc, result)) => {
-                            ordered[idx] = Some((tc, result));
+                        Ok((idx, pf_idx, _tc, result)) => {
+                            ordered[idx] = Some((pf_idx, result));
                         }
                         Err(e) => {
                             if e.is_panic() {
@@ -1139,24 +1184,39 @@ impl Agent {
                     .enumerate()
                     .map(|(i, opt)| {
                         opt.unwrap_or_else(|| {
-                            let tc = runnable[i].clone();
+                            let (pf_idx, tc) = runnable[i].clone();
                             let err: Error = crate::error::ToolError::ExecutionFailed {
                                 name: tc.name.clone(),
                                 reason: "Task failed during execution".to_string(),
                             }
                             .into();
-                            (tc, Err(err))
+                            (pf_idx, Err(err))
                         })
                     })
-                    .collect()
-            };
+                    .for_each(|(pf_idx, result)| {
+                        exec_results[pf_idx] = Some(result);
+                    });
+            }
 
             // === Phase 3: Post-flight (sequential, in original order) ===
             // Process all results before any conditional return so every
             // tool result is recorded in the session audit trail.
             let mut deferred_auth: Option<String> = None;
 
-            for (tc, deferred_result) in exec_results {
+            for (pf_idx, (tc, outcome)) in preflight.into_iter().enumerate() {
+                let deferred_result = match outcome {
+                    DeferredPreflightOutcome::ImmediateResult(immediate_msg) => Ok(immediate_msg),
+                    DeferredPreflightOutcome::Runnable => {
+                        exec_results[pf_idx].take().unwrap_or_else(|| {
+                            Err(crate::error::ToolError::ExecutionFailed {
+                                name: tc.name.clone(),
+                                reason: "No result available".to_string(),
+                            }
+                            .into())
+                        })
+                    }
+                };
+
                 if let Ok(ref output) = deferred_result
                     && !output.is_empty()
                 {

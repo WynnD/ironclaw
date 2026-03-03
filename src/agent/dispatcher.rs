@@ -6,17 +6,21 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use chrono::Utc;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::agent::context_monitor::estimate_text_tokens;
-use crate::agent::session::{PendingApproval, Session, ThreadState};
+use crate::agent::session::{PendingApproval, Session, Thread, ThreadState, Turn};
 use crate::agent::{Agent, tool_params_preview};
-use crate::channels::{IncomingMessage, StatusUpdate};
+use crate::channels::web::util::truncate_preview;
+use crate::channels::{IncomingMessage, OutgoingResponse, StatusUpdate};
 use crate::context::JobContext;
+use crate::db::Database;
 use crate::error::Error;
 use crate::llm::{ChatMessage, Reasoning, ReasoningContext, RespondResult};
+use crate::tools::mcp::{McpExecutionMode, mcp_execution_mode_from_params};
 
 /// Result of the agentic loop execution.
 pub(super) enum AgenticLoopResult {
@@ -29,7 +33,124 @@ pub(super) enum AgenticLoopResult {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChatToolDispatchMode {
+    Blocking,
+    NonBlocking,
+    Background,
+}
+
 impl Agent {
+    pub(super) async fn chat_tool_dispatch_mode(
+        &self,
+        tool_name: &str,
+        params: &serde_json::Value,
+    ) -> ChatToolDispatchMode {
+        let Some(tool) = self.tools().get(tool_name).await else {
+            return ChatToolDispatchMode::Blocking;
+        };
+
+        if !tool.supports_background_execution() {
+            return ChatToolDispatchMode::Blocking;
+        }
+
+        match mcp_execution_mode_from_params(params) {
+            McpExecutionMode::Blocking => ChatToolDispatchMode::Blocking,
+            McpExecutionMode::NonBlocking => ChatToolDispatchMode::NonBlocking,
+            McpExecutionMode::Background => ChatToolDispatchMode::Background,
+        }
+    }
+
+    pub(super) fn dispatch_chat_tool_non_blocking(
+        &self,
+        mode: ChatToolDispatchMode,
+        message: &IncomingMessage,
+        session: Arc<Mutex<Session>>,
+        thread_id: Uuid,
+        tool_call: crate::llm::ToolCall,
+        job_ctx: &JobContext,
+    ) -> String {
+        let channels = self.channels.clone();
+        let tools = self.tools().clone();
+        let safety = self.safety().clone();
+        let store = self.store().cloned();
+        let metadata = message.metadata.clone();
+        let channel = message.channel.clone();
+        let message_clone = message.clone();
+        let job_ctx = job_ctx.clone();
+        let tc = tool_call.clone();
+        let session_for_background = session.clone();
+        let user_id = message.user_id.clone();
+
+        tokio::spawn(async move {
+            let _ = channels
+                .send_status(
+                    &channel,
+                    StatusUpdate::ToolStarted {
+                        name: tc.name.clone(),
+                        params_preview: Some(tool_params_preview(&tc.arguments, 100)),
+                    },
+                    &metadata,
+                )
+                .await;
+
+            let result =
+                execute_chat_tool_standalone(&tools, &safety, &tc.name, &tc.arguments, &job_ctx)
+                    .await;
+
+            let _ = channels
+                .send_status(
+                    &channel,
+                    StatusUpdate::ToolCompleted {
+                        name: tc.name.clone(),
+                        success: result.is_ok(),
+                    },
+                    &metadata,
+                )
+                .await;
+
+            if let Ok(ref output) = result
+                && !output.is_empty()
+            {
+                let _ = channels
+                    .send_status(
+                        &channel,
+                        StatusUpdate::ToolResult {
+                            name: tc.name.clone(),
+                            preview: output.clone(),
+                        },
+                        &metadata,
+                    )
+                    .await;
+            }
+
+            if mode == ChatToolDispatchMode::Background {
+                let completion_ctx = BackgroundCompletionContext {
+                    session: session_for_background,
+                    thread_id,
+                    user_id,
+                    tool_call: tc,
+                    store,
+                    channels,
+                    reply_to: message_clone,
+                };
+                publish_background_tool_completion(completion_ctx, &result).await;
+            }
+        });
+
+        match mode {
+            ChatToolDispatchMode::NonBlocking => format!(
+                "MCP tool '{}' started in non-blocking mode. Continuing without waiting for completion.",
+                tool_call.name
+            ),
+            ChatToolDispatchMode::Background => format!(
+                "MCP tool '{}' started in background mode. I will post the final result here when it completes.",
+                tool_call.name
+            ),
+            ChatToolDispatchMode::Blocking => "Tool dispatched.".to_string(),
+        }
+    }
+
     /// Run the agentic loop: call LLM, execute tools, repeat until text response.
     ///
     /// Returns `AgenticLoopResult::Response` on completion, or
@@ -420,6 +541,8 @@ impl Agent {
                         Rejected(String),
                         /// Tool passed preflight and will be executed.
                         Runnable,
+                        /// Tool was dispatched asynchronously; use this immediate placeholder.
+                        ImmediateResult(String),
                     }
                     let mut preflight: Vec<(crate::llm::ToolCall, PreflightOutcome)> = Vec::new();
                     let mut runnable: Vec<(usize, crate::llm::ToolCall)> = Vec::new();
@@ -496,6 +619,22 @@ impl Agent {
                             if needs_approval {
                                 approval_needed = Some((idx, tc, tool));
                                 break; // remaining tools are deferred
+                            }
+
+                            let dispatch_mode =
+                                self.chat_tool_dispatch_mode(&tc.name, &tc.arguments).await;
+
+                            if dispatch_mode != ChatToolDispatchMode::Blocking {
+                                let immediate = self.dispatch_chat_tool_non_blocking(
+                                    dispatch_mode,
+                                    message,
+                                    session.clone(),
+                                    thread_id,
+                                    tc.clone(),
+                                    &job_ctx,
+                                );
+                                preflight.push((tc, PreflightOutcome::ImmediateResult(immediate)));
+                                continue;
                             }
                         }
 
@@ -655,6 +794,21 @@ impl Agent {
                                 }
                                 context_messages
                                     .push(ChatMessage::tool_result(&tc.id, &tc.name, error_msg));
+                            }
+                            PreflightOutcome::ImmediateResult(immediate_msg) => {
+                                {
+                                    let mut sess = session.lock().await;
+                                    if let Some(thread) = sess.threads.get_mut(&thread_id)
+                                        && let Some(turn) = thread.last_turn_mut()
+                                    {
+                                        turn.record_tool_result(serde_json::json!(immediate_msg));
+                                    }
+                                }
+                                context_messages.push(ChatMessage::tool_result(
+                                    &tc.id,
+                                    &tc.name,
+                                    immediate_msg,
+                                ));
                             }
                             PreflightOutcome::Runnable => {
                                 // Retrieve the execution result for this slot
@@ -903,6 +1057,173 @@ pub(super) async fn execute_chat_tool_standalone(
         }
         .into()
     })
+}
+
+fn background_turn_user_input(tool_name: &str) -> String {
+    format!("[background:mcp:{}]", tool_name)
+}
+
+fn background_completion_message(tool_name: &str, result: &Result<String, Error>) -> String {
+    match result {
+        Ok(output) => format!(
+            "Background MCP tool `{}` completed.\n\n{}",
+            tool_name,
+            truncate_preview(output, 4000)
+        ),
+        Err(e) => format!(
+            "Background MCP tool `{}` failed.\n\nError: {}",
+            tool_name, e
+        ),
+    }
+}
+
+fn append_background_turn(
+    thread: &mut Thread,
+    tool_name: &str,
+    tool_args: serde_json::Value,
+    result: &Result<String, Error>,
+    assistant_msg: &str,
+) {
+    let turn_number = thread.turns.len();
+    let mut turn = Turn::new(turn_number, background_turn_user_input(tool_name));
+    turn.record_tool_call(tool_name.to_string(), tool_args);
+    match result {
+        Ok(output) => turn.record_tool_result(serde_json::json!(output)),
+        Err(e) => turn.record_tool_error(e.to_string()),
+    }
+    turn.complete(assistant_msg.to_string());
+    thread.turns.push(turn);
+    thread.updated_at = Utc::now();
+}
+
+async fn persist_background_turn(
+    store: Arc<dyn Database>,
+    thread_id: Uuid,
+    user_id: &str,
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+    result: &Result<String, Error>,
+    assistant_msg: &str,
+) {
+    if let Err(e) = store
+        .ensure_conversation(thread_id, "gateway", user_id, None)
+        .await
+    {
+        tracing::warn!(
+            thread_id = %thread_id,
+            tool = %tool_name,
+            "Failed to ensure conversation for background MCP completion: {}",
+            e
+        );
+        return;
+    }
+
+    let user_msg = background_turn_user_input(tool_name);
+    if let Err(e) = store
+        .add_conversation_message(thread_id, "user", &user_msg)
+        .await
+    {
+        tracing::warn!(
+            thread_id = %thread_id,
+            tool = %tool_name,
+            "Failed to persist background MCP synthetic user row: {}",
+            e
+        );
+    }
+
+    let mut summary = serde_json::json!({
+        "name": tool_name,
+        "params_preview": truncate_preview(&tool_args.to_string(), 300),
+    });
+    match result {
+        Ok(output) => {
+            summary["result_preview"] = serde_json::Value::String(truncate_preview(output, 500));
+        }
+        Err(e) => {
+            summary["error"] = serde_json::Value::String(truncate_preview(&e.to_string(), 200));
+        }
+    }
+
+    if let Ok(tool_calls_json) = serde_json::to_string(&vec![summary])
+        && let Err(e) = store
+            .add_conversation_message(thread_id, "tool_calls", &tool_calls_json)
+            .await
+    {
+        tracing::warn!(
+            thread_id = %thread_id,
+            tool = %tool_name,
+            "Failed to persist background MCP tool_calls row: {}",
+            e
+        );
+    }
+
+    if let Err(e) = store
+        .add_conversation_message(thread_id, "assistant", assistant_msg)
+        .await
+    {
+        tracing::warn!(
+            thread_id = %thread_id,
+            tool = %tool_name,
+            "Failed to persist background MCP assistant row: {}",
+            e
+        );
+    }
+}
+
+struct BackgroundCompletionContext {
+    session: Arc<Mutex<Session>>,
+    thread_id: Uuid,
+    user_id: String,
+    tool_call: crate::llm::ToolCall,
+    store: Option<Arc<dyn Database>>,
+    channels: Arc<crate::channels::ChannelManager>,
+    reply_to: IncomingMessage,
+}
+
+async fn publish_background_tool_completion(
+    completion: BackgroundCompletionContext,
+    result: &Result<String, Error>,
+) {
+    let assistant_msg = background_completion_message(&completion.tool_call.name, result);
+
+    {
+        let mut sess = completion.session.lock().await;
+        if let Some(thread) = sess.threads.get_mut(&completion.thread_id) {
+            append_background_turn(
+                thread,
+                &completion.tool_call.name,
+                completion.tool_call.arguments.clone(),
+                result,
+                &assistant_msg,
+            );
+        }
+    }
+
+    if let Some(store) = completion.store {
+        persist_background_turn(
+            store,
+            completion.thread_id,
+            &completion.user_id,
+            &completion.tool_call.name,
+            &completion.tool_call.arguments,
+            result,
+            &assistant_msg,
+        )
+        .await;
+    }
+
+    if let Err(e) = completion
+        .channels
+        .respond(&completion.reply_to, OutgoingResponse::text(assistant_msg))
+        .await
+    {
+        tracing::warn!(
+            thread_id = %completion.thread_id,
+            tool = %completion.tool_call.name,
+            "Failed sending background MCP completion response: {}",
+            e
+        );
+    }
 }
 
 /// Parsed auth result fields for emitting StatusUpdate::AuthRequired.

@@ -18,6 +18,7 @@ use crate::tools::mcp::protocol::{
     CallToolResult, InitializeResult, ListToolsResult, McpRequest, McpResponse, McpTool,
 };
 use crate::tools::mcp::session::McpSessionManager;
+use crate::tools::mcp::{IRONCLAW_EXECUTION_HINT_KEY, strip_mcp_execution_hints};
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput};
 
 const DEFAULT_MCP_TIMEOUT_SECS: u64 = 60;
@@ -549,6 +550,33 @@ fn extract_server_name(url: &str) -> String {
         .replace('.', "_")
 }
 
+fn augment_mcp_schema_with_execution_hints(schema: &serde_json::Value) -> serde_json::Value {
+    let mut schema = schema.clone();
+    let Some(root) = schema.as_object_mut() else {
+        return schema;
+    };
+    let Some(properties) = root.get_mut("properties").and_then(|v| v.as_object_mut()) else {
+        return schema;
+    };
+
+    properties.insert(
+        IRONCLAW_EXECUTION_HINT_KEY.to_string(),
+        serde_json::json!({
+            "type": "object",
+            "description": "IronClaw-local execution hints. Not forwarded to MCP servers. mode=non_blocking continues immediately. mode=background continues immediately and posts the final result back into chat when complete.",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["blocking", "non_blocking", "background"]
+                }
+            },
+            "additionalProperties": false
+        }),
+    );
+
+    schema
+}
+
 /// Wrapper that implements Tool for an MCP tool.
 struct McpToolWrapper {
     tool: McpTool,
@@ -570,7 +598,7 @@ impl Tool for McpToolWrapper {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        self.tool.input_schema.clone()
+        augment_mcp_schema_with_execution_hints(&self.tool.input_schema)
     }
 
     async fn execute(
@@ -581,7 +609,8 @@ impl Tool for McpToolWrapper {
         let start = std::time::Instant::now();
 
         // Use the original tool name (without prefix) for the actual call
-        let result = self.client.call_tool(&self.tool.name, params).await?;
+        let clean_params = strip_mcp_execution_hints(&params);
+        let result = self.client.call_tool(&self.tool.name, clean_params).await?;
 
         // Convert content blocks to a single result
         let content: String = result
@@ -600,6 +629,10 @@ impl Tool for McpToolWrapper {
 
     fn requires_sanitization(&self) -> bool {
         true // MCP tools are external, always sanitize
+    }
+
+    fn supports_background_execution(&self) -> bool {
+        true
     }
 
     fn execution_timeout(&self) -> Duration {
@@ -791,5 +824,25 @@ mod tests {
             ApprovalRequirement::Always
         );
         assert_eq!(codex_wrapper.execution_timeout().as_secs(), 300);
+    }
+
+    #[test]
+    fn test_augment_schema_with_execution_hints_adds_reserved_property() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string" }
+            },
+            "required": ["query"]
+        });
+
+        let augmented = augment_mcp_schema_with_execution_hints(&schema);
+        let props = augmented
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("properties must exist");
+
+        assert!(props.contains_key(IRONCLAW_EXECUTION_HINT_KEY));
+        assert!(props.contains_key("query"));
     }
 }
