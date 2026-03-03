@@ -20,7 +20,9 @@ use crate::context::JobContext;
 use crate::db::Database;
 use crate::error::Error;
 use crate::llm::{ChatMessage, Reasoning, ReasoningContext, RespondResult};
-use crate::tools::mcp::{McpExecutionMode, mcp_execution_mode_from_params};
+use crate::tools::mcp::{
+    McpExecutionMode, mcp_execution_mode_from_params, strip_mcp_execution_hints,
+};
 
 /// Result of the agentic loop execution.
 pub(super) enum AgenticLoopResult {
@@ -163,6 +165,8 @@ impl Agent {
         thread_id: Uuid,
         initial_messages: Vec<ChatMessage>,
     ) -> Result<AgenticLoopResult, Error> {
+        let allow_async_mcp_hints = user_explicitly_requested_async_mcp(&message.content);
+
         // Detect group chat from channel metadata (needed before loading system prompt)
         let is_group_chat = message
             .metadata
@@ -597,6 +601,12 @@ impl Agent {
                                 }
                             },
                             _ => {}
+                        }
+
+                        // Guardrail: only honor MCP async execution hints when the user
+                        // explicitly requested background/non-blocking behavior.
+                        if !allow_async_mcp_hints {
+                            tc.arguments = strip_mcp_execution_hints(&tc.arguments);
                         }
 
                         // Check if tool requires approval on the final (post-hook)
@@ -1063,6 +1073,26 @@ fn background_turn_user_input(tool_name: &str) -> String {
     format!("[background:mcp:{}]", tool_name)
 }
 
+fn user_explicitly_requested_async_mcp(input: &str) -> bool {
+    let lowered = input.to_ascii_lowercase();
+    [
+        "background",
+        "in the background",
+        "non-blocking",
+        "nonblocking",
+        "async",
+        "asynchronous",
+        "fire and forget",
+        "don't wait",
+        "do not wait",
+        "without waiting",
+        "continue while",
+        "keep chatting",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
 fn background_completion_message(tool_name: &str, result: &Result<String, Error>) -> String {
     match result {
         Ok(output) => format!(
@@ -1352,7 +1382,20 @@ mod tests {
     use crate::safety::SafetyLayer;
     use crate::tools::ToolRegistry;
 
-    use super::check_auth_required;
+    use super::{check_auth_required, user_explicitly_requested_async_mcp};
+
+    #[test]
+    fn test_user_explicitly_requested_async_mcp() {
+        assert!(user_explicitly_requested_async_mcp(
+            "run this in the background and keep chatting"
+        ));
+        assert!(user_explicitly_requested_async_mcp(
+            "non-blocking call please"
+        ));
+        assert!(!user_explicitly_requested_async_mcp(
+            "check mcp pod logs now"
+        ));
+    }
 
     /// Minimal LLM provider for unit tests that always returns a static response.
     struct StaticLlmProvider;

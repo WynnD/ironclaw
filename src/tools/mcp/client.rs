@@ -577,6 +577,21 @@ fn augment_mcp_schema_with_execution_hints(schema: &serde_json::Value) -> serde_
     schema
 }
 
+fn looks_like_textual_mcp_failure(text: &str) -> bool {
+    let lowered = text.trim().trim_matches('"').to_ascii_lowercase();
+    if lowered.is_empty() {
+        return false;
+    }
+
+    lowered.starts_with("failed to ")
+        || lowered.starts_with("error:")
+        || lowered.starts_with("exception:")
+        || lowered.starts_with("traceback")
+        || lowered.starts_with("fatal:")
+        || lowered.starts_with("panic:")
+        || (lowered.contains("config profile") && lowered.contains("not found"))
+}
+
 /// Wrapper that implements Tool for an MCP tool.
 struct McpToolWrapper {
     tool: McpTool,
@@ -620,7 +635,7 @@ impl Tool for McpToolWrapper {
             .collect::<Vec<_>>()
             .join("\n");
 
-        if result.is_error {
+        if result.is_error || looks_like_textual_mcp_failure(&content) {
             return Err(ToolError::ExecutionFailed(content));
         }
 
@@ -844,5 +859,18 @@ mod tests {
 
         assert!(props.contains_key(IRONCLAW_EXECUTION_HINT_KEY));
         assert!(props.contains_key("query"));
+    }
+
+    #[test]
+    fn test_looks_like_textual_mcp_failure() {
+        assert!(looks_like_textual_mcp_failure(
+            "Failed to load Codex configuration from overrides: config profile `null` not found"
+        ));
+        assert!(looks_like_textual_mcp_failure(
+            "error: could not connect to MCP server"
+        ));
+        assert!(!looks_like_textual_mcp_failure(
+            "listed 14 pods in kube-system"
+        ));
     }
 }
