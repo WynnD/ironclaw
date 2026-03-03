@@ -132,9 +132,26 @@ static TOOL_EXECUTION_CLAIM_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// Detects text that presents a tool result as already obtained.
 static TOOL_RESULT_CLAIM_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"\b(?:here(?:'s| is)\s+what\s+(?:it|the tool)\s+returned|tool\s+returned|it\s+returned)\b",
+        r"\b(?:here(?:'s| is)\s+what\s+(?:it|the tool)\s+returned|tool\s+returned|it\s+returned|tool\s+ran\s+successfully|tool\s+completed\s+successfully)\b",
     )
     .expect("TOOL_RESULT_CLAIM_RE")
+});
+
+/// Detects first-person intent statements that promise a tool-like action but
+/// do not include an executable tool call.
+static TOOL_INTENT_CLAIM_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(?:let\s+me|i(?:'|’)ll|i\s+will|we(?:'|’)ll|we\s+will)\s+(?:check|search|look\s+up|fetch|query|inspect|run|pull|list|find)\b",
+    )
+    .expect("TOOL_INTENT_CLAIM_RE")
+});
+
+/// Detects terse action-preface statements often ending with ":".
+static TOOL_INTENT_COLON_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(?:let\s+me|i(?:'|’)ll|i\s+will|we(?:'|’)ll|we\s+will|checking|searching|looking\s+up|fetching|querying|running|inspecting)\b",
+    )
+    .expect("TOOL_INTENT_COLON_PREFIX_RE")
 });
 
 /// Context for reasoning operations.
@@ -648,11 +665,15 @@ Respond in JSON format:
             // If there is no fresh tool-result evidence in context, force one
             // retry with explicit anti-fabrication instructions.
             if !has_tool_result_since_last_user(&context.messages)
-                && claims_unverified_tool_execution(&content, &context.available_tools)
+                && (claims_unverified_tool_execution(&content, &context.available_tools)
+                    || claims_tool_execution_intent_without_call(
+                        &content,
+                        &context.available_tools,
+                    ))
             {
                 tracing::warn!(
                     content_preview = %crate::llm::rig_adapter::truncate_for_log(&content, 300),
-                    "Detected unverifiable tool-execution claim with no executable tool call; retrying once",
+                    "Detected unverifiable tool-execution or intent-only claim with no executable tool call; retrying once",
                 );
                 let (retry_result, retry_usage) = self
                     .recover_unverified_tool_claim(
@@ -1712,6 +1733,20 @@ fn claims_unverified_tool_execution(content: &str, available_tools: &[ToolDefini
 
     mentions_tool
         && (TOOL_EXECUTION_CLAIM_RE.is_match(&lower) || TOOL_RESULT_CLAIM_RE.is_match(&lower))
+}
+
+fn claims_tool_execution_intent_without_call(
+    content: &str,
+    available_tools: &[ToolDefinition],
+) -> bool {
+    if content.trim().is_empty() || available_tools.is_empty() {
+        return false;
+    }
+
+    let lower = content.to_ascii_lowercase();
+    let trimmed = lower.trim();
+    TOOL_INTENT_CLAIM_RE.is_match(trimmed)
+        || (trimmed.ends_with(':') && TOOL_INTENT_COLON_PREFIX_RE.is_match(trimmed))
 }
 
 fn is_placeholder_tool_name(name: &str) -> bool {
@@ -3109,6 +3144,41 @@ That's my plan."#;
         let tools = make_tools(&["github_list_pull_requests"]);
         let content = "I can call the github_list_pull_requests tool if you'd like.";
         assert!(!claims_unverified_tool_execution(content, &tools));
+    }
+
+    #[test]
+    fn test_claims_tool_execution_intent_without_call_detects_intent() {
+        let tools = make_tools(&["github_list_pull_requests"]);
+        let content = "Let me check the current PRs and report back.";
+        assert!(claims_tool_execution_intent_without_call(content, &tools));
+    }
+
+    #[test]
+    fn test_claims_tool_execution_intent_without_call_ignores_non_tool_intent() {
+        let tools = make_tools(&["github_list_pull_requests"]);
+        let content = "I'll explain how the review process works.";
+        assert!(!claims_tool_execution_intent_without_call(content, &tools));
+    }
+
+    #[test]
+    fn test_claims_tool_execution_intent_without_call_detects_colon_preface() {
+        let tools = make_tools(&["github_list_pull_requests"]);
+        let content = "Checking kubernetes pod logs:";
+        assert!(claims_tool_execution_intent_without_call(content, &tools));
+    }
+
+    #[test]
+    fn test_claims_tool_execution_intent_without_call_detects_user_reported_phrase() {
+        let tools = make_tools(&["kubernetes_logs"]);
+        let content = "Let me search for Kubernetes tools to check the MCP pod logs:";
+        assert!(claims_tool_execution_intent_without_call(content, &tools));
+    }
+
+    #[test]
+    fn test_claims_tool_execution_intent_without_call_detects_missing_tool_phrase() {
+        let tools = make_tools(&["discover_tools"]);
+        let content = "I don't have a codex tool available. Let me search for it:";
+        assert!(claims_tool_execution_intent_without_call(content, &tools));
     }
 
     #[test]
