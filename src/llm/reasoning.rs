@@ -20,6 +20,8 @@ pub const SILENT_REPLY_TOKEN: &str = "NO_REPLY";
 const EMPTY_RESPONSE_FALLBACK: &str = "I'm not sure how to respond to that.";
 const UNVERIFIED_TOOL_CLAIM_FALLBACK: &str =
     "I couldn't verify an actual tool execution for that step, so I won't invent results.";
+const INTENT_ONLY_TOOL_CLAIM_FALLBACK: &str =
+    "I can't run that tool action in this turn, so I won't claim I already did it.";
 
 /// Process-wide counters for empty-response recovery observability.
 struct EmptyResponseRecoveryStats {
@@ -666,10 +668,7 @@ Respond in JSON format:
             // retry with explicit anti-fabrication instructions.
             if !has_tool_result_since_last_user(&context.messages)
                 && (claims_unverified_tool_execution(&content, &context.available_tools)
-                    || claims_tool_execution_intent_without_call(
-                        &content,
-                        &context.available_tools,
-                    ))
+                    || claims_tool_execution_intent_without_call(&content))
             {
                 tracing::warn!(
                     content_preview = %crate::llm::rig_adapter::truncate_for_log(&content, 300),
@@ -721,6 +720,12 @@ Respond in JSON format:
             } else {
                 cleaned
             };
+            let final_text = if claims_tool_execution_intent_without_call(&final_text) {
+                strip_trailing_tool_intent_clause(&final_text)
+                    .unwrap_or_else(|| INTENT_ONLY_TOOL_CLAIM_FALLBACK.to_string())
+            } else {
+                final_text
+            };
             Ok(RespondOutput {
                 result: RespondResult::Text(final_text),
                 usage,
@@ -760,6 +765,12 @@ Respond in JSON format:
                 }
             } else {
                 cleaned
+            };
+            let final_text = if claims_tool_execution_intent_without_call(&final_text) {
+                strip_trailing_tool_intent_clause(&final_text)
+                    .unwrap_or_else(|| INTENT_ONLY_TOOL_CLAIM_FALLBACK.to_string())
+            } else {
+                final_text
             };
             Ok(RespondOutput {
                 result: RespondResult::Text(final_text),
@@ -887,10 +898,13 @@ Respond in JSON format:
             return Ok((None, retry_usage));
         }
 
-        if claims_unverified_tool_execution(&retry_content, available_tools) {
+        if claims_unverified_tool_execution(&retry_content, available_tools)
+            || claims_tool_execution_intent_without_call(&retry_content)
+        {
             return Ok((
                 Some(RespondResult::Text(
-                    UNVERIFIED_TOOL_CLAIM_FALLBACK.to_string(),
+                    strip_trailing_tool_intent_clause(&retry_content)
+                        .unwrap_or_else(|| UNVERIFIED_TOOL_CLAIM_FALLBACK.to_string()),
                 )),
                 retry_usage,
             ));
@@ -1735,11 +1749,8 @@ fn claims_unverified_tool_execution(content: &str, available_tools: &[ToolDefini
         && (TOOL_EXECUTION_CLAIM_RE.is_match(&lower) || TOOL_RESULT_CLAIM_RE.is_match(&lower))
 }
 
-fn claims_tool_execution_intent_without_call(
-    content: &str,
-    available_tools: &[ToolDefinition],
-) -> bool {
-    if content.trim().is_empty() || available_tools.is_empty() {
+fn claims_tool_execution_intent_without_call(content: &str) -> bool {
+    if content.trim().is_empty() {
         return false;
     }
 
@@ -1747,6 +1758,27 @@ fn claims_tool_execution_intent_without_call(
     let trimmed = lower.trim();
     TOOL_INTENT_CLAIM_RE.is_match(trimmed)
         || (trimmed.ends_with(':') && TOOL_INTENT_COLON_PREFIX_RE.is_match(trimmed))
+}
+
+fn strip_trailing_tool_intent_clause(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let markers = ["let me ", "i'll ", "i will ", "we'll ", "we will "];
+    let cut_at = markers
+        .iter()
+        .filter_map(|m| lower.find(m))
+        .filter(|idx| *idx > 0)
+        .min()?;
+
+    let prefix = text[..cut_at]
+        .trim_end()
+        .trim_end_matches(':')
+        .trim_end_matches('-')
+        .trim_end();
+    if prefix.is_empty() {
+        None
+    } else {
+        Some(prefix.to_string())
+    }
 }
 
 fn is_placeholder_tool_name(name: &str) -> bool {
@@ -3148,37 +3180,48 @@ That's my plan."#;
 
     #[test]
     fn test_claims_tool_execution_intent_without_call_detects_intent() {
-        let tools = make_tools(&["github_list_pull_requests"]);
         let content = "Let me check the current PRs and report back.";
-        assert!(claims_tool_execution_intent_without_call(content, &tools));
+        assert!(claims_tool_execution_intent_without_call(content));
     }
 
     #[test]
     fn test_claims_tool_execution_intent_without_call_ignores_non_tool_intent() {
-        let tools = make_tools(&["github_list_pull_requests"]);
         let content = "I'll explain how the review process works.";
-        assert!(!claims_tool_execution_intent_without_call(content, &tools));
+        assert!(!claims_tool_execution_intent_without_call(content));
     }
 
     #[test]
     fn test_claims_tool_execution_intent_without_call_detects_colon_preface() {
-        let tools = make_tools(&["github_list_pull_requests"]);
         let content = "Checking kubernetes pod logs:";
-        assert!(claims_tool_execution_intent_without_call(content, &tools));
+        assert!(claims_tool_execution_intent_without_call(content));
     }
 
     #[test]
     fn test_claims_tool_execution_intent_without_call_detects_user_reported_phrase() {
-        let tools = make_tools(&["kubernetes_logs"]);
         let content = "Let me search for Kubernetes tools to check the MCP pod logs:";
-        assert!(claims_tool_execution_intent_without_call(content, &tools));
+        assert!(claims_tool_execution_intent_without_call(content));
     }
 
     #[test]
     fn test_claims_tool_execution_intent_without_call_detects_missing_tool_phrase() {
-        let tools = make_tools(&["discover_tools"]);
         let content = "I don't have a codex tool available. Let me search for it:";
-        assert!(claims_tool_execution_intent_without_call(content, &tools));
+        assert!(claims_tool_execution_intent_without_call(content));
+    }
+
+    #[test]
+    fn test_claims_tool_execution_intent_without_call_detects_latest_user_phrase() {
+        let content = "I don't have a GitHub tool available to check PRs. Let me search for it:";
+        assert!(claims_tool_execution_intent_without_call(content));
+    }
+
+    #[test]
+    fn test_strip_trailing_tool_intent_clause_keeps_prefix() {
+        let input = "I don't have a GitHub tool available to check PRs. Let me search for it:";
+        let stripped = strip_trailing_tool_intent_clause(input).expect("should strip");
+        assert_eq!(
+            stripped,
+            "I don't have a GitHub tool available to check PRs."
+        );
     }
 
     #[test]
