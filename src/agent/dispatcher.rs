@@ -622,7 +622,10 @@ impl Agent {
                                         !sess.is_tool_auto_approved(&tc.name)
                                     }
                                 }
-                                ApprovalRequirement::Always => true,
+                                ApprovalRequirement::Always => {
+                                    let sess = session.lock().await;
+                                    !sess.is_tool_auto_approved(&tc.name)
+                                }
                             };
 
                             if needs_approval {

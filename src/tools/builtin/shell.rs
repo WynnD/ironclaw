@@ -101,8 +101,7 @@ static DANGEROUS_PATTERNS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
     ]
 });
 
-/// Patterns that should NEVER be auto-approved, even if the user chose "always approve"
-/// for the shell tool. These require explicit per-invocation approval because they are
+/// Patterns that should require stricter approval by default because they are
 /// destructive or security-sensitive.
 static NEVER_AUTO_APPROVE_PATTERNS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
     vec![
@@ -195,10 +194,8 @@ const SAFE_ENV_VARS: &[&str] = &[
     "WINDIR",
 ];
 
-/// Check whether a shell command contains patterns that must never be auto-approved.
-///
-/// Even when the user has chosen "always approve" for the shell tool, these commands
-/// require explicit per-invocation approval because they are destructive.
+/// Check whether a shell command contains patterns that should require stricter
+/// approval by default due to destructive behavior.
 pub fn requires_explicit_approval(command: &str) -> bool {
     let lower = command.to_lowercase();
     NEVER_AUTO_APPROVE_PATTERNS

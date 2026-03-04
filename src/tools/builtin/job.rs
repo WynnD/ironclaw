@@ -1728,7 +1728,9 @@ impl Tool for DeleteJobTool {
     }
 
     fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
-        ApprovalRequirement::Always
+        // Deletion is constrained server-side (ownership + terminal-state checks),
+        // so allow users to opt into always-approve for autonomous cleanup flows.
+        ApprovalRequirement::UnlessAutoApproved
     }
 
     fn requires_sanitization(&self) -> bool {

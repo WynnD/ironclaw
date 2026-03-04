@@ -14,9 +14,14 @@ use crate::context::JobContext;
 pub enum ApprovalRequirement {
     /// No approval needed.
     Never,
-    /// Needs approval, but session auto-approve can bypass.
+    /// Needs approval, but blanket auto-approve and explicit per-tool
+    /// auto-approve can bypass.
     UnlessAutoApproved,
-    /// Always needs explicit approval (even if auto-approved).
+    /// Needs explicit approval unless this specific tool is explicitly
+    /// auto-approved (session/global/per-job allowlist).
+    ///
+    /// Unlike `UnlessAutoApproved`, this is not intended to be bypassed by
+    /// blanket "auto approve all tools" toggles.
     Always,
 }
 
@@ -217,7 +222,9 @@ pub trait Tool: Send + Sync {
     /// Returns `Never` by default (most tools run in a sandboxed environment).
     /// Override to return `UnlessAutoApproved` for tools that need approval
     /// but can be session-auto-approved, or `Always` for invocations that
-    /// must always prompt (e.g. destructive shell commands, HTTP with auth).
+    /// require explicit approval by default and should only be bypassed by
+    /// explicit per-tool allowlisting (e.g. destructive shell commands,
+    /// HTTP with auth).
     fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
         ApprovalRequirement::Never
     }

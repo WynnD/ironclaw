@@ -882,8 +882,8 @@ impl Agent {
                 }
             });
 
-            let tool_result: Result<String, Error> =
-                if let Some(tool) = self.tools().get(&pending.tool_name).await
+            let tool_result: Result<String, Error> = if let Some(tool) =
+                self.tools().get(&pending.tool_name).await
                 && let Some(param_error) = missing_required_tool_params_error(
                     &pending.tool_name,
                     tool.as_ref(),
@@ -1066,7 +1066,10 @@ impl Agent {
                                 !sess.is_tool_auto_approved(&tc.name)
                             }
                         }
-                        ApprovalRequirement::Always => true,
+                        ApprovalRequirement::Always => {
+                            let sess = session.lock().await;
+                            !sess.is_tool_auto_approved(&tc.name)
+                        }
                     };
 
                     if needs_approval {

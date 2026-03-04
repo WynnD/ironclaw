@@ -1,6 +1,6 @@
 //! Job scheduler for parallel execution.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +18,80 @@ use crate::hooks::HookRegistry;
 use crate::llm::LlmProvider;
 use crate::safety::SafetyLayer;
 use crate::tools::ToolRegistry;
+
+const AUTO_APPROVED_TOOLS_SETTING_KEY: &str = "agent.auto_approved_tools";
+const GLOBAL_TOOL_ALLOWLIST_META_KEY: &str = "_global_tool_allowlist";
+const PER_JOB_TOOL_ALLOWLIST_META_KEY: &str = "tool_allowlist";
+const PER_JOB_TOOL_DENYLIST_META_KEY: &str = "tool_denylist";
+
+fn parse_tool_list(value: &serde_json::Value) -> HashSet<String> {
+    let Some(items) = value.as_array() else {
+        return HashSet::new();
+    };
+
+    items
+        .iter()
+        .filter_map(|item| item.as_str().map(str::trim))
+        .filter(|name| !name.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+fn metadata_tool_list(
+    metadata: &serde_json::Value,
+    key: &str,
+    nested_key: &str,
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+
+    if let Some(value) = metadata.get(key) {
+        out.extend(parse_tool_list(value));
+    }
+
+    if let Some(value) = metadata
+        .get("tool_permissions")
+        .and_then(|perms| perms.get(nested_key))
+    {
+        out.extend(parse_tool_list(value));
+    }
+
+    out
+}
+
+async fn global_auto_approved_tools(
+    store: Option<&Arc<dyn Database>>,
+    job_ctx: &JobContext,
+) -> HashSet<String> {
+    let from_metadata = metadata_tool_list(
+        &job_ctx.metadata,
+        GLOBAL_TOOL_ALLOWLIST_META_KEY,
+        "global_allow",
+    );
+    if !from_metadata.is_empty() {
+        return from_metadata;
+    }
+
+    let Some(store) = store else {
+        return HashSet::new();
+    };
+
+    match store
+        .get_setting(&job_ctx.user_id, AUTO_APPROVED_TOOLS_SETTING_KEY)
+        .await
+    {
+        Ok(Some(value)) => parse_tool_list(&value),
+        Ok(None) => HashSet::new(),
+        Err(e) => {
+            tracing::debug!(
+                user_id = %job_ctx.user_id,
+                key = AUTO_APPROVED_TOOLS_SETTING_KEY,
+                "Failed to load global auto-approved tools for scheduler: {}",
+                e
+            );
+            HashSet::new()
+        }
+    }
+}
 
 /// Message to send to a worker.
 #[derive(Debug)]
@@ -245,12 +319,14 @@ impl Scheduler {
                 let tools = self.tools.clone();
                 let context_manager = self.context_manager.clone();
                 let safety = self.safety.clone();
+                let store = self.store.clone();
 
                 tokio::spawn(async move {
                     let result = Self::execute_tool_task(
                         tools,
                         context_manager,
                         safety,
+                        store,
                         tool_parent_id,
                         &tool_name,
                         params,
@@ -379,6 +455,7 @@ impl Scheduler {
         tools: Arc<ToolRegistry>,
         context_manager: Arc<ContextManager>,
         safety: Arc<SafetyLayer>,
+        store: Option<Arc<dyn Database>>,
         job_id: Uuid,
         tool_name: &str,
         params: serde_json::Value,
@@ -402,11 +479,30 @@ impl Scheduler {
             .into());
         }
 
-        if tool.requires_approval(&params).is_required() {
-            return Err(crate::error::ToolError::AuthRequired {
-                name: tool_name.to_string(),
+        use crate::tools::ApprovalRequirement;
+        match tool.requires_approval(&params) {
+            ApprovalRequirement::Never => {}
+            ApprovalRequirement::Always | ApprovalRequirement::UnlessAutoApproved => {
+                let per_job_deny =
+                    metadata_tool_list(&job_ctx.metadata, PER_JOB_TOOL_DENYLIST_META_KEY, "deny");
+                if per_job_deny.contains(tool_name) {
+                    return Err(crate::error::ToolError::AuthRequired {
+                        name: tool_name.to_string(),
+                    }
+                    .into());
+                }
+
+                let per_job_allow =
+                    metadata_tool_list(&job_ctx.metadata, PER_JOB_TOOL_ALLOWLIST_META_KEY, "allow");
+                let global_allow = global_auto_approved_tools(store.as_ref(), &job_ctx).await;
+
+                if !per_job_allow.contains(tool_name) && !global_allow.contains(tool_name) {
+                    return Err(crate::error::ToolError::AuthRequired {
+                        name: tool_name.to_string(),
+                    }
+                    .into());
+                }
             }
-            .into());
         }
 
         // Validate tool parameters

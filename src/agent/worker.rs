@@ -652,18 +652,11 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
 
         // Approval policy for autonomous jobs:
         // - Never: always allowed
-        // - Always: always blocked (requires interactive human approval)
-        // - UnlessAutoApproved: allowed only when globally or per-job allowlisted
+        // - Always/UnlessAutoApproved: allowed only when globally or per-job allowlisted
         use crate::tools::ApprovalRequirement;
         match tool.requires_approval(params) {
             ApprovalRequirement::Never => {}
-            ApprovalRequirement::Always => {
-                return Err(crate::error::ToolError::AuthRequired {
-                    name: tool_name.to_string(),
-                }
-                .into());
-            }
-            ApprovalRequirement::UnlessAutoApproved => {
+            ApprovalRequirement::Always | ApprovalRequirement::UnlessAutoApproved => {
                 let per_job_deny =
                     metadata_tool_list(&job_ctx.metadata, PER_JOB_TOOL_DENYLIST_META_KEY, "deny");
                 if per_job_deny.contains(tool_name) {
@@ -1220,6 +1213,40 @@ mod tests {
         }
     }
 
+    /// A test tool that always requires explicit approval.
+    struct AlwaysApprovalTool {
+        tool_name: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for AlwaysApprovalTool {
+        fn name(&self) -> &str {
+            &self.tool_name
+        }
+        fn description(&self) -> &str {
+            "Test tool requiring explicit approval"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &JobContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("approved", Duration::from_millis(1)))
+        }
+        fn requires_approval(
+            &self,
+            _params: &serde_json::Value,
+        ) -> crate::tools::ApprovalRequirement {
+            crate::tools::ApprovalRequirement::Always
+        }
+        fn requires_sanitization(&self) -> bool {
+            false
+        }
+    }
+
     /// Stub LLM provider (never called in these tests).
     struct StubLlm;
 
@@ -1462,6 +1489,54 @@ mod tests {
         assert!(
             results[0].result.is_err(),
             "Missing tool should produce an error, not a panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_always_tool_blocked_without_allowlist() {
+        let worker = make_worker(vec![Arc::new(AlwaysApprovalTool {
+            tool_name: "always_tool".to_string(),
+        })])
+        .await;
+
+        let result = worker
+            .execute_tool("always_tool", &serde_json::json!({}))
+            .await;
+        assert!(result.is_err(), "Always tool should require allowlisting");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("requires authentication"),
+            "expected auth-required error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_always_tool_allowed_with_per_job_allowlist() {
+        let worker = make_worker(vec![Arc::new(AlwaysApprovalTool {
+            tool_name: "always_tool".to_string(),
+        })])
+        .await;
+
+        // Simulate explicit per-job allowlisting for an autonomous worker job.
+        worker
+            .deps
+            .context_manager
+            .update_context(worker.job_id, |ctx| {
+                ctx.metadata = serde_json::json!({
+                    "tool_allowlist": ["always_tool"]
+                });
+                Ok::<(), String>(())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let result = worker
+            .execute_tool("always_tool", &serde_json::json!({}))
+            .await;
+        assert!(
+            result.is_ok(),
+            "Always tool should run when explicitly allowlisted"
         );
     }
 
