@@ -161,6 +161,10 @@ pub async fn routines_trigger_handler(
 
     let routine = get_owned_routine(store.as_ref(), routine_id, &state.user_id).await?;
 
+    if routine.user_id != state.user_id {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
+
     // Send the routine prompt through the message pipeline as a manual trigger.
     let prompt = match &routine.action {
         crate::agent::routine::RoutineAction::Lightweight { prompt, .. } => prompt.clone(),
@@ -170,7 +174,12 @@ pub async fn routines_trigger_handler(
     };
 
     let content = format!("[routine:{}] {}", routine.name, prompt);
-    let msg = IncomingMessage::new("gateway", &state.user_id, content);
+    let thread_id = format!(
+        "routine-{}-{}",
+        routine_id,
+        chrono::Utc::now().timestamp_millis()
+    );
+    let msg = IncomingMessage::new("gateway", &state.user_id, content).with_thread(thread_id);
 
     let tx_guard = state.msg_tx.read().await;
     let tx = tx_guard.as_ref().ok_or((

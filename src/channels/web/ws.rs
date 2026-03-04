@@ -484,6 +484,7 @@ mod tests {
             secrets_store: None,
             job_manager: None,
             prompt_queue: None,
+            scheduler: None,
             user_id: "test".to_string(),
             shutdown_tx: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
@@ -494,7 +495,6 @@ mod tests {
             registry_entries: Vec::new(),
             cost_guard: None,
             startup_time: std::time::Instant::now(),
-            restart_requested: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
