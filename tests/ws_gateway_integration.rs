@@ -59,7 +59,7 @@ async fn start_test_server() -> (
         registry_entries: Vec::new(),
         cost_guard: None,
         startup_time: std::time::Instant::now(),
-        scheduler: None,
+        restart_requested: std::sync::atomic::AtomicBool::new(false),
         secrets_store: None,
     });
 

@@ -270,7 +270,7 @@ impl HeartbeatRunner {
 
         let content = content.trim();
 
-        // Guard against empty content. Reasoning models may
+        // Guard against empty content. Reasoning models (e.g. GLM-4.7) may
         // burn all output tokens on chain-of-thought and return content: null.
         if content.is_empty() {
             return HeartbeatResult::Failed("LLM returned empty content.".to_string());

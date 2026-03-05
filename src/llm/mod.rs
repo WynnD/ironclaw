@@ -45,8 +45,101 @@ use secrecy::ExposeSecret;
 use crate::config::{LlmBackend, LlmConfig, NearAiConfig};
 use crate::error::LlmError;
 
+const KIMI_K25_DEFAULT_FALLBACK_MODEL: &str = "MiniMaxAI/MiniMax-M2.5";
+const GLM_TOOL_CALL_PARSER_HEADER: &str = "tool-call-parser";
+const GLM_REASONING_PARSER_HEADER: &str = "reasoning-parser";
+const GLM_TOOL_CALL_PARSER_VALUE: &str = "glm47";
+const GLM_REASONING_PARSER_VALUE: &str = "glm45";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailoverModelSource {
+    Configured,
+    AutoKimiPolicy,
+}
+
 fn normalize_model_id(model: &str) -> String {
     model.trim().to_ascii_lowercase()
+}
+
+fn is_kimi_k2_5_model_id(model: &str) -> bool {
+    let normalized = normalize_model_id(model);
+    normalized.contains("kimi-k2.5")
+        || normalized.contains("kimi-k2-5")
+        || normalized.contains("kimi-k2p5")
+}
+
+fn parse_glm_major_minor(model: &str) -> Option<(u32, u32)> {
+    let lower = model.to_ascii_lowercase();
+    let glm_idx = lower.find("glm")?;
+    let mut chars = lower[glm_idx + 3..].chars().peekable();
+
+    while let Some(ch) = chars.peek() {
+        if ch.is_ascii_digit() {
+            break;
+        }
+        chars.next();
+    }
+
+    let mut major = String::new();
+    while let Some(ch) = chars.peek() {
+        if !ch.is_ascii_digit() {
+            break;
+        }
+        major.push(*ch);
+        chars.next();
+    }
+    if major.is_empty() {
+        return None;
+    }
+
+    let major = major.parse::<u32>().ok()?;
+    let mut minor = 0u32;
+    if matches!(chars.peek(), Some('.' | '-' | '_')) {
+        chars.next();
+        let mut minor_digits = String::new();
+        while let Some(ch) = chars.peek() {
+            if !ch.is_ascii_digit() {
+                break;
+            }
+            minor_digits.push(*ch);
+            chars.next();
+        }
+        if !minor_digits.is_empty() {
+            minor = minor_digits.parse::<u32>().ok()?;
+        }
+    }
+
+    Some((major, minor))
+}
+
+pub(crate) fn is_glm_4_7_or_newer_model_id(model: &str) -> bool {
+    let normalized = normalize_model_id(model);
+    if normalized.contains("glm-latest") {
+        return true;
+    }
+
+    parse_glm_major_minor(&normalized)
+        .map(|(major, minor)| major > 4 || (major == 4 && minor >= 7))
+        .unwrap_or(false)
+}
+
+fn maybe_apply_glm_parser_headers(headers: &mut reqwest::header::HeaderMap, model: &str) {
+    if !is_glm_4_7_or_newer_model_id(model) {
+        return;
+    }
+
+    if !headers.contains_key(GLM_TOOL_CALL_PARSER_HEADER) {
+        headers.insert(
+            reqwest::header::HeaderName::from_static(GLM_TOOL_CALL_PARSER_HEADER),
+            reqwest::header::HeaderValue::from_static(GLM_TOOL_CALL_PARSER_VALUE),
+        );
+    }
+    if !headers.contains_key(GLM_REASONING_PARSER_HEADER) {
+        headers.insert(
+            reqwest::header::HeaderName::from_static(GLM_REASONING_PARSER_HEADER),
+            reqwest::header::HeaderValue::from_static(GLM_REASONING_PARSER_VALUE),
+        );
+    }
 }
 
 fn active_backend_model(config: &LlmConfig) -> Option<&str> {
@@ -60,8 +153,25 @@ fn active_backend_model(config: &LlmConfig) -> Option<&str> {
     }
 }
 
-fn resolved_failover_model(config: &LlmConfig) -> Option<String> {
-    config.nearai.fallback_model.clone()
+fn resolved_failover_model(config: &LlmConfig) -> Option<(String, FailoverModelSource)> {
+    if let Some(ref configured) = config.nearai.fallback_model {
+        return Some((configured.clone(), FailoverModelSource::Configured));
+    }
+
+    // OpenAI-compatible Kimi K2.5 stability policy:
+    // if this model is selected and no explicit fallback is configured,
+    // automatically fail over to MiniMax M2.5.
+    if config.backend == LlmBackend::OpenAiCompatible
+        && let Some(primary_model) = config.openai_compatible.as_ref().map(|c| c.model.as_str())
+        && is_kimi_k2_5_model_id(primary_model)
+    {
+        return Some((
+            KIMI_K25_DEFAULT_FALLBACK_MODEL.to_string(),
+            FailoverModelSource::AutoKimiPolicy,
+        ));
+    }
+
+    None
 }
 
 fn create_backend_fallback_provider(
@@ -290,7 +400,12 @@ fn create_tinfoil_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvider>, L
     let client = client.completions_api();
     let model = client.completion_model(&tf.model);
     tracing::info!("Using Tinfoil private inference (model: {})", tf.model);
-    Ok(Arc::new(RigAdapter::new(model, &tf.model)))
+    let adapter = RigAdapter::new(model, &tf.model).with_native_transport(
+        TINFOIL_BASE_URL,
+        tf.api_key.expose_secret().to_string(),
+        reqwest::header::HeaderMap::new(),
+    );
+    Ok(Arc::new(adapter))
 }
 
 fn create_openai_compatible_provider(
@@ -324,6 +439,7 @@ fn create_openai_compatible_provider(
         };
         extra_headers.insert(name, val);
     }
+    maybe_apply_glm_parser_headers(&mut extra_headers, &compat.model);
 
     let api_key_str = compat
         .api_key
@@ -349,7 +465,12 @@ fn create_openai_compatible_provider(
         compat.model
     );
 
-    Ok(Arc::new(RigAdapter::new(model, &compat.model)))
+    let adapter = RigAdapter::new(model, &compat.model).with_native_transport(
+        &compat.base_url,
+        api_key_str,
+        extra_headers,
+    );
+    Ok(Arc::new(adapter))
 }
 
 /// Create a cheap/fast LLM provider for lightweight tasks (heartbeat, routing, evaluation).
@@ -447,7 +568,9 @@ pub fn build_provider_chain(
     };
 
     // 3. Failover
-    let llm: Arc<dyn LlmProvider> = if let Some(fallback_model) = resolved_failover_model(config) {
+    let llm: Arc<dyn LlmProvider> = if let Some((fallback_model, fallback_source)) =
+        resolved_failover_model(config)
+    {
         if let Some(primary_model) = active_backend_model(config)
             && normalize_model_id(primary_model) == normalize_model_id(&fallback_model)
         {
@@ -460,12 +583,24 @@ pub fn build_provider_chain(
 
         let fallback = create_backend_fallback_provider(config, session.clone(), &fallback_model)?;
 
-        tracing::info!(
-            backend = %config.backend,
-            primary = %llm.model_name(),
-            fallback = %fallback.model_name(),
-            "LLM failover enabled"
-        );
+        match fallback_source {
+            FailoverModelSource::Configured => {
+                tracing::info!(
+                    backend = %config.backend,
+                    primary = %llm.model_name(),
+                    fallback = %fallback.model_name(),
+                    "LLM failover enabled"
+                );
+            }
+            FailoverModelSource::AutoKimiPolicy => {
+                tracing::info!(
+                    backend = %config.backend,
+                    primary = %llm.model_name(),
+                    fallback = %fallback.model_name(),
+                    "LLM failover enabled via automatic Kimi policy"
+                );
+            }
+        }
 
         let fallback: Arc<dyn LlmProvider> = if retry_config.max_retries > 0 {
             Arc::new(RetryProvider::new(fallback, retry_config.clone()))
@@ -532,7 +667,7 @@ pub fn build_provider_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{LlmBackend, NearAiConfig};
+    use crate::config::{LlmBackend, NearAiConfig, OpenAiCompatibleConfig};
     use std::path::PathBuf;
 
     fn test_nearai_config() -> NearAiConfig {
@@ -566,6 +701,18 @@ mod tests {
             openai_compatible: None,
             tinfoil: None,
         }
+    }
+
+    fn test_openai_compatible_llm_config(model: &str) -> LlmConfig {
+        let mut config = test_llm_config();
+        config.backend = LlmBackend::OpenAiCompatible;
+        config.openai_compatible = Some(OpenAiCompatibleConfig {
+            base_url: "https://inference.baseten.co/v1".to_string(),
+            api_key: None,
+            model: model.to_string(),
+            extra_headers: Vec::new(),
+        });
+        config
     }
 
     #[test]
@@ -606,17 +753,95 @@ mod tests {
     }
 
     #[test]
-    fn test_resolved_failover_model_returns_configured() {
-        let mut config = test_llm_config();
+    fn test_resolved_failover_model_prefers_configured_model() {
+        let mut config = test_openai_compatible_llm_config("moonshotai/Kimi-K2.5");
         config.nearai.fallback_model = Some("configured/fallback".to_string());
 
         let resolved = resolved_failover_model(&config).expect("fallback should be resolved");
-        assert_eq!(resolved, "configured/fallback");
+        assert_eq!(resolved.0, "configured/fallback");
+        assert_eq!(resolved.1, FailoverModelSource::Configured);
     }
 
     #[test]
-    fn test_resolved_failover_model_none_when_not_configured() {
-        let config = test_llm_config();
+    fn test_resolved_failover_model_auto_kimi_policy() {
+        let config = test_openai_compatible_llm_config("moonshotai/Kimi-K2.5");
+
+        let resolved = resolved_failover_model(&config).expect("fallback should be resolved");
+        assert_eq!(resolved.0, KIMI_K25_DEFAULT_FALLBACK_MODEL);
+        assert_eq!(resolved.1, FailoverModelSource::AutoKimiPolicy);
+    }
+
+    #[test]
+    fn test_resolved_failover_model_auto_kimi_policy_alias() {
+        let config = test_openai_compatible_llm_config("kimi-k2-5");
+
+        let resolved = resolved_failover_model(&config).expect("fallback should be resolved");
+        assert_eq!(resolved.0, KIMI_K25_DEFAULT_FALLBACK_MODEL);
+        assert_eq!(resolved.1, FailoverModelSource::AutoKimiPolicy);
+    }
+
+    #[test]
+    fn test_resolved_failover_model_auto_kimi_policy_alias_compact() {
+        let config = test_openai_compatible_llm_config("kimi-k2p5");
+
+        let resolved = resolved_failover_model(&config).expect("fallback should be resolved");
+        assert_eq!(resolved.0, KIMI_K25_DEFAULT_FALLBACK_MODEL);
+        assert_eq!(resolved.1, FailoverModelSource::AutoKimiPolicy);
+    }
+
+    #[test]
+    fn test_resolved_failover_model_none_for_non_kimi_model() {
+        let config = test_openai_compatible_llm_config("moonshotai/Kimi-K2");
         assert!(resolved_failover_model(&config).is_none());
+    }
+
+    #[test]
+    fn test_is_glm_4_7_or_newer_model_id() {
+        assert!(is_glm_4_7_or_newer_model_id("zai-org/GLM-4.7"));
+        assert!(is_glm_4_7_or_newer_model_id("glm-5"));
+        assert!(is_glm_4_7_or_newer_model_id("zai-org/GLM-latest"));
+        assert!(!is_glm_4_7_or_newer_model_id("zai-org/GLM-4.6"));
+        assert!(!is_glm_4_7_or_newer_model_id("zai-org/GLM-4"));
+        assert!(!is_glm_4_7_or_newer_model_id("moonshotai/Kimi-K2.5"));
+    }
+
+    #[test]
+    fn test_maybe_apply_glm_parser_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        maybe_apply_glm_parser_headers(&mut headers, "zai-org/GLM-5");
+        assert_eq!(
+            headers
+                .get(GLM_TOOL_CALL_PARSER_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(GLM_TOOL_CALL_PARSER_VALUE)
+        );
+        assert_eq!(
+            headers
+                .get(GLM_REASONING_PARSER_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(GLM_REASONING_PARSER_VALUE)
+        );
+    }
+
+    #[test]
+    fn test_maybe_apply_glm_parser_headers_preserves_existing_values() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::HeaderName::from_static(GLM_TOOL_CALL_PARSER_HEADER),
+            reqwest::header::HeaderValue::from_static("custom"),
+        );
+        maybe_apply_glm_parser_headers(&mut headers, "zai-org/GLM-5");
+        assert_eq!(
+            headers
+                .get(GLM_TOOL_CALL_PARSER_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("custom")
+        );
+        assert_eq!(
+            headers
+                .get(GLM_REASONING_PARSER_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(GLM_REASONING_PARSER_VALUE)
+        );
     }
 }

@@ -30,12 +30,25 @@ use crate::llm::provider::{
     ToolDefinition as IronToolDefinition,
 };
 
+/// Optional native HTTP transport for bypassing rig-core's serialization.
+///
+/// rig-core always serializes message content as `[{"type":"text","text":"..."}]` (array),
+/// which vLLM/SGLang endpoints choke on when tools are present. The native transport
+/// sends requests with plain string content, matching curl/SDK format.
+struct NativeTransport {
+    client: reqwest::Client,
+    base_url: String,
+    api_key: String,
+}
+
 /// Adapter that wraps a rig-core `CompletionModel` and implements `LlmProvider`.
 pub struct RigAdapter<M: CompletionModel> {
     model: M,
     model_name: String,
     input_cost: Decimal,
     output_cost: Decimal,
+    /// Native HTTP transport for K2.5 tool requests that bypass rig-core serialization.
+    native_transport: Option<NativeTransport>,
 }
 
 impl<M: CompletionModel> RigAdapter<M> {
@@ -49,7 +62,39 @@ impl<M: CompletionModel> RigAdapter<M> {
             model_name: name,
             input_cost,
             output_cost,
+            native_transport: None,
         }
+    }
+
+    /// Enable native HTTP transport for K2.5 tool requests.
+    ///
+    /// This bypasses rig-core's message serialization (which uses array content format)
+    /// and sends requests with plain string content, matching what curl sends.
+    pub fn with_native_transport(
+        mut self,
+        base_url: &str,
+        api_key: String,
+        extra_headers: reqwest::header::HeaderMap,
+    ) -> Self {
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        default_headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        default_headers.extend(extra_headers);
+
+        let client = reqwest::Client::builder()
+            .default_headers(default_headers)
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap_or_default();
+
+        self.native_transport = Some(NativeTransport {
+            client,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            api_key,
+        });
+        self
     }
 }
 
@@ -154,14 +199,60 @@ fn prune_required_to_defined_properties(obj: &mut serde_json::Map<String, JsonVa
     }
 }
 
+fn is_kimi_k2_5_model(model_name: &str) -> bool {
+    let model = model_name.to_ascii_lowercase();
+    model.contains("kimi-k2.5")
+        || model.contains("kimi-k2p5")
+        || model.contains("kimi-k2-5")
+        || model.contains("moonshotai/kimi-k2.5")
+}
+
+fn is_kimi_k2_thinking_model(model_name: &str) -> bool {
+    let model = model_name.to_ascii_lowercase();
+    model.contains("kimi-k2-thinking") || model.contains("moonshotai/kimi-k2-thinking")
+}
+
+fn is_kimi_interleaved_thinking_model(model_name: &str) -> bool {
+    is_kimi_k2_5_model(model_name) || is_kimi_k2_thinking_model(model_name)
+}
+
+fn should_use_kimi_text_tool_primary(model_name: &str) -> bool {
+    is_kimi_k2_5_model(model_name)
+}
+
+fn should_use_glm_native_tool_rounds(model_name: &str) -> bool {
+    crate::llm::is_glm_4_7_or_newer_model_id(model_name)
+}
+
+fn maybe_chat_template_kwargs_for_model(model_name: &str) -> Option<JsonValue> {
+    if should_use_glm_native_tool_rounds(model_name) {
+        Some(serde_json::json!({ "clear_thinking": false }))
+    } else {
+        None
+    }
+}
+
 fn should_use_strict_tool_schema(model_name: &str) -> bool {
     // Gemini (including OpenRouter `google/gemini-*` models) has stricter
     // function-schema validation and is not compatible with our OpenAI strict
     // rewrite in all cases. Keep the original schema shape for Gemini.
+    //
+    // Kimi K2.5 also rejects or mishandles strict schemas (all-required +
+    // additionalProperties: false) — known issue with SGLang-based serving.
     if model_name.to_ascii_lowercase().contains("gemini") {
         return false;
     }
+    if is_kimi_k2_5_model(model_name) {
+        return false;
+    }
     true
+}
+
+fn truncate_chars(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    input.chars().take(max_chars).collect()
 }
 
 /// Truncate a string for logging, appending "..." if truncated.
@@ -174,19 +265,119 @@ pub fn truncate_for_log(input: &str, max_chars: usize) -> String {
     s
 }
 
+/// Kimi K2.5 is sensitive to broad JSON-Schema vocabularies on some
+/// OpenAI-compatible gateways. Keep a conservative subset.
+fn simplify_schema_kimi_compat(schema: &JsonValue) -> JsonValue {
+    simplify_schema_kimi_compat_inner(schema, 0)
+}
+
+fn simplify_schema_kimi_compat_inner(schema: &JsonValue, depth: usize) -> JsonValue {
+    // Prevent deep / recursive schemas from causing provider parser issues.
+    if depth > 8 {
+        return JsonValue::Object(serde_json::Map::from_iter([(
+            "type".to_string(),
+            JsonValue::String("object".to_string()),
+        )]));
+    }
+
+    let Some(obj) = schema.as_object() else {
+        return schema.clone();
+    };
+
+    let mut out = serde_json::Map::new();
+
+    if let Some(ty) = obj.get("type") {
+        out.insert("type".to_string(), ty.clone());
+    }
+
+    if let Some(description) = obj.get("description").and_then(|v| v.as_str())
+        && !description.trim().is_empty()
+    {
+        out.insert(
+            "description".to_string(),
+            JsonValue::String(truncate_chars(description.trim(), 256)),
+        );
+    }
+
+    if let Some(enum_values) = obj.get("enum").and_then(|v| v.as_array()) {
+        let mut values = Vec::new();
+        for value in enum_values.iter().take(64) {
+            if value.is_string() || value.is_number() || value.is_boolean() || value.is_null() {
+                values.push(value.clone());
+            }
+        }
+        if !values.is_empty() {
+            out.insert("enum".to_string(), JsonValue::Array(values));
+        }
+    }
+
+    if let Some(properties) = obj.get("properties").and_then(|v| v.as_object()) {
+        let mut simplified_properties = serde_json::Map::new();
+        for (name, value) in properties.iter().take(64) {
+            simplified_properties.insert(
+                name.clone(),
+                simplify_schema_kimi_compat_inner(value, depth + 1),
+            );
+        }
+        out.insert(
+            "properties".to_string(),
+            JsonValue::Object(simplified_properties),
+        );
+        out.entry("type".to_string())
+            .or_insert_with(|| JsonValue::String("object".to_string()));
+
+        if let Some(required) = obj.get("required").and_then(|v| v.as_array()) {
+            let allowed: HashSet<&str> = properties.keys().map(String::as_str).collect();
+            let filtered_required: Vec<JsonValue> = required
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter(|name| allowed.contains(*name))
+                .map(|name| JsonValue::String(name.to_string()))
+                .collect();
+            if !filtered_required.is_empty() {
+                out.insert("required".to_string(), JsonValue::Array(filtered_required));
+            }
+        }
+
+        // Do NOT add additionalProperties: false — vLLM/SGLang K2.5 endpoints
+        // choke on this constraint during guided decoding.
+    }
+
+    if let Some(items) = obj.get("items") {
+        out.insert(
+            "items".to_string(),
+            simplify_schema_kimi_compat_inner(items, depth + 1),
+        );
+        out.entry("type".to_string())
+            .or_insert_with(|| JsonValue::String("array".to_string()));
+    }
+
+    JsonValue::Object(out)
+}
+
 fn normalize_tool_parameters_for_model(model_name: &str, schema: &JsonValue) -> JsonValue {
     if should_use_strict_tool_schema(model_name) {
         normalize_schema_strict(schema)
     } else {
-        normalize_schema_lenient(schema)
+        let lenient = normalize_schema_lenient(schema);
+        if is_kimi_k2_5_model(model_name) {
+            simplify_schema_kimi_compat(&lenient)
+        } else {
+            lenient
+        }
     }
 }
 
-fn normalize_tool_description_for_model(
-    _model_name: &str,
-    name: &str,
-    description: &str,
-) -> String {
+fn normalize_tool_description_for_model(model_name: &str, name: &str, description: &str) -> String {
+    if is_kimi_k2_5_model(model_name) {
+        let base = if description.trim().is_empty() {
+            name
+        } else {
+            description.trim()
+        };
+        return truncate_chars(base, 512);
+    }
+
     if description.trim().is_empty() {
         name.to_string()
     } else {
@@ -438,6 +629,61 @@ fn convert_tools(model_name: &str, tools: &[IronToolDefinition]) -> Vec<RigToolD
         .collect()
 }
 
+fn is_server_error_retryable_for_kimi(error: &str) -> bool {
+    let e = error.to_ascii_lowercase();
+    e.contains("status code 500")
+        || e.contains("500 internal server error")
+        || e.contains("\"error\": \"internal server error\"")
+}
+
+fn kimi_reduced_tool_set(tools: &[IronToolDefinition]) -> Vec<IronToolDefinition> {
+    // Keep a small deterministic set first. `discover_tools` lets the model
+    // activate deferred tools later if needed.
+    const KIMI_TOOL_PRIORITY: &[&str] = &[
+        "discover_tools",
+        "time",
+        "read_file",
+        "write_file",
+        "list_dir",
+        "apply_patch",
+        "shell",
+        "http",
+        "memory_search",
+    ];
+
+    const KIMI_MAX_TOOLS: usize = 9;
+
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+
+    for preferred in KIMI_TOOL_PRIORITY {
+        if selected.len() >= KIMI_MAX_TOOLS {
+            break;
+        }
+        if let Some(tool) = tools.iter().find(|t| t.name == *preferred)
+            && seen.insert(tool.name.clone())
+        {
+            selected.push(tool.clone());
+        }
+    }
+
+    if selected.len() < KIMI_MAX_TOOLS {
+        let mut remainder: Vec<IronToolDefinition> = tools
+            .iter()
+            .filter(|t| !seen.contains(&t.name))
+            .cloned()
+            .collect();
+        remainder.sort_by(|a, b| a.name.cmp(&b.name));
+        selected.extend(
+            remainder
+                .into_iter()
+                .take(KIMI_MAX_TOOLS.saturating_sub(selected.len())),
+        );
+    }
+
+    selected
+}
+
 /// Convert IronClaw tool_choice string to rig-core ToolChoice.
 fn convert_tool_choice(choice: Option<&str>) -> Option<RigToolChoice> {
     match choice.map(|s| s.to_lowercase()).as_deref() {
@@ -607,7 +853,484 @@ fn maybe_dump_openai_payload(model_name: &str, rig_req: &RigRequest, kind: &str)
     }
 }
 
-impl<M: CompletionModel + Send + Sync + 'static> RigAdapter<M> {}
+// -- K2.5 native transport helpers --
+
+impl<M: CompletionModel + Send + Sync + 'static> RigAdapter<M> {
+    /// Send a K2.5 tool request using native HTTP transport with string content format.
+    ///
+    /// rig-core serializes content as `[{"type":"text","text":"..."}]` which vLLM/SGLang
+    /// rejects when tools are present. This sends plain string content matching curl.
+    async fn send_kimi_native_tool_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[IronToolDefinition],
+        tool_choice: Option<&str>,
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> Result<ToolCompletionResponse, LlmError> {
+        let transport = self
+            .native_transport
+            .as_ref()
+            .ok_or_else(|| LlmError::RequestFailed {
+                provider: self.model_name.clone(),
+                reason: "Native transport not configured".to_string(),
+            })?;
+
+        // Build messages with string content (matching curl format)
+        let json_messages = build_native_messages(messages);
+
+        // Build tool definitions with kimi-compat schemas
+        let tools_json: Vec<JsonValue> = tools
+            .iter()
+            .map(|t| {
+                let params = normalize_tool_parameters_for_model(&self.model_name, &t.parameters);
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": normalize_tool_description_for_model(
+                            &self.model_name, &t.name, &t.description,
+                        ),
+                        "parameters": params,
+                    }
+                })
+            })
+            .collect();
+
+        let mut payload = serde_json::json!({
+            "model": self.model_name,
+            "messages": json_messages,
+            "tools": tools_json,
+            "tool_choice": tool_choice.unwrap_or("auto"),
+        });
+        if let Some(kwargs) = maybe_chat_template_kwargs_for_model(&self.model_name) {
+            payload["chat_template_kwargs"] = kwargs;
+        }
+
+        if let Some(t) = temperature {
+            payload["temperature"] = serde_json::json!(t);
+        }
+        if let Some(m) = max_tokens {
+            payload["max_tokens"] = serde_json::json!(m);
+        }
+
+        // Dump payload if enabled
+        if env_flag_enabled("IRONCLAW_RIG_PAYLOAD_DUMP") {
+            let path = payload_dump_path("kimi_native");
+            if let Ok(json) = serde_json::to_string_pretty(&payload) {
+                let _ = std::fs::write(&path, &json);
+                tracing::info!(
+                    model = %self.model_name,
+                    path = %path.display(),
+                    bytes = json.len(),
+                    "Wrote native K2.5 payload debug dump",
+                );
+            }
+        }
+
+        let url = format!("{}/chat/completions", transport.base_url);
+        tracing::debug!(
+            model = %self.model_name,
+            url = %url,
+            tools = tools.len(),
+            "Sending K2.5 request via native chat transport",
+        );
+
+        let response = transport
+            .client
+            .post(&url)
+            .bearer_auth(&transport.api_key)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| LlmError::RequestFailed {
+                provider: self.model_name.clone(),
+                reason: format!("Native transport request failed: {e}"),
+            })?;
+
+        let status = response.status();
+        let body = response.text().await.map_err(|e| LlmError::RequestFailed {
+            provider: self.model_name.clone(),
+            reason: format!("Failed to read response body: {e}"),
+        })?;
+
+        if !status.is_success() {
+            return Err(LlmError::RequestFailed {
+                provider: self.model_name.clone(),
+                reason: format!("HTTP {status}: {}", truncate_chars(&body, 512)),
+            });
+        }
+
+        parse_native_tool_response(&self.model_name, &body)
+    }
+
+    /// Send a request via native transport WITHOUT the `tools` parameter.
+    ///
+    /// Used as the final fallback when even reduced-tools requests fail with 500.
+    /// Tools are already injected into the system prompt by the caller; the model
+    /// emits tool calls as section-delimited text that `recover_tool_calls_from_content`
+    /// parses in the reasoning layer.
+    async fn send_kimi_native_text_tool_request(
+        &self,
+        messages: &[ChatMessage],
+        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+    ) -> Result<ToolCompletionResponse, LlmError> {
+        let transport = self
+            .native_transport
+            .as_ref()
+            .ok_or_else(|| LlmError::RequestFailed {
+                provider: self.model_name.clone(),
+                reason: "Native transport not configured".to_string(),
+            })?;
+
+        let json_messages = build_native_messages(messages);
+
+        let mut payload = serde_json::json!({
+            "model": self.model_name,
+            "messages": json_messages,
+        });
+        if let Some(kwargs) = maybe_chat_template_kwargs_for_model(&self.model_name) {
+            payload["chat_template_kwargs"] = kwargs;
+        }
+
+        if let Some(t) = temperature {
+            payload["temperature"] = serde_json::json!(t);
+        }
+        if let Some(m) = max_tokens {
+            payload["max_tokens"] = serde_json::json!(m);
+        }
+
+        if env_flag_enabled("IRONCLAW_RIG_PAYLOAD_DUMP") {
+            let path = payload_dump_path("kimi_text_tool_fallback");
+            if let Ok(json) = serde_json::to_string_pretty(&payload) {
+                let _ = std::fs::write(&path, &json);
+                tracing::info!(
+                    model = %self.model_name,
+                    path = %path.display(),
+                    bytes = json.len(),
+                    "Wrote native K2.5 text-tool fallback payload dump",
+                );
+            }
+        }
+
+        let url = format!("{}/chat/completions", transport.base_url);
+        tracing::debug!(
+            model = %self.model_name,
+            url = %url,
+            "Sending K2.5 text-tool fallback via native transport (no tools param)",
+        );
+
+        let response = transport
+            .client
+            .post(&url)
+            .bearer_auth(&transport.api_key)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| LlmError::RequestFailed {
+                provider: self.model_name.clone(),
+                reason: format!("Native text-tool fallback request failed: {e}"),
+            })?;
+
+        let status = response.status();
+        let body = response.text().await.map_err(|e| LlmError::RequestFailed {
+            provider: self.model_name.clone(),
+            reason: format!("Failed to read response body: {e}"),
+        })?;
+
+        if !status.is_success() {
+            return Err(LlmError::RequestFailed {
+                provider: self.model_name.clone(),
+                reason: format!("HTTP {status}: {}", truncate_chars(&body, 512)),
+            });
+        }
+
+        parse_native_tool_response(&self.model_name, &body)
+    }
+}
+
+/// Inject tool definitions into the first system message as plain text.
+///
+/// When the LLM endpoint doesn't support the structured `tools` parameter
+/// (returns HTTP 500), we embed tool descriptions in the system prompt instead.
+/// K2.5 is trained to emit tool calls using section-delimited format
+/// (`<|tool_calls_section_begin|>...`) which `recover_tool_calls_from_content`
+/// in the reasoning layer parses automatically.
+fn inject_tools_into_system_prompt(messages: &mut Vec<ChatMessage>, tools: &[IronToolDefinition]) {
+    if tools.is_empty() {
+        return;
+    }
+
+    // Build tool descriptions
+    let mut tool_section = String::from(
+        "\n\n## Tool Calling\n\
+         You have access to the following tools. To call a tool, output EXACTLY this format:\n\
+         <|tool_calls_section_begin|><|tool_call_begin|>functions.TOOL_NAME:0\
+         <|tool_call_argument_begin|>{\"arg\": \"value\"}<|tool_call_end|>\
+         <|tool_calls_section_end|>\n\n\
+         IMPORTANT: Use the EXACT tool name as listed below (e.g. `time`, not `time_get_current_time`). \
+         The tool name must match exactly.\n\
+         Never claim a tool was called or show tool results unless you emitted a valid tool call block in this response.\n\n\
+         Available tools:\n",
+    );
+
+    for tool in tools {
+        tool_section.push_str(&format!("- **{}**: {}\n", tool.name, tool.description));
+        // Include parameter schema in compact form
+        if let Some(props) = tool.parameters.get("properties")
+            && let Some(obj) = props.as_object()
+        {
+            let required: Vec<&str> = tool
+                .parameters
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            let params: Vec<String> = obj
+                .iter()
+                .map(|(name, schema)| {
+                    let ty = schema.get("type").and_then(|t| t.as_str()).unwrap_or("any");
+                    let req = if required.contains(&name.as_str()) {
+                        " (required)"
+                    } else {
+                        ""
+                    };
+                    let desc = schema
+                        .get("description")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("");
+                    // Include enum values so the model knows valid options
+                    let enum_suffix = schema
+                        .get("enum")
+                        .and_then(|e| e.as_array())
+                        .map(|vals| {
+                            let items: Vec<String> = vals
+                                .iter()
+                                .filter_map(|v| v.as_str().map(|s| format!("\"{s}\"")))
+                                .collect();
+                            format!(" [{}]", items.join(", "))
+                        })
+                        .unwrap_or_default();
+                    format!("    - `{name}` ({ty}{req}): {desc}{enum_suffix}")
+                })
+                .collect();
+            if !params.is_empty() {
+                tool_section.push_str(&format!("  Parameters:\n{}\n", params.join("\n")));
+            }
+        }
+    }
+
+    // Find the first system message and append the tool section
+    if let Some(sys_msg) = messages
+        .iter_mut()
+        .find(|m| m.role == crate::llm::Role::System)
+    {
+        sys_msg.content.push_str(&tool_section);
+    } else {
+        // No system message — prepend one
+        messages.insert(
+            0,
+            ChatMessage {
+                role: crate::llm::Role::System,
+                content: tool_section,
+                tool_call_id: None,
+                name: None,
+                tool_calls: None,
+            },
+        );
+    }
+}
+
+/// Split hidden `<thinking>...</thinking>` blocks from assistant content.
+///
+/// Returns `(visible_content, reasoning_content)` where reasoning content is
+/// joined with newlines if multiple blocks are present.
+fn split_hidden_thinking(content: &str) -> (String, Option<String>) {
+    let mut visible = String::new();
+    let mut reasoning_parts: Vec<String> = Vec::new();
+    let mut cursor = content;
+
+    const OPEN: &str = "<thinking>";
+    const CLOSE: &str = "</thinking>";
+
+    loop {
+        let Some(open_idx) = cursor.find(OPEN) else {
+            visible.push_str(cursor);
+            break;
+        };
+
+        visible.push_str(&cursor[..open_idx]);
+        let after_open = &cursor[open_idx + OPEN.len()..];
+
+        let Some(close_rel) = after_open.find(CLOSE) else {
+            // Malformed tail: keep it as visible content.
+            visible.push_str(&cursor[open_idx..]);
+            break;
+        };
+
+        let reasoning = &after_open[..close_rel];
+        if !reasoning.trim().is_empty() {
+            reasoning_parts.push(reasoning.to_string());
+        }
+        cursor = &after_open[close_rel + CLOSE.len()..];
+    }
+
+    let reasoning_content = if reasoning_parts.is_empty() {
+        None
+    } else {
+        Some(reasoning_parts.join("\n"))
+    };
+
+    (visible, reasoning_content)
+}
+
+/// Build OpenAI-format messages with plain string content (not array).
+fn build_native_messages(messages: &[ChatMessage]) -> Vec<JsonValue> {
+    let mut out = Vec::new();
+    for msg in messages {
+        match msg.role {
+            crate::llm::Role::System => {
+                out.push(serde_json::json!({
+                    "role": "system",
+                    "content": msg.content,
+                }));
+            }
+            crate::llm::Role::User => {
+                out.push(serde_json::json!({
+                    "role": "user",
+                    "content": msg.content,
+                }));
+            }
+            crate::llm::Role::Assistant => {
+                let (visible_content, reasoning_content) = split_hidden_thinking(&msg.content);
+                if let Some(ref tool_calls) = msg.tool_calls {
+                    let tc_json: Vec<JsonValue> = tool_calls
+                        .iter()
+                        .map(|tc| {
+                            // OpenAI API expects arguments as a JSON string
+                            let args_str = if tc.arguments.is_string() {
+                                tc.arguments.as_str().unwrap_or("{}").to_string()
+                            } else {
+                                serde_json::to_string(&tc.arguments).unwrap_or_default()
+                            };
+                            serde_json::json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": args_str,
+                                }
+                            })
+                        })
+                        .collect();
+                    let content: JsonValue = if visible_content.is_empty() {
+                        JsonValue::Null
+                    } else {
+                        JsonValue::String(visible_content)
+                    };
+                    let mut payload = serde_json::json!({
+                        "role": "assistant",
+                        "content": content,
+                        "tool_calls": tc_json,
+                    });
+                    if let Some(reasoning) = reasoning_content {
+                        payload["reasoning_content"] = JsonValue::String(reasoning);
+                    }
+                    out.push(payload);
+                } else {
+                    let mut payload = serde_json::json!({
+                        "role": "assistant",
+                        "content": visible_content,
+                    });
+                    if let Some(reasoning) = reasoning_content {
+                        payload["reasoning_content"] = JsonValue::String(reasoning);
+                    }
+                    out.push(payload);
+                }
+            }
+            crate::llm::Role::Tool => {
+                out.push(serde_json::json!({
+                    "role": "tool",
+                    "content": msg.content,
+                    "tool_call_id": msg.tool_call_id.as_deref().unwrap_or(""),
+                }));
+            }
+        }
+    }
+    out
+}
+
+/// Parse an OpenAI chat completion response into a `ToolCompletionResponse`.
+fn parse_native_tool_response(
+    model_name: &str,
+    body: &str,
+) -> Result<ToolCompletionResponse, LlmError> {
+    let resp: JsonValue = serde_json::from_str(body).map_err(|e| LlmError::RequestFailed {
+        provider: model_name.to_string(),
+        reason: format!("Failed to parse response JSON: {e}"),
+    })?;
+
+    let choice = resp["choices"]
+        .as_array()
+        .and_then(|c| c.first())
+        .ok_or_else(|| LlmError::RequestFailed {
+            provider: model_name.to_string(),
+            reason: format!("No choices in response: {}", truncate_chars(body, 256)),
+        })?;
+
+    let message = &choice["message"];
+    let message_content = message["content"].as_str().map(String::from);
+    let reasoning_content = message["reasoning_content"]
+        .as_str()
+        .or_else(|| message["reasoning"].as_str())
+        .map(String::from);
+
+    let mut tool_calls = Vec::new();
+    if let Some(tcs) = message["tool_calls"].as_array() {
+        for tc in tcs {
+            let id = tc["id"].as_str().unwrap_or("").to_string();
+            let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+            let arguments = match tc["function"]["arguments"].as_str() {
+                Some(s) => serde_json::from_str(s).unwrap_or(JsonValue::Object(Default::default())),
+                None => tc["function"]["arguments"].clone(),
+            };
+            tool_calls.push(IronToolCall {
+                id,
+                name,
+                arguments,
+            });
+        }
+    }
+
+    let content = match (message_content, reasoning_content) {
+        // Keep reasoning in hidden tags so we can preserve it in context without
+        // exposing chain-of-thought to users.
+        (Some(content), Some(reasoning)) => {
+            Some(format!("{content}\n<thinking>{reasoning}</thinking>"))
+        }
+        (Some(content), None) => Some(content),
+        (None, Some(reasoning)) => Some(format!("<thinking>{reasoning}</thinking>")),
+        (None, None) => None,
+    };
+
+    let finish_reason = if !tool_calls.is_empty() {
+        FinishReason::ToolUse
+    } else {
+        FinishReason::Stop
+    };
+
+    let input_tokens = resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+    let output_tokens = resp["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+
+    Ok(ToolCompletionResponse {
+        content,
+        tool_calls,
+        input_tokens: saturate_u32(input_tokens),
+        output_tokens: saturate_u32(output_tokens),
+        finish_reason,
+    })
+}
 
 #[async_trait]
 impl<M> LlmProvider for RigAdapter<M>
@@ -687,7 +1410,124 @@ where
         let mut messages = request.messages;
         crate::llm::provider::sanitize_tool_messages(&mut messages);
 
-        // Standard rig-core path.
+        // Interleaved-thinking Kimi models: bypass rig-core's array content
+        // serialization for tool rounds, because these endpoints expect plain
+        // string content and emit reasoning in a provider-specific field.
+        if should_use_glm_native_tool_rounds(&self.model_name) && self.native_transport.is_some() {
+            match self
+                .send_kimi_native_tool_request(
+                    &messages,
+                    &request.tools,
+                    request.tool_choice.as_deref(),
+                    request.temperature,
+                    request.max_tokens,
+                )
+                .await
+            {
+                Ok(mut resp) => {
+                    normalize_tool_calls(&mut resp.tool_calls, &known_tool_names);
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        model = %self.model_name,
+                        error = %e,
+                        "GLM native tool request failed; falling back to standard provider path"
+                    );
+                }
+            }
+        }
+
+        if is_kimi_interleaved_thinking_model(&self.model_name) && self.native_transport.is_some() {
+            // K2.5 on some OpenAI-compatible gateways (Baseten/vLLM/SGLang) is
+            // unstable when using the structured `tools` field and often returns
+            // HTTP 500. Prefer text-tool mode first for K2.5.
+            if should_use_kimi_text_tool_primary(&self.model_name) {
+                let mut text_tool_messages = messages.clone();
+                inject_tools_into_system_prompt(&mut text_tool_messages, &request.tools);
+                tracing::info!(
+                    model = %self.model_name,
+                    tools = request.tools.len(),
+                    "K2.5 using text-based tool calling via native transport (structured tools disabled)"
+                );
+
+                match self
+                    .send_kimi_native_text_tool_request(
+                        &text_tool_messages,
+                        request.temperature,
+                        request.max_tokens,
+                    )
+                    .await
+                {
+                    Ok(mut resp) => {
+                        normalize_tool_calls(&mut resp.tool_calls, &known_tool_names);
+                        return Ok(resp);
+                    }
+                    Err(e) => {
+                        // Retry once with a small deterministic tool subset if
+                        // the full text-tool prompt fails (typically payload size).
+                        let reduced_tools = kimi_reduced_tool_set(&request.tools);
+                        if reduced_tools.len() < request.tools.len() {
+                            tracing::warn!(
+                                model = %self.model_name,
+                                tools = request.tools.len(),
+                                reduced_tools = reduced_tools.len(),
+                                error = %e,
+                                "K2.5 text-tool request failed; retrying with reduced tool set in system prompt"
+                            );
+
+                            let mut reduced_text_tool_messages = messages.clone();
+                            inject_tools_into_system_prompt(
+                                &mut reduced_text_tool_messages,
+                                &reduced_tools,
+                            );
+
+                            let mut resp = self
+                                .send_kimi_native_text_tool_request(
+                                    &reduced_text_tool_messages,
+                                    request.temperature,
+                                    request.max_tokens,
+                                )
+                                .await?;
+                            normalize_tool_calls(&mut resp.tool_calls, &known_tool_names);
+                            return Ok(resp);
+                        }
+
+                        return Err(e);
+                    }
+                }
+            }
+
+            // K2-thinking: use native structured tools to preserve interleaved
+            // reasoning with provider-native tool calls. If native call fails,
+            // fall through to the standard provider path below.
+            if is_kimi_k2_thinking_model(&self.model_name) {
+                match self
+                    .send_kimi_native_tool_request(
+                        &messages,
+                        &request.tools,
+                        request.tool_choice.as_deref(),
+                        request.temperature,
+                        request.max_tokens,
+                    )
+                    .await
+                {
+                    Ok(mut resp) => {
+                        normalize_tool_calls(&mut resp.tool_calls, &known_tool_names);
+                        return Ok(resp);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            model = %self.model_name,
+                            error = %e,
+                            "Kimi K2-thinking native transport failed; falling back to standard provider path"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Standard rig-core path (non-interleaved models, or native fallback).
         let (preamble, history) = convert_messages(&messages);
         let tools = convert_tools(&self.model_name, &request.tools);
         let tool_choice = convert_tool_choice(request.tool_choice.as_deref());
@@ -702,14 +1542,80 @@ where
         )?;
         maybe_dump_openai_payload(&self.model_name, &rig_req, "complete_with_tools");
 
-        let response =
-            self.model
-                .completion(rig_req)
-                .await
-                .map_err(|e| LlmError::RequestFailed {
-                    provider: self.model_name.clone(),
-                    reason: e.to_string(),
-                })?;
+        let response = match self.model.completion(rig_req.clone()).await {
+            Ok(resp) => resp,
+            Err(primary_error) => {
+                let primary_reason = primary_error.to_string();
+                if !is_kimi_k2_5_model(&self.model_name)
+                    || !is_server_error_retryable_for_kimi(&primary_reason)
+                {
+                    return Err(LlmError::RequestFailed {
+                        provider: self.model_name.clone(),
+                        reason: primary_reason,
+                    });
+                }
+
+                tracing::warn!(
+                    model = %self.model_name,
+                    tools = request.tools.len(),
+                    "Kimi tool request hit provider 500; retrying with reduced tool set"
+                );
+
+                let reduced_tool_defs = kimi_reduced_tool_set(&request.tools);
+                let reduced_tools = convert_tools(&self.model_name, &reduced_tool_defs);
+                let reduced_req = build_rig_request(
+                    rig_req.preamble.clone(),
+                    rig_req.chat_history.clone().into_iter().collect(),
+                    reduced_tools,
+                    rig_req.tool_choice.clone(),
+                    request.temperature,
+                    request.max_tokens,
+                )?;
+                maybe_dump_openai_payload(
+                    &self.model_name,
+                    &reduced_req,
+                    "complete_with_tools_kimi_reduced",
+                );
+
+                match self.model.completion(reduced_req).await {
+                    Ok(resp) => resp,
+                    Err(reduced_error) => {
+                        let reduced_reason = reduced_error.to_string();
+                        tracing::warn!(
+                            model = %self.model_name,
+                            "Kimi reduced tool request also failed; retrying once without tools"
+                        );
+
+                        let no_tools_req = build_rig_request(
+                            rig_req.preamble.clone(),
+                            rig_req.chat_history.clone().into_iter().collect(),
+                            Vec::new(),
+                            None,
+                            request.temperature,
+                            request.max_tokens,
+                        )?;
+                        maybe_dump_openai_payload(
+                            &self.model_name,
+                            &no_tools_req,
+                            "complete_with_tools_kimi_no_tools",
+                        );
+
+                        match self.model.completion(no_tools_req).await {
+                            Ok(resp) => resp,
+                            Err(no_tools_error) => {
+                                return Err(LlmError::RequestFailed {
+                                    provider: self.model_name.clone(),
+                                    reason: format!(
+                                        "{primary_reason}; reduced_tools_retry={reduced_reason}; no_tools_retry={}",
+                                        no_tools_error
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        };
 
         let (text, mut tool_calls, finish) = extract_response(&response.choice, &response.usage);
 
@@ -953,6 +1859,243 @@ mod tests {
     }
 
     #[test]
+    fn test_convert_tools_kimi_simplifies_schema_subset() {
+        let tools = vec![IronToolDefinition {
+            name: "demo".to_string(),
+            description: "demo".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "title": "Ignored title",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "default": "hello",
+                        "minLength": 1
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" }
+                    }
+                },
+                "required": ["query"],
+                "anyOf": [
+                    { "type": "object" },
+                    { "type": "null" }
+                ]
+            }),
+        }];
+
+        let rig_tools = convert_tools("moonshotai/Kimi-K2.5", &tools);
+        let params = &rig_tools[0].parameters;
+
+        assert_eq!(params["type"], serde_json::json!("object"));
+        assert_eq!(params["required"], serde_json::json!(["query"]));
+        assert_eq!(
+            params["properties"]["query"]["type"],
+            serde_json::json!("string")
+        );
+        assert!(
+            params["properties"]["query"].get("default").is_none(),
+            "Kimi path should drop non-essential schema keywords"
+        );
+        assert!(
+            params["properties"]["limit"].get("minimum").is_none(),
+            "Kimi path should drop min/max constraints that can trigger provider bugs"
+        );
+        assert!(
+            params["properties"]["metadata"]
+                .get("additionalProperties")
+                .is_none(),
+            "Kimi path should drop nested map schemas that some gateways reject"
+        );
+        assert!(
+            params.get("anyOf").is_none(),
+            "Kimi path should drop combinators that can trigger parser bugs"
+        );
+        assert!(
+            params.get("additionalProperties").is_none(),
+            "Kimi path should NOT emit additionalProperties (vLLM/SGLang choke on it)"
+        );
+        assert!(
+            params.get("title").is_none(),
+            "Kimi path should drop root-level title"
+        );
+    }
+
+    #[test]
+    fn test_kimi_reduced_tool_set_prefers_core_priority() {
+        let tools = vec![
+            IronToolDefinition {
+                name: "memory_write".to_string(),
+                description: "".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+            IronToolDefinition {
+                name: "time".to_string(),
+                description: "".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+            IronToolDefinition {
+                name: "discover_tools".to_string(),
+                description: "".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+            IronToolDefinition {
+                name: "shell".to_string(),
+                description: "".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+            IronToolDefinition {
+                name: "create_job".to_string(),
+                description: "".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        ];
+
+        let reduced = kimi_reduced_tool_set(&tools);
+        let names: Vec<&str> = reduced.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names[0], "discover_tools");
+        assert_eq!(names[1], "time");
+        assert_eq!(names[2], "shell");
+        assert!(names.contains(&"memory_write"));
+        assert!(names.contains(&"create_job"));
+    }
+
+    #[test]
+    fn test_is_server_error_retryable_for_kimi() {
+        assert!(is_server_error_retryable_for_kimi(
+            "HttpError: Invalid status code 500 Internal Server Error with message: {\"error\": \"Internal Server Error\"}"
+        ));
+        assert!(!is_server_error_retryable_for_kimi(
+            "HttpError: Invalid status code 400 Bad Request"
+        ));
+    }
+
+    #[test]
+    fn test_is_kimi_interleaved_thinking_model() {
+        assert!(is_kimi_interleaved_thinking_model("moonshotai/kimi-k2.5"));
+        assert!(is_kimi_interleaved_thinking_model("kimi-k2.5"));
+        assert!(is_kimi_interleaved_thinking_model("kimi-k2-5"));
+        assert!(is_kimi_interleaved_thinking_model("kimi-k2p5"));
+        assert!(is_kimi_interleaved_thinking_model(
+            "moonshotai/kimi-k2-thinking"
+        ));
+        assert!(is_kimi_k2_thinking_model("kimi-k2-thinking"));
+        assert!(!is_kimi_interleaved_thinking_model("moonshotai/kimi-k2"));
+    }
+
+    #[test]
+    fn test_should_use_kimi_text_tool_primary() {
+        assert!(should_use_kimi_text_tool_primary("moonshotai/kimi-k2.5"));
+        assert!(should_use_kimi_text_tool_primary("kimi-k2-5"));
+        assert!(!should_use_kimi_text_tool_primary("kimi-k2-thinking"));
+        assert!(!should_use_kimi_text_tool_primary("moonshotai/kimi-k2"));
+    }
+
+    #[test]
+    fn test_maybe_chat_template_kwargs_for_model_glm() {
+        let kwargs = maybe_chat_template_kwargs_for_model("zai-org/GLM-5").expect("glm kwargs");
+        assert_eq!(kwargs, serde_json::json!({"clear_thinking": false}));
+        assert!(maybe_chat_template_kwargs_for_model("moonshotai/Kimi-K2.5").is_none());
+    }
+
+    #[test]
+    fn test_split_hidden_thinking() {
+        let (visible, reasoning) = split_hidden_thinking(
+            "Visible content<thinking>first thought</thinking>\n<thinking>second thought</thinking>",
+        );
+        assert_eq!(visible, "Visible content\n");
+        assert_eq!(reasoning, Some("first thought\nsecond thought".to_string()));
+    }
+
+    #[test]
+    fn test_parse_native_tool_response_wraps_reasoning_hidden() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "I'll use tools.",
+                    "reasoning_content": "Need current date and web search",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "time",
+                            "arguments": "{}"
+                        }
+                    }]
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5
+            }
+        })
+        .to_string();
+
+        let parsed = parse_native_tool_response("moonshotai/kimi-k2-thinking", &body)
+            .expect("response should parse");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        let content = parsed.content.expect("content should be present");
+        assert!(content.contains("I'll use tools."));
+        assert!(content.contains("<thinking>Need current date and web search</thinking>"));
+    }
+
+    #[test]
+    fn test_parse_native_tool_response_supports_reasoning_alias() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "reasoning": "Need to think first",
+                    "tool_calls": []
+                }
+            }]
+        })
+        .to_string();
+
+        let parsed = parse_native_tool_response("zai-org/GLM-5", &body).expect("response parses");
+        let content = parsed.content.expect("content should be present");
+        assert_eq!(content, "<thinking>Need to think first</thinking>");
+    }
+
+    #[test]
+    fn test_build_native_messages_exposes_reasoning_content_field() {
+        let messages = vec![ChatMessage::assistant(
+            "Visible reply<thinking>hidden reasoning</thinking>",
+        )];
+
+        let out = build_native_messages(&messages);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["role"], "assistant");
+        assert_eq!(out[0]["content"], "Visible reply");
+        assert_eq!(out[0]["reasoning_content"], "hidden reasoning");
+    }
+
+    #[test]
+    fn test_convert_tools_kimi_description_fallback_and_truncation() {
+        let tools = vec![
+            IronToolDefinition {
+                name: "unnamed_description_tool".to_string(),
+                description: "   ".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            },
+            IronToolDefinition {
+                name: "long_description_tool".to_string(),
+                description: "x".repeat(700),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            },
+        ];
+
+        let rig_tools = convert_tools("moonshotai/Kimi-K2.5", &tools);
+        assert_eq!(rig_tools[0].description, "unnamed_description_tool");
+        assert_eq!(rig_tools[1].description.chars().count(), 512);
+    }
+
+    #[test]
     fn test_normalize_schema_lenient_prunes_stale_required_recursively() {
         let schema = serde_json::json!({
             "type": "object",
@@ -1192,5 +2335,83 @@ mod tests {
     fn test_normalize_tool_name_unknown_passthrough() {
         let known = HashSet::from(["echo".to_string()]);
         assert_eq!(normalize_tool_name("other_tool", &known), "other_tool");
+    }
+
+    #[test]
+    fn test_inject_tools_into_system_prompt_appends() {
+        let mut messages = vec![
+            ChatMessage::system("You are helpful."),
+            ChatMessage::user("Hello"),
+        ];
+        let tools = vec![IronToolDefinition {
+            name: "time".to_string(),
+            description: "Get current time".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tz": {"type": "string", "description": "Timezone"}
+                },
+                "required": ["tz"]
+            }),
+        }];
+        inject_tools_into_system_prompt(&mut messages, &tools);
+        assert!(messages[0].content.contains("Tool Calling"));
+        assert!(messages[0].content.contains("time"));
+        assert!(messages[0].content.contains("Get current time"));
+        assert!(messages[0].content.contains("tool_calls_section_begin"));
+        assert!(messages[0].content.contains("tz"));
+        assert!(messages[0].content.contains("(required)"));
+        // Original system prompt is still there
+        assert!(messages[0].content.starts_with("You are helpful."));
+        // Message count unchanged
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn test_inject_tools_into_system_prompt_creates_system_msg() {
+        let mut messages = vec![ChatMessage::user("Hello")];
+        let tools = vec![IronToolDefinition {
+            name: "echo".to_string(),
+            description: "Echo text".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        }];
+        inject_tools_into_system_prompt(&mut messages, &tools);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, crate::llm::Role::System);
+        assert!(messages[0].content.contains("echo"));
+    }
+
+    #[test]
+    fn test_inject_tools_empty_tools_noop() {
+        let mut messages = vec![ChatMessage::system("You are helpful.")];
+        let original = messages[0].content.clone();
+        inject_tools_into_system_prompt(&mut messages, &[]);
+        assert_eq!(messages[0].content, original);
+    }
+
+    #[test]
+    fn test_inject_tools_includes_enum_values() {
+        let mut messages = vec![ChatMessage::system("You are helpful.")];
+        let tools = vec![IronToolDefinition {
+            name: "time".to_string(),
+            description: "Get current time".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["now", "parse", "format"],
+                        "description": "The operation"
+                    }
+                },
+                "required": ["operation"]
+            }),
+        }];
+        inject_tools_into_system_prompt(&mut messages, &tools);
+        assert!(
+            messages[0]
+                .content
+                .contains(r#"["now", "parse", "format"]"#)
+        );
     }
 }

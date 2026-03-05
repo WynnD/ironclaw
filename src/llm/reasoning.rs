@@ -93,6 +93,18 @@ pub fn is_silent_reply(text: &str) -> bool {
                 .all(|c| c.is_whitespace() || c.is_ascii_punctuation())
 }
 
+/// Simple `<think>...</think>` stripping for preprocessing raw LLM output.
+/// Unlike `clean_response`, this only removes `<think>` blocks without
+/// code-region awareness — suitable for early-stage content before it
+/// reaches the full cleaning pipeline.
+pub fn strip_think_tags(text: &str) -> String {
+    static THINK_BLOCK_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)<\s*think(?:ing)?\b[^>]*>.*?<\s*/\s*think(?:ing)?\s*>")
+            .expect("THINK_BLOCK_RE")
+    });
+    THINK_BLOCK_RE.replace_all(text, "").to_string()
+}
+
 /// Quick-check: bail early if no reasoning/final tags are present at all.
 static QUICK_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)<\s*/?\s*(?:think(?:ing)?|thought|thoughts|antthinking|reasoning|reflection|scratchpad|inner_monologue|final)\b").expect("QUICK_TAG_RE")
@@ -613,15 +625,27 @@ Respond in JSON format:
 
             let content = response.content.unwrap_or_default();
 
-            // Some models emit tool calls as XML tags in content instead of
-            // using the structured tool_calls field. Try to recover them
-            // before giving up and returning plain text.
+            // Some models (e.g. GLM-4.7) emit tool calls as XML tags in content
+            // instead of using the structured tool_calls field. Try to recover
+            // them before giving up and returning plain text.
             tracing::debug!(
                 content_len = content.len(),
                 content_preview = %crate::llm::rig_adapter::truncate_for_log(&content, 300),
                 "Attempting tool call recovery from text content",
             );
-            let recovered = recover_tool_calls_from_content(&content, &context.available_tools);
+            let (recovered, recovery_stats) =
+                recover_tool_calls_from_content_with_stats(&content, &context.available_tools);
+            if recovery_stats.section_blocks > 0 && recovered.is_empty() {
+                tracing::warn!(
+                    section_blocks = recovery_stats.section_blocks,
+                    section_calls_seen = recovery_stats.section_calls_seen,
+                    placeholder_names_seen = recovery_stats.placeholder_names_seen,
+                    placeholder_names_repaired = recovery_stats.placeholder_names_repaired,
+                    unknown_calls_dropped = recovery_stats.unknown_calls_dropped,
+                    content_preview = %crate::llm::rig_adapter::truncate_for_log(&content, 300),
+                    "Detected section-delimited tool calls but recovered zero executable tool calls",
+                );
+            }
             if !recovered.is_empty() {
                 let cleaned = clean_response(&content);
                 return Ok(RespondOutput {
@@ -667,8 +691,10 @@ Respond in JSON format:
             }
 
             // Guard against empty text after cleaning. This can happen
-            // when reasoning models return chain-of-thought wrapped in
-            // <think> tags — clean_response strips the tags leaving empty.
+            // when reasoning models (e.g. GLM-5) return chain-of-thought
+            // in reasoning_content wrapped in <think> tags and content is
+            // null — the .or(reasoning_content) fallback picks it up, then
+            // clean_response strips the think tags leaving an empty string.
             let cleaned = clean_response(&content);
             let final_text = if cleaned.trim().is_empty() {
                 tracing::warn!(
@@ -851,7 +877,8 @@ Respond in JSON format:
         }
 
         let retry_content = retry.content.unwrap_or_default();
-        let recovered = recover_tool_calls_from_content(&retry_content, available_tools);
+        let (recovered, _) =
+            recover_tool_calls_from_content_with_stats(&retry_content, available_tools);
         if !recovered.is_empty() {
             let cleaned = clean_response(&retry_content);
             return Ok((
@@ -1504,6 +1531,9 @@ fn is_inside_code(pos: usize, regions: &[CodeRegion]) -> bool {
     regions.iter().any(|r| pos >= r.start && pos < r.end)
 }
 
+/// Clean up LLM response by stripping model-internal tags and reasoning patterns.
+///
+/// Some models (GLM-4.7, etc.) emit XML-tagged internal state like
 /// Try to extract tool calls from content text where the model emitted them
 /// as XML tags instead of using the structured tool_calls field.
 ///
@@ -1512,16 +1542,36 @@ fn is_inside_code(pos: usize, regions: &[CodeRegion]) -> bool {
 /// - `<tool_call>{"name":"x","arguments":{}}</tool_call>` (JSON)
 /// - `<|tool_call|>...<|/tool_call|>` (pipe-delimited variant)
 /// - `<function_call>...</function_call>` (function_call variant)
+/// - `<|tool_calls_section_begin|>...<|tool_calls_section_end|>` (section-delimited, Kimi K2.5)
 ///
 /// Only returns calls whose name matches an available tool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ToolCallRecoveryStats {
+    section_blocks: usize,
+    section_calls_seen: usize,
+    placeholder_names_seen: usize,
+    placeholder_names_repaired: usize,
+    unknown_calls_dropped: usize,
+}
+
+#[cfg(test)]
 fn recover_tool_calls_from_content(
     content: &str,
     available_tools: &[ToolDefinition],
 ) -> Vec<ToolCall> {
+    recover_tool_calls_from_content_with_stats(content, available_tools).0
+}
+
+fn recover_tool_calls_from_content_with_stats(
+    content: &str,
+    available_tools: &[ToolDefinition],
+) -> (Vec<ToolCall>, ToolCallRecoveryStats) {
     let tool_names: std::collections::HashSet<&str> =
         available_tools.iter().map(|t| t.name.as_str()).collect();
     let mut calls = Vec::new();
+    let mut stats = ToolCallRecoveryStats::default();
 
+    // Format 1: paired XML/pipe tags
     for (open, close) in &[
         ("<tool_call>", "</tool_call>"),
         ("<|tool_call|>", "<|/tool_call|>"),
@@ -1571,7 +1621,99 @@ fn recover_tool_calls_from_content(
         }
     }
 
-    calls
+    // Format 2: section-delimited tool calls (Kimi K2.5 and similar models)
+    //
+    // <|tool_calls_section_begin|>
+    //   <|tool_call_begin|>functions.http:0<|tool_call_argument_begin|>{"method":"GET",...}<|tool_call_end|>
+    //   <|tool_call_begin|>functions.shell:1<|tool_call_argument_begin|>{"command":"ls"}<|tool_call_end|>
+    // <|tool_calls_section_end|>
+    const SECTION_BEGIN: &str = "<|tool_calls_section_begin|>";
+    const SECTION_END: &str = "<|tool_calls_section_end|>";
+    const CALL_BEGIN: &str = "<|tool_call_begin|>";
+    const CALL_END: &str = "<|tool_call_end|>";
+    const ARG_BEGIN: &str = "<|tool_call_argument_begin|>";
+
+    let mut remaining = content;
+    while let Some(sec_start) = remaining.find(SECTION_BEGIN) {
+        stats.section_blocks += 1;
+        let after_sec = &remaining[sec_start + SECTION_BEGIN.len()..];
+        let sec_end = after_sec.find(SECTION_END).unwrap_or(after_sec.len());
+        let section = &after_sec[..sec_end];
+        remaining = if sec_end < after_sec.len() {
+            &after_sec[sec_end + SECTION_END.len()..]
+        } else {
+            ""
+        };
+
+        // Parse individual tool calls within the section
+        let mut section_remaining = section;
+        while let Some(call_start) = section_remaining.find(CALL_BEGIN) {
+            let after_call = &section_remaining[call_start + CALL_BEGIN.len()..];
+            let call_end = match after_call.find(CALL_END) {
+                Some(pos) => pos,
+                None => break,
+            };
+            let call_body = &after_call[..call_end];
+            section_remaining = &after_call[call_end + CALL_END.len()..];
+            stats.section_calls_seen += 1;
+
+            // Split on <|tool_call_argument_begin|> to get name and arguments
+            let (raw_name, arguments) = if let Some(arg_pos) = call_body.find(ARG_BEGIN) {
+                let name_part = call_body[..arg_pos].trim();
+                let arg_part = call_body[arg_pos + ARG_BEGIN.len()..].trim();
+                let args: serde_json::Value =
+                    serde_json::from_str(arg_part).unwrap_or(serde_json::json!({}));
+                (name_part, args)
+            } else {
+                (call_body.trim(), serde_json::json!({}))
+            };
+
+            // Normalize: "functions.http:0" → "http"
+            let name = normalize_section_tool_name(raw_name);
+
+            let mut matched_name = if tool_names.contains(name.as_str()) {
+                Some(name.clone())
+            } else {
+                // Fuzzy match: model may invent a more specific name like
+                // "time_get_current_time" for tool "time", or prepend
+                // a server namespace like "home_assistant_time".
+                fuzzy_match_tool_name(&name, &tool_names)
+                    .or_else(|| canonical_match_tool_name(&name, &tool_names))
+            };
+
+            if matched_name.is_none() && is_placeholder_tool_name(&name) {
+                stats.placeholder_names_seen += 1;
+                matched_name = infer_placeholder_tool_name(&name, &arguments, available_tools);
+                if let Some(ref repaired) = matched_name {
+                    stats.placeholder_names_repaired += 1;
+                    tracing::warn!(
+                        placeholder_tool = %name,
+                        repaired_tool = %repaired,
+                        argument_keys = %argument_keys_for_log(&arguments),
+                        "Recovered placeholder tool name emitted by model"
+                    );
+                } else {
+                    tracing::warn!(
+                        placeholder_tool = %name,
+                        argument_keys = %argument_keys_for_log(&arguments),
+                        "Model emitted placeholder tool name that could not be mapped to an available tool"
+                    );
+                }
+            }
+
+            if let Some(matched) = matched_name {
+                calls.push(ToolCall {
+                    id: format!("recovered_{}", calls.len()),
+                    name: matched,
+                    arguments,
+                });
+            } else {
+                stats.unknown_calls_dropped += 1;
+            }
+        }
+    }
+
+    (calls, stats)
 }
 
 /// Returns true if there's at least one tool-result message after the most
@@ -1768,6 +1910,221 @@ fn strip_trailing_tool_intent_clause(text: &str) -> Option<String> {
     }
 }
 
+fn is_placeholder_tool_name(name: &str) -> bool {
+    has_numeric_suffix(name, "recovered_") || has_numeric_suffix(name, "generated_tool_call_")
+}
+
+fn has_numeric_suffix(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn infer_placeholder_tool_name(
+    placeholder_name: &str,
+    arguments: &serde_json::Value,
+    available_tools: &[ToolDefinition],
+) -> Option<String> {
+    let args_obj = arguments.as_object()?;
+    if args_obj.is_empty() {
+        tracing::warn!(
+            placeholder_tool = %placeholder_name,
+            "Placeholder tool name had empty arguments; refusing to infer tool mapping"
+        );
+        return None;
+    }
+
+    let arg_keys: std::collections::HashSet<&str> =
+        args_obj.keys().map(std::string::String::as_str).collect();
+    let mut candidates: Vec<(String, usize, usize, usize)> = Vec::new();
+
+    for tool in available_tools {
+        let Some(props) = tool
+            .parameters
+            .get("properties")
+            .and_then(|v| v.as_object())
+        else {
+            continue;
+        };
+        if props.is_empty() {
+            continue;
+        }
+
+        let prop_keys: std::collections::HashSet<&str> =
+            props.keys().map(std::string::String::as_str).collect();
+        if !arg_keys.iter().all(|k| prop_keys.contains(k)) {
+            continue;
+        }
+
+        let required: std::collections::HashSet<&str> = tool
+            .parameters
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        if !required.iter().all(|k| arg_keys.contains(k)) {
+            continue;
+        }
+
+        candidates.push((
+            tool.name.clone(),
+            required.len(),
+            arg_keys.len(),
+            prop_keys.len(),
+        ));
+    }
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    candidates.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.3.cmp(&b.3))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let best = &candidates[0];
+    if candidates.len() > 1 {
+        let second = &candidates[1];
+        if best.1 == second.1 && best.2 == second.2 && best.3 == second.3 {
+            tracing::warn!(
+                placeholder_tool = %placeholder_name,
+                first_candidate = %best.0,
+                second_candidate = %second.0,
+                argument_keys = %argument_keys_for_log(arguments),
+                "Placeholder tool name mapping was ambiguous; refusing to guess"
+            );
+            return None;
+        }
+    }
+
+    Some(best.0.clone())
+}
+
+fn argument_keys_for_log(arguments: &serde_json::Value) -> String {
+    if let Some(obj) = arguments.as_object() {
+        let mut keys: Vec<&str> = obj.keys().map(std::string::String::as_str).collect();
+        keys.sort();
+        if keys.is_empty() {
+            "(none)".to_string()
+        } else {
+            keys.join(",")
+        }
+    } else {
+        "(non-object)".to_string()
+    }
+}
+
+/// Normalize a tool name from section-delimited format.
+///
+/// Models like Kimi K2.5 emit names like `functions.http:0` where `functions.`
+/// is a namespace prefix and `:0` is a call index. Strip both to get `http`.
+fn normalize_section_tool_name(raw: &str) -> String {
+    let mut name = raw;
+
+    // Strip "functions." prefix
+    if let Some(stripped) = name.strip_prefix("functions.") {
+        name = stripped;
+    }
+
+    // Strip ":N" suffix (call index)
+    if let Some(colon) = name.rfind(':')
+        && name[colon + 1..].bytes().all(|b| b.is_ascii_digit())
+        && colon + 1 < name.len()
+    {
+        name = &name[..colon];
+    }
+
+    name.to_string()
+}
+
+/// Fuzzy-match a model-generated tool name against known tool names.
+///
+/// Models sometimes invent more specific names like `time_get_current_time` for
+/// a tool registered as `time`. Try matching by prefix: if `time` is a prefix
+/// of `time_get_current_time` (followed by `_`), it's a match.
+///
+/// Picks the longest matching tool name to avoid ambiguity (e.g., `memory_search`
+/// should match `memory_search`, not `memory`).
+fn fuzzy_match_tool_name(
+    model_name: &str,
+    tool_names: &std::collections::HashSet<&str>,
+) -> Option<String> {
+    let mut best: Option<&str> = None;
+    for &tool in tool_names {
+        // Check if the model name starts with the tool name followed by '_'
+        if model_name.starts_with(tool)
+            && (model_name.len() == tool.len()
+                || model_name.as_bytes().get(tool.len()) == Some(&b'_'))
+            && best.is_none_or(|b| tool.len() > b.len())
+        {
+            best = Some(tool);
+        }
+
+        // Also handle server-prefixed model names, e.g.
+        // "home_assistant_ha_search_entities" for tool "ha_search_entities".
+        if model_name.len() > tool.len()
+            && model_name.ends_with(tool)
+            && model_name
+                .as_bytes()
+                .get(model_name.len().saturating_sub(tool.len() + 1))
+                == Some(&b'_')
+            && best.is_none_or(|b| tool.len() > b.len())
+        {
+            best = Some(tool);
+        }
+    }
+    if let Some(matched) = best {
+        tracing::info!(
+            model_name = model_name,
+            matched_tool = matched,
+            "Fuzzy-matched model tool name to registered tool",
+        );
+    }
+    best.map(|s| s.to_string())
+}
+
+fn canonicalize_tool_token(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut prev_was_sep = false;
+
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_was_sep = false;
+        } else if !prev_was_sep {
+            out.push('_');
+            prev_was_sep = true;
+        }
+    }
+
+    out.trim_matches('_').to_string()
+}
+
+fn canonical_match_tool_name(
+    model_name: &str,
+    tool_names: &std::collections::HashSet<&str>,
+) -> Option<String> {
+    let canonical_model = canonicalize_tool_token(model_name);
+    if canonical_model.is_empty() {
+        return None;
+    }
+
+    for &tool in tool_names {
+        if canonicalize_tool_token(tool) == canonical_model {
+            tracing::info!(
+                model_name = model_name,
+                matched_tool = tool,
+                "Canonical-matched model tool name to registered tool",
+            );
+            return Some(tool.to_string());
+        }
+    }
+
+    None
+}
+
 /// `<tool_call>tool_list</tool_call>` or `<|tool_call|>` in the content field
 /// instead of using the standard OpenAI tool_calls array. We strip all of
 /// these before the response reaches channels/users.
@@ -1807,6 +2164,10 @@ fn clean_response(text: &str) -> String {
         result = strip_xml_tag(&result, tag);
         result = strip_pipe_tag(&result, tag);
     }
+
+    // 6b. Strip section-delimited tool call blocks
+    // (e.g. <|tool_calls_section_begin|>...<|tool_calls_section_end|>)
+    result = strip_section_tool_calls(&result);
 
     // 7. Collapse triple+ newlines, trim
     let collapsed = collapse_newlines(&result);
@@ -2055,6 +2416,35 @@ fn strip_pipe_tag(text: &str, tag: &str) -> String {
     result
 }
 
+/// Strip `<|tool_calls_section_begin|>...<|tool_calls_section_end|>` blocks.
+///
+/// These are emitted by Kimi K2.5 and similar models when tool calls appear as
+/// text in the content field. Strips the entire section including all inner
+/// `<|tool_call_begin|>...<|tool_call_end|>` blocks.
+fn strip_section_tool_calls(text: &str) -> String {
+    const SECTION_BEGIN: &str = "<|tool_calls_section_begin|>";
+    const SECTION_END: &str = "<|tool_calls_section_end|>";
+
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+
+    while let Some(start) = remaining.find(SECTION_BEGIN) {
+        result.push_str(&remaining[..start]);
+
+        let after = &remaining[start + SECTION_BEGIN.len()..];
+        if let Some(end_offset) = after.find(SECTION_END) {
+            remaining = &after[end_offset + SECTION_END.len()..];
+        } else {
+            // No closing tag — discard rest (malformed)
+            remaining = "";
+            break;
+        }
+    }
+
+    result.push_str(remaining);
+    result
+}
+
 /// Collapse triple+ newlines to double, then trim.
 fn collapse_newlines(text: &str) -> String {
     let mut result = text.to_string();
@@ -2088,6 +2478,35 @@ fn collapse_exact_duplicate_response(text: &str) -> String {
 
         if left == right || normalized_whitespace_eq(left, right) {
             return left.to_string();
+        }
+    }
+
+    // Pass 2: near-duplicate detection via repeated prefix — O(n).
+    // GLM5 pattern: the answer appears twice with minor differences (extra
+    // trailing sentence or small preamble). We find positions where
+    // words[0] recurs, then verify the match length from that anchor.
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    if words.len() >= 14 {
+        let first_word = words[0];
+        let limit = words.len() * 2 / 3;
+        for start in 1..limit {
+            if !words[start].eq_ignore_ascii_case(first_word) {
+                continue;
+            }
+            // Anchor found — count matching prefix length
+            let prefix_len = words[start..]
+                .iter()
+                .zip(words.iter())
+                .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
+                .count();
+            let shorter_side = start.min(words.len() - start);
+            if prefix_len >= 7 && prefix_len * 10 >= shorter_side * 6 {
+                if start <= words.len() - start {
+                    return words[..start].join(" ");
+                } else {
+                    return words[start..].join(" ");
+                }
+            }
         }
     }
 
@@ -2410,7 +2829,7 @@ mod tests {
                     finish_reason: FinishReason::Stop,
                 },
                 ToolCompletionResponse {
-                    content: Some("<tool_call>{\"name\":\"github_list_pull_requests\",\"arguments\":{\"repository\":\"WynnD/ironclaw\"}}</tool_call>".to_string()),
+                    content: Some("<|tool_calls_section_begin|><|tool_call_begin|>functions.github_list_pull_requests:0<|tool_call_argument_begin|>{\"repository\":\"WynnD/ironclaw\"}<|tool_call_end|><|tool_calls_section_end|>".to_string()),
                     tool_calls: Vec::new(),
                     input_tokens: 3,
                     output_tokens: 4,
@@ -3111,6 +3530,224 @@ That's my plan."#;
         assert_eq!(calls[0].name, "tool_list");
     }
 
+    // ---- section-delimited tool call recovery tests ----
+
+    #[test]
+    fn test_recover_section_delimited_single() {
+        let tools = make_tools(&["http"]);
+        let content = r#"I'll fetch that for you. <|tool_calls_section_begin|><|tool_call_begin|>functions.http:0<|tool_call_argument_begin|>{"method": "GET", "url": "https://example.com/rss.xml"}<|tool_call_end|><|tool_calls_section_end|>"#;
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "http");
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"method": "GET", "url": "https://example.com/rss.xml"})
+        );
+    }
+
+    #[test]
+    fn test_recover_section_delimited_multiple() {
+        let tools = make_tools(&["http", "shell"]);
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>functions.http:0<|tool_call_argument_begin|>{\"url\": \"https://example.com\"}<|tool_call_end|><|tool_call_begin|>functions.shell:1<|tool_call_argument_begin|>{\"command\": \"ls\"}<|tool_call_end|><|tool_calls_section_end|>";
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "http");
+        assert_eq!(calls[1].name, "shell");
+        assert_eq!(calls[1].arguments, serde_json::json!({"command": "ls"}));
+    }
+
+    #[test]
+    fn test_recover_section_delimited_no_functions_prefix() {
+        let tools = make_tools(&["time"]);
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>time:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>";
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "time");
+    }
+
+    #[test]
+    fn test_recover_section_delimited_bare_name() {
+        let tools = make_tools(&["time"]);
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>time<|tool_call_end|><|tool_calls_section_end|>";
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "time");
+    }
+
+    #[test]
+    fn test_recover_section_delimited_unknown_tool_ignored() {
+        let tools = make_tools(&["http"]);
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>functions.nonexistent:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>";
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_recover_section_delimited_placeholder_tool_name_repaired() {
+        let tools = vec![
+            ToolDefinition {
+                name: "memory_read".to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"}
+                    },
+                    "required": ["path"]
+                }),
+            },
+            ToolDefinition {
+                name: "time".to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "operation": {"type": "string"}
+                    },
+                    "required": ["operation"]
+                }),
+            },
+        ];
+
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>recovered_1<|tool_call_argument_begin|>{\"path\":\"HEARTBEAT.md\"}<|tool_call_end|><|tool_calls_section_end|>";
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "memory_read");
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"path":"HEARTBEAT.md"})
+        );
+    }
+
+    #[test]
+    fn test_recover_section_delimited_placeholder_tool_name_ambiguous_ignored() {
+        let tools = vec![
+            ToolDefinition {
+                name: "memory_read".to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"}
+                    },
+                    "required": ["path"]
+                }),
+            },
+            ToolDefinition {
+                name: "read_file".to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"}
+                    },
+                    "required": ["path"]
+                }),
+            },
+        ];
+
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>recovered_2<|tool_call_argument_begin|>{\"path\":\"HEARTBEAT.md\"}<|tool_call_end|><|tool_calls_section_end|>";
+        let (calls, stats) = recover_tool_calls_from_content_with_stats(content, &tools);
+        assert!(calls.is_empty());
+        assert_eq!(stats.section_blocks, 1);
+        assert_eq!(stats.section_calls_seen, 1);
+        assert_eq!(stats.placeholder_names_seen, 1);
+        assert_eq!(stats.placeholder_names_repaired, 0);
+        assert_eq!(stats.unknown_calls_dropped, 1);
+    }
+
+    #[test]
+    fn test_normalize_section_tool_name() {
+        assert_eq!(normalize_section_tool_name("functions.http:0"), "http");
+        assert_eq!(normalize_section_tool_name("functions.shell:12"), "shell");
+        assert_eq!(normalize_section_tool_name("http:0"), "http");
+        assert_eq!(
+            normalize_section_tool_name("functions.memory_search:0"),
+            "memory_search"
+        );
+        assert_eq!(normalize_section_tool_name("time"), "time");
+        assert_eq!(normalize_section_tool_name("functions.time"), "time");
+    }
+
+    #[test]
+    fn test_fuzzy_match_tool_name() {
+        let tools: std::collections::HashSet<&str> =
+            ["time", "memory_search", "http", "shell"].into();
+
+        // Exact match returns None (handled by exact check before fuzzy)
+        // But fuzzy also works for exact since exact prefix + length match
+        assert_eq!(
+            fuzzy_match_tool_name("time", &tools),
+            Some("time".to_string())
+        );
+
+        // Model invents longer name
+        assert_eq!(
+            fuzzy_match_tool_name("time_get_current_time", &tools),
+            Some("time".to_string())
+        );
+
+        // Longer prefix wins: "memory_search" beats "memory" (if both existed)
+        assert_eq!(
+            fuzzy_match_tool_name("memory_search_documents", &tools),
+            Some("memory_search".to_string())
+        );
+
+        // No match
+        assert_eq!(fuzzy_match_tool_name("unknown_tool", &tools), None);
+
+        // Partial overlap but not at `_` boundary shouldn't match
+        // "timer" doesn't start with "time_"
+        assert_eq!(fuzzy_match_tool_name("timer", &tools), None);
+    }
+
+    #[test]
+    fn test_fuzzy_match_tool_name_suffix_server_prefix() {
+        let tools: std::collections::HashSet<&str> = ["ha_search_entities", "time"].into();
+        assert_eq!(
+            fuzzy_match_tool_name("home_assistant_ha_search_entities", &tools),
+            Some("ha_search_entities".to_string())
+        );
+    }
+
+    #[test]
+    fn test_canonical_match_tool_name_separator_variants() {
+        let tools: std::collections::HashSet<&str> = ["home-assistant_ha_search_entities"].into();
+        assert_eq!(
+            canonical_match_tool_name("home_assistant_ha_search_entities", &tools),
+            Some("home-assistant_ha_search_entities".to_string())
+        );
+    }
+
+    #[test]
+    fn test_recover_section_delimited_canonical_name_match() {
+        let tools = make_tools(&["home-assistant_ha_search_entities"]);
+        let content = "<|tool_calls_section_begin|><|tool_call_begin|>functions.home_assistant_ha_search_entities:2<|tool_call_argument_begin|>{\"query\":\"moisture\",\"domain_filter\":\"sensor\"}<|tool_call_end|><|tool_calls_section_end|>";
+        let calls = recover_tool_calls_from_content(content, &tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "home-assistant_ha_search_entities");
+    }
+
+    // ---- clean_response section stripping tests ----
+
+    #[test]
+    fn test_clean_response_strips_section_tool_calls() {
+        let input = "Here is my response. <|tool_calls_section_begin|><|tool_call_begin|>functions.http:0<|tool_call_argument_begin|>{\"url\": \"https://example.com\"}<|tool_call_end|><|tool_calls_section_end|>";
+        let cleaned = clean_response(input);
+        assert!(!cleaned.contains("tool_calls_section"));
+        assert!(!cleaned.contains("tool_call_begin"));
+        assert!(cleaned.contains("Here is my response."));
+    }
+
+    #[test]
+    fn test_clean_response_strips_section_preserves_text() {
+        let input = "Before section <|tool_calls_section_begin|><|tool_call_begin|>functions.http:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|> After section";
+        let cleaned = clean_response(input);
+        assert!(cleaned.contains("Before section"));
+        assert!(cleaned.contains("After section"));
+        assert!(!cleaned.contains("tool_calls_section"));
+    }
+
     #[test]
     fn test_clean_response_dedupes_duplicate_final_blocks() {
         let input = "<final>I need to discover the Codex tool first. Let me do that.</final>\
@@ -3140,6 +3777,32 @@ That's my plan."#;
             cleaned,
             "Thanks for the link. Let me read the docs to understand how the Codex \
              MCP is supposed to work, then retry properly."
+        );
+    }
+
+    #[test]
+    fn test_clean_response_dedupes_near_duplicate_via_substring() {
+        // GLM5 pattern: answer appears twice, second copy has a trailing sentence
+        let input = "The fix is to update the config file and restart the service. \
+                     The fix is to update the config file and restart the service. \
+                     Let me know if you need more help.";
+        let cleaned = clean_response(input);
+        assert_eq!(
+            cleaned,
+            "The fix is to update the config file and restart the service."
+        );
+    }
+
+    #[test]
+    fn test_collapse_near_duplicate_with_preamble_difference() {
+        // Near-duplicate where the second copy has a short preamble ("So,").
+        // The algorithm detects the repeat and keeps the shorter copy.
+        let input = "Here is my analysis of the situation and the recommended fix. \
+                     So, here is my analysis of the situation and the recommended fix.";
+        let cleaned = collapse_exact_duplicate_response(input);
+        assert_eq!(
+            cleaned,
+            "here is my analysis of the situation and the recommended fix."
         );
     }
 

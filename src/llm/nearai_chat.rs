@@ -174,7 +174,7 @@ impl NearAiChatProvider {
     async fn send_request_inner<T: Serialize, R: for<'de> Deserialize<'de>>(
         &self,
         body: &T,
-        _model: Option<&str>,
+        model: Option<&str>,
     ) -> Result<R, LlmError> {
         let url = self.api_url("chat/completions");
         let token = self.resolve_bearer_token().await?;
@@ -187,11 +187,19 @@ impl NearAiChatProvider {
             tracing::debug!("NEAR AI Chat request body: {}", json);
         }
 
-        let request_builder = self
+        let mut request_builder = self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", token))
             .header("Content-Type", "application/json");
+
+        if let Some(model_name) = model
+            && crate::llm::is_glm_4_7_or_newer_model_id(model_name)
+        {
+            request_builder = request_builder
+                .header("tool-call-parser", "glm47")
+                .header("reasoning-parser", "glm45");
+        }
 
         let response =
             request_builder
@@ -424,6 +432,7 @@ impl NearAiChatProvider {
 impl LlmProvider for NearAiChatProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let model = req.model.unwrap_or_else(|| self.active_model_name());
+        let chat_template_kwargs = chat_template_kwargs_for_model(&model);
         let mut raw_messages = req.messages;
         crate::llm::provider::sanitize_tool_messages(&mut raw_messages);
         let messages: Vec<ChatCompletionMessage> =
@@ -436,6 +445,7 @@ impl LlmProvider for NearAiChatProvider {
             max_tokens: req.max_tokens,
             tools: None,
             tool_choice: None,
+            chat_template_kwargs,
         };
 
         let response: ChatCompletionResponse =
@@ -451,7 +461,13 @@ impl LlmProvider for NearAiChatProvider {
                     reason: "No choices in response".to_string(),
                 })?;
 
-        let content = choice.message.content.unwrap_or_default();
+        // Fall back to reasoning_content when content is null (same as
+        // complete_with_tools — reasoning models may put the answer there).
+        let content = choice
+            .message
+            .content
+            .or(choice.message.reasoning_content)
+            .unwrap_or_default();
         let finish_reason = match choice.finish_reason.as_deref() {
             Some("stop") => FinishReason::Stop,
             Some("length") => FinishReason::Length,
@@ -475,6 +491,7 @@ impl LlmProvider for NearAiChatProvider {
         req: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
         let model = req.model.unwrap_or_else(|| self.active_model_name());
+        let chat_template_kwargs = chat_template_kwargs_for_model(&model);
         let mut raw_messages = req.messages;
         crate::llm::provider::sanitize_tool_messages(&mut raw_messages);
         let messages: Vec<ChatCompletionMessage> =
@@ -508,6 +525,7 @@ impl LlmProvider for NearAiChatProvider {
             max_tokens: req.max_tokens,
             tools: if tools.is_empty() { None } else { Some(tools) },
             tool_choice: req.tool_choice,
+            chat_template_kwargs,
         };
 
         let response: ChatCompletionResponse =
@@ -523,7 +541,21 @@ impl LlmProvider for NearAiChatProvider {
                     reason: "No choices in response".to_string(),
                 })?;
 
-        let content = choice.message.content;
+        // Fall back to reasoning_content when content is null (e.g. GLM-5
+        // returns its answer in reasoning_content instead of content).
+        // Pre-strip <think> tags so chain-of-thought doesn't leak through
+        // as user-visible text (which clean_response would strip, leaving empty).
+        let content = choice.message.content.or_else(|| {
+            choice.message.reasoning_content.and_then(|rc| {
+                let stripped = crate::llm::reasoning::strip_think_tags(&rc);
+                let trimmed = stripped.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            })
+        });
         let tool_calls: Vec<ToolCall> = choice
             .message
             .tool_calls
@@ -623,6 +655,23 @@ struct ChatCompletionRequest {
     tools: Option<Vec<ChatCompletionTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatTemplateKwargs {
+    clear_thinking: bool,
+}
+
+fn chat_template_kwargs_for_model(model: &str) -> Option<ChatTemplateKwargs> {
+    if crate::llm::is_glm_4_7_or_newer_model_id(model) {
+        Some(ChatTemplateKwargs {
+            clear_thinking: false,
+        })
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -911,6 +960,10 @@ struct ChatCompletionResponseMessage {
     #[allow(dead_code)]
     role: String,
     content: Option<String>,
+    /// Some models (e.g. GLM-5) return chain-of-thought reasoning here
+    /// instead of in `content`.
+    #[serde(default, alias = "reasoning")]
+    reasoning_content: Option<String>,
     tool_calls: Option<Vec<ChatCompletionToolCall>>,
 }
 
@@ -1279,5 +1332,33 @@ mod tests {
         let (default_in, default_out) = costs::default_cost();
         assert_eq!(input, default_in);
         assert_eq!(output, default_out);
+    }
+
+    #[test]
+    fn test_response_message_reasoning_alias_deserializes() {
+        let msg: ChatCompletionResponseMessage = serde_json::from_str(
+            r#"{
+                "role":"assistant",
+                "content":null,
+                "reasoning":"hidden chain of thought",
+                "tool_calls":[]
+            }"#,
+        )
+        .expect("response message should deserialize");
+
+        assert_eq!(
+            msg.reasoning_content.as_deref(),
+            Some("hidden chain of thought")
+        );
+    }
+
+    #[test]
+    fn test_chat_template_kwargs_for_glm_models() {
+        let glm = chat_template_kwargs_for_model("zai-org/GLM-5");
+        assert!(glm.is_some());
+        assert!(!glm.expect("glm kwargs").clear_thinking);
+
+        let non_glm = chat_template_kwargs_for_model("moonshotai/Kimi-K2.5");
+        assert!(non_glm.is_none());
     }
 }
