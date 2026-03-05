@@ -19,8 +19,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  tests:
-    name: Tests (${{ matrix.name }})
+  # Fast-fail on formatting before expensive compilation
+  format:
+    name: Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # Combined clippy + tests per feature config — clippy compiles all targets,
+  # so `cargo test` afterwards only links and runs (near-free).
+  check:
+    name: Check (${{ matrix.name }})
+    needs: format
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -33,25 +47,27 @@ jobs:
           - name: libsql-only
             flags: "--no-default-features --features libsql"
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.name }}
-      - name: Run Tests
+          key: check-${{ matrix.name }}
+      - name: Clippy
+        run: cargo clippy --all --benches --tests --examples ${{ matrix.flags }} -- -D warnings
+      - name: Tests
         run: cargo test ${{ matrix.flags }} -- --nocapture
 
   telegram-tests:
     name: Telegram Channel Tests
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: telegram
       - name: Run Telegram Channel Tests
         run: cargo test --manifest-path channels-src/telegram/Cargo.toml -- --nocapture
 
@@ -61,8 +77,7 @@ jobs:
     name: Docker Build
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'arc-runner-set-ironclaw' }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Check if this run is latest main commit
@@ -89,6 +104,9 @@ jobs:
           context: .
           file: Dockerfile
           push: false
+          secrets: |
+            actions_cache_url=${{ env.ACTIONS_CACHE_URL }}
+            actions_runtime_token=${{ env.ACTIONS_RUNTIME_TOKEN }}
           cache-from: type=gha,scope=docker-build
           cache-to: type=gha,mode=max,scope=docker-build
 
@@ -96,14 +114,13 @@ jobs:
   # Only runs on main after tests AND docker-build both succeed.
   push-image:
     name: Push Image
-    needs: [tests, telegram-tests, docker-build]
+    needs: [check, telegram-tests, docker-build]
     if: >
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: arc-runner-set-ironclaw
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Check if this run is latest main commit
@@ -136,6 +153,9 @@ jobs:
           tags: |
             registry.wynndrahorad.com/ironclaw:latest
             registry.wynndrahorad.com/ironclaw:${{ steps.meta.outputs.tag }}
+          secrets: |
+            actions_cache_url=${{ env.ACTIONS_CACHE_URL }}
+            actions_runtime_token=${{ env.ACTIONS_RUNTIME_TOKEN }}
           cache-from: type=gha,scope=docker-build
 
   # Roll-up job for branch protection
@@ -143,10 +163,11 @@ jobs:
     name: Run Tests
     runs-on: ubuntu-latest
     if: always()
-    needs: [tests, telegram-tests, docker-build, push-image]
+    needs: [format, check, telegram-tests, docker-build, push-image]
     steps:
       - run: |
-          if [[ "${{ needs.tests.result }}" != "success" || \
+          if [[ "${{ needs.format.result }}" != "success" || \
+                "${{ needs.check.result }}" != "success" || \
                 "${{ needs.telegram-tests.result }}" != "success" || \
                 "${{ needs.docker-build.result }}" != "success" ]]; then
             echo "Required jobs failed"
