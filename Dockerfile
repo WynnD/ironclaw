@@ -5,10 +5,10 @@
 # Build (local):
 #   docker build --platform linux/amd64 -t ironclaw:latest .
 #
-# Build (CI with sccache — automatically uses GHA cache):
+# Build (CI with registry cache):
 #   docker build --platform linux/amd64 \
-#     --secret id=actions_cache_url,env=ACTIONS_CACHE_URL \
-#     --secret id=actions_runtime_token,env=ACTIONS_RUNTIME_TOKEN \
+#     --cache-from type=registry,ref=registry.wynndrahorad.com/ironclaw:buildcache \
+#     --cache-to type=registry,ref=registry.wynndrahorad.com/ironclaw:buildcache,mode=max \
 #     -t ironclaw:latest .
 #
 # Run:
@@ -20,17 +20,13 @@ FROM rust:1.92-slim-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev cmake gcc g++ curl \
     && rm -rf /var/lib/apt/lists/* \
-    && rustup target add wasm32-wasip2 \
-    && cargo install wasm-tools
+    && rustup target add wasm32-wasip2
 
-# Install sccache (prebuilt binary — ~3s vs ~2min from source).
-# In CI, sccache uses GitHub Actions cache as backend so individual
-# compilation units survive across builds. For local builds without
-# GHA secrets, sccache is installed but not activated.
-ARG SCCACHE_VERSION=0.9.1
-RUN curl -sSfL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
-    | tar xz --strip-components=1 -C /usr/local/bin "sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" \
-    && chmod +x /usr/local/bin/sccache
+# Install wasm-tools from prebuilt binary (~3s vs ~2min from source).
+ARG WASM_TOOLS_VERSION=1.245.1
+RUN curl -sSfL "https://github.com/bytecodealliance/wasm-tools/releases/download/v${WASM_TOOLS_VERSION}/wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux.tar.gz" \
+    | tar xz --strip-components=1 -C /usr/local/bin "wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux/wasm-tools" \
+    && chmod +x /usr/local/bin/wasm-tools
 
 WORKDIR /app
 
@@ -45,18 +41,9 @@ RUN mkdir -p src && echo "fn main() {}" > src/main.rs \
     && mkdir -p migrations registry wit \
     && echo "fn main() {}" > build.rs
 
-RUN --mount=type=secret,id=actions_cache_url \
-    --mount=type=secret,id=actions_runtime_token \
-    --mount=type=cache,id=ironclaw-cargo-registry,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,id=ironclaw-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=ironclaw-cargo-git,target=/usr/local/cargo/git \
-    if [ -f /run/secrets/actions_cache_url ]; then \
-      export ACTIONS_CACHE_URL="$(cat /run/secrets/actions_cache_url)" ; \
-      export ACTIONS_RUNTIME_TOKEN="$(cat /run/secrets/actions_runtime_token)" ; \
-      export SCCACHE_GHA_ENABLED=true ; \
-      export RUSTC_WRAPPER=sccache ; \
-    fi && \
-    cargo build --release --bin ironclaw 2>&1 || true && \
-    if [ "${RUSTC_WRAPPER:-}" = "sccache" ]; then sccache --show-stats; fi
+    cargo build --release --bin ironclaw 2>&1 || true
 
 # Copy real source (only this layer changes on source edits)
 COPY build.rs build.rs
@@ -66,19 +53,10 @@ COPY migrations/ migrations/
 COPY registry/ registry/
 COPY wit/ wit/
 
-RUN --mount=type=secret,id=actions_cache_url \
-    --mount=type=secret,id=actions_runtime_token \
-    --mount=type=cache,id=ironclaw-cargo-registry,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,id=ironclaw-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=ironclaw-cargo-git,target=/usr/local/cargo/git \
-    if [ -f /run/secrets/actions_cache_url ]; then \
-      export ACTIONS_CACHE_URL="$(cat /run/secrets/actions_cache_url)" ; \
-      export ACTIONS_RUNTIME_TOKEN="$(cat /run/secrets/actions_runtime_token)" ; \
-      export SCCACHE_GHA_ENABLED=true ; \
-      export RUSTC_WRAPPER=sccache ; \
-    fi && \
-    cargo build --release --bin ironclaw && \
-    if [ "${RUSTC_WRAPPER:-}" = "sccache" ]; then sccache --show-stats; fi && \
-    install -D /app/target/release/ironclaw /app-out/ironclaw
+    cargo build --release --bin ironclaw \
+    && install -D /app/target/release/ironclaw /app-out/ironclaw
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim

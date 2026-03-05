@@ -2559,6 +2559,7 @@ mod tests {
                 skills_config: SkillsConfig::default(),
                 hooks: Arc::new(HookRegistry::new()),
                 cost_guard: Arc::new(CostGuard::new(CostGuardConfig::default())),
+                sse_tx: None,
             };
 
             Agent::new(

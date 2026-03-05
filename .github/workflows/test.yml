@@ -71,50 +71,30 @@ jobs:
       - name: Run Telegram Channel Tests
         run: cargo test --manifest-path channels-src/telegram/Cargo.toml -- --nocapture
 
-  # Runs in parallel with tests — validates Dockerfile on PRs,
-  # warms buildx GHA cache on main for the push-image job.
+  # PR builds: validate Dockerfile on ubuntu-latest with GHA cache.
+  # Main builds: build + push in one shot on self-hosted with registry cache.
   docker-build:
     name: Docker Build
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || 'arc-runner-set-ironclaw' }}
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Check if this run is latest main commit
-        id: main_head
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: |
-          set -euo pipefail
-          latest_main_sha="$(git ls-remote --heads origin main | awk '{print $1}')"
-          if [[ -z "$latest_main_sha" ]]; then
-            echo "Could not resolve origin/main head"
-            exit 1
-          fi
-          if [[ "$GITHUB_SHA" == "$latest_main_sha" ]]; then
-            echo "is_latest=true" >> "$GITHUB_OUTPUT"
-            echo "This run is at latest main commit: $GITHUB_SHA"
-          else
-            echo "is_latest=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping docker-build for stale commit $GITHUB_SHA (latest main: $latest_main_sha)"
-          fi
       - name: Build image
-        if: github.event_name != 'push' || github.ref != 'refs/heads/main' || steps.main_head.outputs.is_latest == 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
           push: false
-          secrets: |
-            actions_cache_url=${{ env.ACTIONS_CACHE_URL }}
-            actions_runtime_token=${{ env.ACTIONS_RUNTIME_TOKEN }}
           cache-from: type=gha,scope=docker-build
           cache-to: type=gha,mode=max,scope=docker-build
 
-  # Rebuilds from GHA cache (near-instant) and pushes.
-  # Only runs on main after tests AND docker-build both succeed.
+  # Self-hosted: build + push in one job using local registry cache.
+  # Registry cache is fast (local network) and persists across ephemeral runners.
   push-image:
     name: Push Image
-    needs: [check, telegram-tests, docker-build]
+    needs: [check, telegram-tests]
     if: >
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
@@ -153,10 +133,8 @@ jobs:
           tags: |
             registry.wynndrahorad.com/ironclaw:latest
             registry.wynndrahorad.com/ironclaw:${{ steps.meta.outputs.tag }}
-          secrets: |
-            actions_cache_url=${{ env.ACTIONS_CACHE_URL }}
-            actions_runtime_token=${{ env.ACTIONS_RUNTIME_TOKEN }}
-          cache-from: type=gha,scope=docker-build
+          cache-from: type=registry,ref=registry.wynndrahorad.com/ironclaw:buildcache
+          cache-to: type=registry,ref=registry.wynndrahorad.com/ironclaw:buildcache,mode=max
 
   # Roll-up job for branch protection
   run-tests:
@@ -168,9 +146,13 @@ jobs:
       - run: |
           if [[ "${{ needs.format.result }}" != "success" || \
                 "${{ needs.check.result }}" != "success" || \
-                "${{ needs.telegram-tests.result }}" != "success" || \
-                "${{ needs.docker-build.result }}" != "success" ]]; then
+                "${{ needs.telegram-tests.result }}" != "success" ]]; then
             echo "Required jobs failed"
+            exit 1
+          fi
+          # docker-build only runs on PRs; push-image only on main
+          if [[ "${{ needs.docker-build.result }}" == "failure" ]]; then
+            echo "Docker build failed"
             exit 1
           fi
           if [[ "${{ needs.push-image.result }}" == "failure" ]]; then
