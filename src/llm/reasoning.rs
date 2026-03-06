@@ -662,13 +662,15 @@ Respond in JSON format:
                 });
             }
 
-            // Guardrail: some providers/models occasionally narrate fabricated
-            // tool usage in plain text instead of returning executable tool calls.
-            // If there is no fresh tool-result evidence in context, force one
-            // retry with explicit anti-fabrication instructions.
+            // Guardrail: some models fabricate past-tense tool results in plain
+            // text ("I called X and here's what it returned") without actual
+            // tool_calls.  If there is no fresh tool-result evidence in context,
+            // force one retry with explicit anti-fabrication instructions.
+            // Use cleaned content (thinking tags stripped) so internal reasoning
+            // doesn't false-trigger the guardrail.
+            let guardrail_content = clean_response(&content);
             if !has_tool_result_since_last_user(&context.messages)
-                && (claims_unverified_tool_execution(&content, &context.available_tools)
-                    || claims_tool_execution_intent_without_call(&content))
+                && claims_unverified_tool_execution(&guardrail_content, &context.available_tools)
             {
                 tracing::warn!(
                     content_preview = %crate::llm::rig_adapter::truncate_for_log(&content, 300),
@@ -900,9 +902,7 @@ Respond in JSON format:
             return Ok((None, retry_usage));
         }
 
-        if claims_unverified_tool_execution(&retry_content, available_tools)
-            || claims_tool_execution_intent_without_call(&retry_content)
-        {
+        if claims_unverified_tool_execution(&cleaned, available_tools) {
             return Ok((
                 Some(RespondResult::Text(
                     strip_trailing_tool_intent_clause(&retry_content)
@@ -3427,6 +3427,21 @@ That's my plan."#;
         assert_eq!(
             stripped,
             "I don't have a GitHub tool available to check PRs."
+        );
+    }
+
+    #[test]
+    fn test_thinking_tags_dont_trigger_intent_guardrail() {
+        // Regression: Kimi K2.5 wraps internal reasoning in <thinking> tags.
+        // "I called the memory_search tool" inside thinking should not trigger
+        // the fabrication guardrail after clean_response strips thinking blocks.
+        let tools = make_tools(&["memory_search", "memory_read"]);
+        let raw = "<final>Hey there! It's Sir Claw here! 🦀\n\nWhat's up?</final>\n<thinking>I called the memory_search tool to check context.</thinking>";
+        let cleaned = clean_response(raw);
+        assert!(
+            !claims_unverified_tool_execution(&cleaned, &tools),
+            "Cleaned content should not trigger fabrication guardrail: {:?}",
+            cleaned
         );
     }
 
