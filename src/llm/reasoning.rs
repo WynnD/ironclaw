@@ -1872,7 +1872,16 @@ fn claims_unverified_tool_execution(content: &str, available_tools: &[ToolDefini
         || available_tools
             .iter()
             .map(|tool| tool.name.to_ascii_lowercase())
-            .any(|tool_name| lower.contains(&tool_name));
+            // Skip short names (<=5 chars) that match common words (time, echo, http, shell)
+            .filter(|name| name.len() > 5)
+            .any(|tool_name| {
+                // Word-boundary match to avoid "time" matching inside "sometimes"
+                lower.contains(&format!(" {} ", tool_name))
+                    || lower.contains(&format!(" {}.", tool_name))
+                    || lower.contains(&format!("`{}`", tool_name))
+                    || lower.starts_with(&format!("{} ", tool_name))
+                    || lower.ends_with(&format!(" {}", tool_name))
+            });
 
     mentions_tool
         && (TOOL_EXECUTION_CLAIM_RE.is_match(&lower) || TOOL_RESULT_CLAIM_RE.is_match(&lower))
