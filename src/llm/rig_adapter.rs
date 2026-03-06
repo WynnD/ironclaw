@@ -216,10 +216,6 @@ fn is_kimi_interleaved_thinking_model(model_name: &str) -> bool {
     is_kimi_k2_5_model(model_name) || is_kimi_k2_thinking_model(model_name)
 }
 
-fn should_use_kimi_text_tool_primary(model_name: &str) -> bool {
-    is_kimi_k2_5_model(model_name)
-}
-
 fn should_use_glm_native_tool_rounds(model_name: &str) -> bool {
     crate::llm::is_glm_4_7_or_newer_model_id(model_name)
 }
@@ -630,10 +626,18 @@ fn convert_tools(model_name: &str, tools: &[IronToolDefinition]) -> Vec<RigToolD
 }
 
 fn is_server_error_retryable_for_kimi(error: &str) -> bool {
+    is_server_error(error)
+}
+
+/// Returns true if the error string indicates a server-side error (5xx).
+fn is_server_error(error: &str) -> bool {
     let e = error.to_ascii_lowercase();
     e.contains("status code 500")
         || e.contains("500 internal server error")
         || e.contains("\"error\": \"internal server error\"")
+        || e.contains("http 500")
+        || e.contains("http 502")
+        || e.contains("http 503")
 }
 
 fn kimi_reduced_tool_set(tools: &[IronToolDefinition]) -> Vec<IronToolDefinition> {
@@ -1439,90 +1443,89 @@ where
         }
 
         if is_kimi_interleaved_thinking_model(&self.model_name) && self.native_transport.is_some() {
-            // K2.5 on some OpenAI-compatible gateways (Baseten/vLLM/SGLang) is
-            // unstable when using the structured `tools` field and often returns
-            // HTTP 500. Prefer text-tool mode first for K2.5.
-            if should_use_kimi_text_tool_primary(&self.model_name) {
-                let mut text_tool_messages = messages.clone();
-                inject_tools_into_system_prompt(&mut text_tool_messages, &request.tools);
-                tracing::info!(
-                    model = %self.model_name,
-                    tools = request.tools.len(),
-                    "K2.5 using text-based tool calling via native transport (structured tools disabled)"
-                );
-
-                match self
-                    .send_kimi_native_text_tool_request(
-                        &text_tool_messages,
-                        request.temperature,
-                        request.max_tokens,
-                    )
-                    .await
+            // K2.5 / K2-thinking: try structured tools via native transport first.
+            // This works correctly on OpenRouter and other proxies that normalize
+            // tool-calling requests. Only fall back to text-based tool injection
+            // when the endpoint returns a server error (e.g. vLLM/SGLang 500).
+            match self
+                .send_kimi_native_tool_request(
+                    &messages,
+                    &request.tools,
+                    request.tool_choice.as_deref(),
+                    request.temperature,
+                    request.max_tokens,
+                )
+                .await
+            {
+                Ok(mut resp) => {
+                    normalize_tool_calls(&mut resp.tool_calls, &known_tool_names);
+                    return Ok(resp);
+                }
+                Err(ref e)
+                    if is_kimi_k2_5_model(&self.model_name) && is_server_error(&e.to_string()) =>
                 {
-                    Ok(mut resp) => {
-                        normalize_tool_calls(&mut resp.tool_calls, &known_tool_names);
-                        return Ok(resp);
-                    }
-                    Err(e) => {
-                        // Retry once with a small deterministic tool subset if
-                        // the full text-tool prompt fails (typically payload size).
-                        let reduced_tools = kimi_reduced_tool_set(&request.tools);
-                        if reduced_tools.len() < request.tools.len() {
-                            tracing::warn!(
-                                model = %self.model_name,
-                                tools = request.tools.len(),
-                                reduced_tools = reduced_tools.len(),
-                                error = %e,
-                                "K2.5 text-tool request failed; retrying with reduced tool set in system prompt"
-                            );
+                    tracing::warn!(
+                        model = %self.model_name,
+                        error = %e,
+                        "K2.5 structured tool request hit server error; falling back to text-based tool calling"
+                    );
 
-                            let mut reduced_text_tool_messages = messages.clone();
-                            inject_tools_into_system_prompt(
-                                &mut reduced_text_tool_messages,
-                                &reduced_tools,
-                            );
+                    // Text-tool fallback: inject tools into system prompt,
+                    // model emits section-delimited tool calls recovered by
+                    // recover_tool_calls_from_content in the reasoning layer.
+                    let mut text_tool_messages = messages.clone();
+                    inject_tools_into_system_prompt(&mut text_tool_messages, &request.tools);
 
-                            let mut resp = self
-                                .send_kimi_native_text_tool_request(
-                                    &reduced_text_tool_messages,
-                                    request.temperature,
-                                    request.max_tokens,
-                                )
-                                .await?;
+                    match self
+                        .send_kimi_native_text_tool_request(
+                            &text_tool_messages,
+                            request.temperature,
+                            request.max_tokens,
+                        )
+                        .await
+                    {
+                        Ok(mut resp) => {
                             normalize_tool_calls(&mut resp.tool_calls, &known_tool_names);
                             return Ok(resp);
                         }
+                        Err(e) => {
+                            let reduced_tools = kimi_reduced_tool_set(&request.tools);
+                            if reduced_tools.len() < request.tools.len() {
+                                tracing::warn!(
+                                    model = %self.model_name,
+                                    tools = request.tools.len(),
+                                    reduced_tools = reduced_tools.len(),
+                                    error = %e,
+                                    "K2.5 text-tool request failed; retrying with reduced tool set"
+                                );
 
-                        return Err(e);
+                                let mut reduced_text_tool_messages = messages.clone();
+                                inject_tools_into_system_prompt(
+                                    &mut reduced_text_tool_messages,
+                                    &reduced_tools,
+                                );
+
+                                let mut resp = self
+                                    .send_kimi_native_text_tool_request(
+                                        &reduced_text_tool_messages,
+                                        request.temperature,
+                                        request.max_tokens,
+                                    )
+                                    .await?;
+                                normalize_tool_calls(&mut resp.tool_calls, &known_tool_names);
+                                return Ok(resp);
+                            }
+
+                            return Err(e);
+                        }
                     }
                 }
-            }
-
-            // K2-thinking: use native structured tools to preserve interleaved
-            // reasoning with provider-native tool calls. If native call fails,
-            // fall through to the standard provider path below.
-            if is_kimi_k2_thinking_model(&self.model_name) {
-                match self
-                    .send_kimi_native_tool_request(
-                        &messages,
-                        &request.tools,
-                        request.tool_choice.as_deref(),
-                        request.temperature,
-                        request.max_tokens,
-                    )
-                    .await
-                {
-                    Ok(mut resp) => {
-                        normalize_tool_calls(&mut resp.tool_calls, &known_tool_names);
-                        return Ok(resp);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            model = %self.model_name,
-                            error = %e,
-                            "Kimi K2-thinking native transport failed; falling back to standard provider path"
-                        );
-                    }
+                Err(e) => {
+                    tracing::warn!(
+                        model = %self.model_name,
+                        error = %e,
+                        "Kimi native transport failed; falling back to standard provider path"
+                    );
                 }
             }
         }
@@ -1977,6 +1980,16 @@ mod tests {
     }
 
     #[test]
+    fn test_is_server_error_covers_5xx() {
+        assert!(is_server_error("HTTP 500: Internal Server Error"));
+        assert!(is_server_error("HTTP 502: Bad Gateway"));
+        assert!(is_server_error("HTTP 503: Service Unavailable"));
+        assert!(is_server_error("status code 500"));
+        assert!(!is_server_error("HTTP 400: Bad Request"));
+        assert!(!is_server_error("HTTP 429: Too Many Requests"));
+    }
+
+    #[test]
     fn test_is_kimi_interleaved_thinking_model() {
         assert!(is_kimi_interleaved_thinking_model("moonshotai/kimi-k2.5"));
         assert!(is_kimi_interleaved_thinking_model("kimi-k2.5"));
@@ -1987,14 +2000,6 @@ mod tests {
         ));
         assert!(is_kimi_k2_thinking_model("kimi-k2-thinking"));
         assert!(!is_kimi_interleaved_thinking_model("moonshotai/kimi-k2"));
-    }
-
-    #[test]
-    fn test_should_use_kimi_text_tool_primary() {
-        assert!(should_use_kimi_text_tool_primary("moonshotai/kimi-k2.5"));
-        assert!(should_use_kimi_text_tool_primary("kimi-k2-5"));
-        assert!(!should_use_kimi_text_tool_primary("kimi-k2-thinking"));
-        assert!(!should_use_kimi_text_tool_primary("moonshotai/kimi-k2"));
     }
 
     #[test]
