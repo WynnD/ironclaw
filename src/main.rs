@@ -931,6 +931,13 @@ async fn setup_wasm_channels(
     let mut channels: Vec<(String, Box<dyn ironclaw::channels::Channel>)> = Vec::new();
     let mut channel_names: Vec<String> = Vec::new();
 
+    let secrets_user_id = config
+        .channels
+        .gateway
+        .as_ref()
+        .map(|g| g.user_id.as_str())
+        .unwrap_or("default");
+
     for loaded in results.loaded {
         let channel_name = loaded.name().to_string();
         channel_names.push(channel_name.clone());
@@ -941,7 +948,7 @@ async fn setup_wasm_channels(
 
         let webhook_secret = if let Some(secrets) = secrets_store {
             secrets
-                .get_decrypted("default", &secret_name)
+                .get_decrypted(secrets_user_id, &secret_name)
                 .await
                 .ok()
                 .map(|s| s.expose().to_string())
@@ -959,7 +966,11 @@ async fn setup_wasm_channels(
             require_secret: webhook_secret.is_some(),
         }];
 
-        let channel_arc = Arc::new(loaded.channel);
+        let channel_arc = Arc::new(
+            loaded
+                .channel
+                .with_secrets_user_id(secrets_user_id.to_string()),
+        );
 
         {
             let mut config_updates = std::collections::HashMap::new();
@@ -1017,7 +1028,7 @@ async fn setup_wasm_channels(
         // Register Ed25519 signature key if declared in capabilities
         if let Some(ref sig_key_name) = sig_key_secret_name
             && let Some(secrets) = secrets_store
-            && let Ok(key_secret) = secrets.get_decrypted("default", sig_key_name).await
+            && let Ok(key_secret) = secrets.get_decrypted(secrets_user_id, sig_key_name).await
         {
             match wasm_router
                 .register_signature_key(&channel_name, key_secret.expose())
@@ -1033,7 +1044,14 @@ async fn setup_wasm_channels(
         }
 
         if let Some(secrets) = secrets_store {
-            match inject_channel_credentials(&channel_arc, secrets.as_ref(), &channel_name).await {
+            match inject_channel_credentials(
+                &channel_arc,
+                secrets.as_ref(),
+                &channel_name,
+                secrets_user_id,
+            )
+            .await
+            {
                 Ok(count) => {
                     if count > 0 {
                         tracing::info!(
@@ -1115,9 +1133,10 @@ async fn inject_channel_credentials(
     channel: &Arc<ironclaw::channels::wasm::WasmChannel>,
     secrets: &dyn SecretsStore,
     channel_name: &str,
+    user_id: &str,
 ) -> anyhow::Result<usize> {
     let all_secrets = secrets
-        .list("default")
+        .list(user_id)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to list secrets: {}", e))?;
 
@@ -1129,7 +1148,7 @@ async fn inject_channel_credentials(
             continue;
         }
 
-        let decrypted = match secrets.get_decrypted("default", &secret_meta.name).await {
+        let decrypted = match secrets.get_decrypted(user_id, &secret_meta.name).await {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!(

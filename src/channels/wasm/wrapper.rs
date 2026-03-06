@@ -664,6 +664,9 @@ pub struct WasmChannel {
     /// Secrets store for host-based credential injection.
     /// Used to pre-resolve credentials before each WASM callback.
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
+
+    /// User ID for secrets store lookups (e.g., gateway user ID).
+    secrets_user_id: String,
 }
 
 /// Update broadcast metadata in memory and persist to the settings store when
@@ -727,6 +730,7 @@ impl WasmChannel {
             last_broadcast_metadata: Arc::new(tokio::sync::RwLock::new(None)),
             settings_store,
             secrets_store: None,
+            secrets_user_id: "default".to_string(),
         }
     }
 
@@ -737,6 +741,12 @@ impl WasmChannel {
     /// the target host (e.g., Bearer token for api.slack.com).
     pub fn with_secrets_store(mut self, store: Arc<dyn SecretsStore + Send + Sync>) -> Self {
         self.secrets_store = Some(store);
+        self
+    }
+
+    /// Set the user ID for secrets store lookups.
+    pub fn with_secrets_user_id(mut self, user_id: String) -> Self {
+        self.secrets_user_id = user_id;
         self
     }
 
@@ -1006,9 +1016,12 @@ impl WasmChannel {
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
-        let host_credentials =
-            resolve_channel_host_credentials(&self.capabilities, self.secrets_store.as_deref())
-                .await;
+        let host_credentials = resolve_channel_host_credentials(
+            &self.capabilities,
+            self.secrets_store.as_deref(),
+            &self.secrets_user_id,
+        )
+        .await;
         let pairing_store = self.pairing_store.clone();
         let workspace_store = self.workspace_store.clone();
 
@@ -1146,9 +1159,12 @@ impl WasmChannel {
         let capabilities = Self::inject_workspace_reader(&self.capabilities, &self.workspace_store);
         let timeout = self.runtime.config().callback_timeout;
         let credentials = self.get_credentials().await;
-        let host_credentials =
-            resolve_channel_host_credentials(&self.capabilities, self.secrets_store.as_deref())
-                .await;
+        let host_credentials = resolve_channel_host_credentials(
+            &self.capabilities,
+            self.secrets_store.as_deref(),
+            &self.secrets_user_id,
+        )
+        .await;
         let pairing_store = self.pairing_store.clone();
         let workspace_store = self.workspace_store.clone();
 
@@ -1249,9 +1265,12 @@ impl WasmChannel {
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
-        let host_credentials =
-            resolve_channel_host_credentials(&self.capabilities, self.secrets_store.as_deref())
-                .await;
+        let host_credentials = resolve_channel_host_credentials(
+            &self.capabilities,
+            self.secrets_store.as_deref(),
+            &self.secrets_user_id,
+        )
+        .await;
         let pairing_store = self.pairing_store.clone();
         let workspace_store = self.workspace_store.clone();
 
@@ -1354,9 +1373,12 @@ impl WasmChannel {
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
-        let host_credentials =
-            resolve_channel_host_credentials(&self.capabilities, self.secrets_store.as_deref())
-                .await;
+        let host_credentials = resolve_channel_host_credentials(
+            &self.capabilities,
+            self.secrets_store.as_deref(),
+            &self.secrets_user_id,
+        )
+        .await;
         let pairing_store = self.pairing_store.clone();
 
         // Prepare response data
@@ -1471,9 +1493,12 @@ impl WasmChannel {
         let timeout = self.runtime.config().callback_timeout;
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
-        let host_credentials =
-            resolve_channel_host_credentials(&self.capabilities, self.secrets_store.as_deref())
-                .await;
+        let host_credentials = resolve_channel_host_credentials(
+            &self.capabilities,
+            self.secrets_store.as_deref(),
+            &self.secrets_user_id,
+        )
+        .await;
         let pairing_store = self.pairing_store.clone();
 
         let wit_update = status_to_wit(status, metadata);
@@ -1709,6 +1734,7 @@ impl WasmChannel {
                     let repeater_host_credentials = resolve_channel_host_credentials(
                         &self.capabilities,
                         self.secrets_store.as_deref(),
+                        &self.secrets_user_id,
                     )
                     .await;
                     let pairing_store = self.pairing_store.clone();
@@ -1993,6 +2019,7 @@ impl WasmChannel {
         let last_broadcast_metadata = self.last_broadcast_metadata.clone();
         let settings_store = self.settings_store.clone();
         let poll_secrets_store = self.secrets_store.clone();
+        let poll_secrets_user_id = self.secrets_user_id.clone();
 
         tokio::spawn(async move {
             let mut interval_timer = tokio::time::interval(interval);
@@ -2010,6 +2037,7 @@ impl WasmChannel {
                         let host_credentials = resolve_channel_host_credentials(
                             &poll_capabilities,
                             poll_secrets_store.as_deref(),
+                            &poll_secrets_user_id,
                         )
                         .await;
 
@@ -2838,6 +2866,7 @@ fn extract_host_from_url(url: &str) -> Option<String> {
 async fn resolve_channel_host_credentials(
     capabilities: &ChannelCapabilities,
     store: Option<&(dyn SecretsStore + Send + Sync)>,
+    user_id: &str,
 ) -> Vec<ResolvedHostCredential> {
     let store = match store {
         Some(s) => s,
@@ -2864,7 +2893,7 @@ async fn resolve_channel_host_credentials(
             continue;
         }
 
-        let secret = match store.get_decrypted("default", &mapping.secret_name).await {
+        let secret = match store.get_decrypted(user_id, &mapping.secret_name).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::debug!(

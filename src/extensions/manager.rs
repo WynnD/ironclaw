@@ -2428,7 +2428,7 @@ impl ExtensionManager {
             .ok()
             .map(|s| s.expose().to_string());
 
-        let channel_arc = Arc::new(loaded.channel);
+        let channel_arc = Arc::new(loaded.channel.with_secrets_user_id(self.user_id.clone()));
 
         // Inject runtime config (tunnel_url, webhook_secret, owner_id)
         {
