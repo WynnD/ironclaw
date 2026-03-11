@@ -6,7 +6,7 @@
 //!
 //! File: `~/.ironclaw/.env` (standard dotenvy format)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 const IRONCLAW_BASE_DIR_ENV: &str = "IRONCLAW_BASE_DIR";
@@ -20,22 +20,11 @@ static IRONCLAW_BASE_DIR: LazyLock<PathBuf> = LazyLock::new(compute_ironclaw_bas
 /// `ironclaw_base_dir()` function (which caches the result) and tests
 /// (which need to verify different configurations).
 pub fn compute_ironclaw_base_dir() -> PathBuf {
-    std::env::var(IRONCLAW_BASE_DIR_ENV)
-        .map(PathBuf::from)
-        .map(|path| {
-            if path.as_os_str().is_empty() {
-                default_base_dir()
-            } else if !path.is_absolute() {
-                eprintln!(
-                    "Warning: IRONCLAW_BASE_DIR is a relative path '{}', resolved against current directory",
-                    path.display()
-                );
-                path
-            } else {
-                path
-            }
-        })
-        .unwrap_or_else(|_| default_base_dir())
+    if let Some(path) = explicit_base_dir_from_env() {
+        return path;
+    }
+
+    select_writable_base_dir(default_base_dir())
 }
 
 /// Get the default IronClaw base directory (~/.ironclaw).
@@ -50,6 +39,97 @@ fn default_base_dir() -> PathBuf {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("/tmp"))
             .join(".ironclaw")
+    }
+}
+
+fn explicit_base_dir_from_env() -> Option<PathBuf> {
+    match std::env::var(IRONCLAW_BASE_DIR_ENV) {
+        Ok(value) => {
+            let path = PathBuf::from(value);
+            if path.as_os_str().is_empty() {
+                None
+            } else if !path.is_absolute() {
+                eprintln!(
+                    "Warning: IRONCLAW_BASE_DIR is a relative path '{}', resolved against current directory",
+                    path.display()
+                );
+                Some(path)
+            } else {
+                Some(path)
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+fn select_writable_base_dir(preferred: PathBuf) -> PathBuf {
+    select_writable_base_dir_with_fallbacks(
+        preferred,
+        &[Path::new("/dev/shm/.ironclaw"), Path::new("/tmp/.ironclaw")],
+    )
+}
+
+fn select_writable_base_dir_with_fallbacks(preferred: PathBuf, fallbacks: &[&Path]) -> PathBuf {
+    if is_path_writable_or_creatable(&preferred) {
+        return preferred;
+    }
+
+    for candidate in fallbacks {
+        if is_path_writable_or_creatable(candidate) {
+            eprintln!(
+                "Warning: default base dir '{}' is not writable; using '{}' instead. \
+                 Set IRONCLAW_BASE_DIR to override.",
+                preferred.display(),
+                candidate.display()
+            );
+            return candidate.to_path_buf();
+        }
+    }
+
+    eprintln!(
+        "Warning: default base dir '{}' is not writable and no writable fallback was found.",
+        preferred.display()
+    );
+    preferred
+}
+
+fn is_path_writable_or_creatable(path: &Path) -> bool {
+    if path.exists() {
+        return directory_probe_writable(path);
+    }
+
+    match path.parent() {
+        Some(parent) => directory_probe_writable(parent),
+        None => false,
+    }
+}
+
+fn directory_probe_writable(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let probe = dir.join(format!(
+        ".ironclaw-write-probe-{}-{}",
+        std::process::id(),
+        ts
+    ));
+
+    match std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe)
+    {
+        Ok(file) => {
+            drop(file);
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -481,6 +561,8 @@ pub enum MigrationError {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    #[cfg(unix)]
+    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
     use tempfile::tempdir;
 
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
@@ -1048,5 +1130,44 @@ INJECTED="pwned"#;
             // SAFETY: ENV_MUTEX ensures single-threaded access to env vars in tests
             unsafe { std::env::remove_var("IRONCLAW_BASE_DIR") };
         }
+    }
+
+    #[test]
+    fn test_is_path_writable_or_creatable_uses_parent_for_missing_path() {
+        let dir = tempdir().unwrap();
+        let missing_child = dir.path().join("child");
+        assert!(is_path_writable_or_creatable(&missing_child));
+
+        let missing_parent_child = dir.path().join("missing").join("child");
+        assert!(!is_path_writable_or_creatable(&missing_parent_child));
+    }
+
+    #[test]
+    fn test_select_writable_base_dir_with_fallbacks_keeps_writable_preferred() {
+        let dir = tempdir().unwrap();
+        let preferred = dir.path().join("preferred");
+        std::fs::create_dir_all(&preferred).unwrap();
+        let fallback = dir.path().join("fallback");
+
+        let selected =
+            select_writable_base_dir_with_fallbacks(preferred.clone(), &[fallback.as_path()]);
+        assert_eq!(selected, preferred);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_select_writable_base_dir_with_fallbacks_uses_fallback_for_readonly_preferred() {
+        let dir = tempdir().unwrap();
+        let preferred = dir.path().join("preferred");
+        std::fs::create_dir_all(&preferred).unwrap();
+        std::fs::set_permissions(&preferred, Permissions::from_mode(0o555)).unwrap();
+        let fallback = dir.path().join("fallback");
+
+        let selected =
+            select_writable_base_dir_with_fallbacks(preferred.clone(), &[fallback.as_path()]);
+        assert_eq!(selected, fallback);
+
+        // Restore write permission so tempdir cleanup succeeds.
+        std::fs::set_permissions(&preferred, Permissions::from_mode(0o755)).unwrap();
     }
 }

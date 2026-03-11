@@ -128,7 +128,44 @@ fn normalize_schema_lenient(schema: &JsonValue) -> JsonValue {
     schema
 }
 
+/// Coerce degenerate schema values that many LLM providers (llama.cpp, vLLM,
+/// etc.) do not support even though they are valid JSON Schema:
+///
+/// - `true` / `false` boolean schemas → `{}` (allow-anything object)
+/// - Objects with only `description` (no `type`, no combinators, no
+///   `properties`) → add `"type": "string"` as a sensible default.
+///
+/// MCP servers commonly emit these patterns; this normalizes them before the
+/// schema reaches the provider.
+fn coerce_degenerate_schema(schema: &mut JsonValue) {
+    match schema {
+        JsonValue::Bool(_) => {
+            // `true` = "any value", `false` = "no value" — neither is supported
+            // by most local/compatible endpoints. Replace with empty object.
+            *schema = JsonValue::Object(serde_json::Map::new());
+        }
+        JsonValue::Object(obj) => {
+            // Object schema with only a `description` and no type information:
+            // add `"type": "string"` so the provider can validate it.
+            let has_type = obj.contains_key("type");
+            let has_combinator =
+                obj.contains_key("anyOf") || obj.contains_key("oneOf") || obj.contains_key("allOf");
+            let has_structure = obj.contains_key("properties")
+                || obj.contains_key("items")
+                || obj.contains_key("enum");
+            let has_description = obj.contains_key("description");
+
+            if !has_type && !has_combinator && !has_structure && has_description {
+                obj.insert("type".to_string(), JsonValue::String("string".to_string()));
+            }
+        }
+        _ => {}
+    }
+}
+
 fn normalize_schema_lenient_recursive(schema: &mut JsonValue) {
+    coerce_degenerate_schema(schema);
+
     let obj = match schema.as_object_mut() {
         Some(o) => o,
         None => return,
@@ -382,6 +419,8 @@ fn normalize_tool_description_for_model(model_name: &str, name: &str, descriptio
 }
 
 fn normalize_schema_recursive(schema: &mut JsonValue) {
+    coerce_degenerate_schema(schema);
+
     let obj = match schema.as_object_mut() {
         Some(o) => o,
         None => return,
@@ -1859,6 +1898,87 @@ mod tests {
             params["properties"]["optional_field"]["type"],
             serde_json::json!(["integer", "null"])
         );
+    }
+
+    #[test]
+    fn test_coerce_degenerate_schema_boolean_true() {
+        // `true` boolean schema (common in MCP tool definitions) must be replaced
+        // with an empty object so providers like llama.cpp / qwen don't reject it.
+        let tools = vec![IronToolDefinition {
+            name: "mcp_tool".to_string(),
+            description: "MCP tool with boolean schema".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "filter": true,
+                    "having": {"description": "Having clauses for the query"}
+                }
+            }),
+        }];
+
+        let rig_tools = convert_tools("qwen3.5-9b", &tools);
+        let params = &rig_tools[0].parameters;
+
+        // `true` → coerced to an object (strict mode may wrap it further)
+        assert!(
+            !params["properties"]["filter"].is_boolean(),
+            "boolean schema `true` must be coerced to an object"
+        );
+        // description-only → must have a `type` (strict mode makes it nullable: ["string", "null"])
+        assert!(
+            !params["properties"]["having"]["type"].is_null(),
+            "description-only schema must gain a type field"
+        );
+    }
+
+    #[test]
+    fn test_coerce_degenerate_schema_boolean_strict_model() {
+        // Same schemas under a strict-mode model (OpenAI-style).
+        let tools = vec![IronToolDefinition {
+            name: "mcp_tool".to_string(),
+            description: "MCP tool with boolean schema".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "filter": true,
+                    "value": {"description": "Value for the filter"}
+                }
+            }),
+        }];
+
+        let rig_tools = convert_tools("openai/gpt-4.1", &tools);
+        let params = &rig_tools[0].parameters;
+
+        assert!(
+            !params["properties"]["filter"].is_boolean(),
+            "boolean schema `true` must be coerced to an object under strict mode"
+        );
+        // Strict mode makes optional fields nullable: ["string", "null"]
+        assert!(
+            !params["properties"]["value"]["type"].is_null(),
+            "description-only schema must gain a type under strict mode"
+        );
+    }
+
+    #[test]
+    fn test_coerce_degenerate_schema_unit_level() {
+        // Test the coercion function directly to verify behavior.
+        let mut bool_schema = serde_json::json!(true);
+        coerce_degenerate_schema(&mut bool_schema);
+        assert_eq!(bool_schema, serde_json::json!({}));
+
+        let mut desc_only = serde_json::json!({"description": "A filter value"});
+        coerce_degenerate_schema(&mut desc_only);
+        assert_eq!(desc_only["type"], serde_json::json!("string"));
+        assert_eq!(
+            desc_only["description"],
+            serde_json::json!("A filter value")
+        );
+
+        // Schema with a type should NOT be modified
+        let mut typed = serde_json::json!({"type": "integer", "description": "A count"});
+        coerce_degenerate_schema(&mut typed);
+        assert_eq!(typed["type"], serde_json::json!("integer"));
     }
 
     #[test]

@@ -6,6 +6,12 @@
 
 This is **Wynn's fork** (`WynnD/ironclaw`) of `nearai/ironclaw`.
 
+## Fork "Gotchas"
+- Use docker buildkit to build.
+- Upstream code often supports only "default" gateway user id. Our code must support the current id instead.
+- There is a pre-existing failing test in `tests::test_large_output_command` you can ignore.
+- Name image tags after short commit hash
+
 ### Git Remotes
 - **origin** — `WynnD/ironclaw` (this fork, push here)
 - **upstream** — `nearai/ironclaw` (pull upstream changes from here)
@@ -25,7 +31,7 @@ IronClaw is deployed to Wynn's home Kubernetes cluster as **`accountability-agen
 - **Ingress**: Traefik with local-only middleware on `wynndrahorad.com`
 - **Cluster nodes**: `morningstar` (primary, GPU), `rocinante`, `pi1`, `pi2`
 
-**Deploy workflow**: build image, push to `registry.wynndrahorad.com/ironclaw:<tag>`, update `newTag` in `kustomization.yaml`, push `home-cluster` — ArgoCD auto-syncs.
+**Deploy workflow**: build image, push to `registry.wynndrahorad.com/ironclaw:<tag>`, commit/push `home-cluster` — ArgoCD runs image-updater
 
 ### Core Philosophy
 - **User-first security** - Your data stays yours, encrypted and local
