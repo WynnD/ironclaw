@@ -97,6 +97,7 @@ impl GatewayChannel {
             chat_rate_limiter: server::RateLimiter::new(30, 60),
             registry_entries: Vec::new(),
             cost_guard: None,
+            context_monitor: tokio::sync::RwLock::new(None),
             startup_time: std::time::Instant::now(),
         });
 
@@ -133,6 +134,7 @@ impl GatewayChannel {
             chat_rate_limiter: server::RateLimiter::new(30, 60),
             registry_entries: self.state.registry_entries.clone(),
             cost_guard: self.state.cost_guard.clone(),
+            context_monitor: tokio::sync::RwLock::new(None),
             startup_time: self.state.startup_time,
         };
         mutate(&mut new_state);

@@ -181,6 +181,7 @@ mod tests {
             chat_rate_limiter: RateLimiter::new(30, 60),
             registry_entries: Vec::new(),
             cost_guard: None,
+            context_monitor: tokio::sync::RwLock::new(None),
             startup_time: std::time::Instant::now(),
             scheduler: None,
         })

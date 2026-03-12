@@ -64,6 +64,10 @@ pub struct Settings {
     #[serde(default)]
     pub selected_model: Option<String>,
 
+    /// Context window size in tokens. `None` = auto-detect from model metadata.
+    #[serde(default)]
+    pub context_limit: Option<usize>,
+
     // === Step 5: Embeddings ===
     /// Embeddings configuration.
     #[serde(default)]

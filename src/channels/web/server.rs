@@ -170,6 +170,9 @@ pub struct GatewayState {
     pub registry_entries: Vec<crate::extensions::RegistryEntry>,
     /// Cost guard for token/cost tracking.
     pub cost_guard: Option<Arc<crate::agent::cost_guard::CostGuard>>,
+    /// Context monitor for live context-limit updates from the settings UI.
+    pub context_monitor:
+        tokio::sync::RwLock<Option<Arc<tokio::sync::RwLock<crate::agent::ContextMonitor>>>>,
     /// Server startup time for uptime calculation.
     pub startup_time: std::time::Instant,
 }
@@ -2383,6 +2386,7 @@ fn persisted_summary_from_settings(settings: &crate::settings::Settings) -> LlmS
         accept_language: settings.openai_compatible_accept_language.clone(),
         openai_compatible_base_url: settings.openai_compatible_base_url.clone(),
         ollama_base_url: settings.ollama_base_url.clone(),
+        context_limit: settings.context_limit,
     }
 }
 
@@ -2396,12 +2400,19 @@ fn effective_summary_from_settings(
     let accept_language_env = parse_accept_language_from_env_extra_headers();
 
     let provider = provider_alias_for_backend(&backend, base_url.as_deref());
+    let context_limit_env = std::env::var("CONTEXT_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+
     let env_overrides = LlmSettingsEnvOverrides {
         provider: std::env::var_os("LLM_BACKEND").is_some(),
         model: std::env::var_os(model_env_var_for_backend(backend_enum)).is_some(),
         base_url: base_url_env_override,
         accept_language: accept_language_env.is_some(),
+        context_limit: context_limit_env.is_some(),
     };
+
+    let effective_context_limit = context_limit_env.or(settings.context_limit);
 
     let mut summary = LlmSettingsSummary {
         provider,
@@ -2410,6 +2421,7 @@ fn effective_summary_from_settings(
         accept_language: None,
         openai_compatible_base_url: None,
         ollama_base_url: None,
+        context_limit: effective_context_limit,
     };
 
     match backend_enum {
@@ -2735,6 +2747,32 @@ async fn llm_settings_set_handler(
             }
         }
         _ => {}
+    }
+
+    // Persist context_limit (provider-independent)
+    if let Some(limit) = body.context_limit {
+        store
+            .set_setting(
+                &state.user_id,
+                "context_limit",
+                &serde_json::json!(limit),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to persist context_limit: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to save context limit".to_string(),
+                )
+            })?;
+        settings.context_limit = Some(limit);
+
+        // Apply context limit live to the running agent's context monitor.
+        if let Some(ref monitor) = *state.context_monitor.read().await {
+            let mut cm = monitor.write().await;
+            *cm = cm.clone().with_limit(limit);
+            tracing::info!(context_limit = limit, "Applied context limit live from settings UI");
+        }
     }
 
     let mut after = build_llm_settings_response(

@@ -811,6 +811,9 @@ pub struct LlmSettingsSummary {
     pub openai_compatible_base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ollama_base_url: Option<String>,
+    /// Context window size in tokens. `None` = auto-detect from model metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -819,6 +822,7 @@ pub struct LlmSettingsEnvOverrides {
     pub model: bool,
     pub base_url: bool,
     pub accept_language: bool,
+    pub context_limit: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -844,6 +848,8 @@ pub struct LlmSettingsUpdateRequest {
     pub base_url: Option<String>,
     /// Optional Accept-Language header (used for openai_compatible/openrouter).
     pub accept_language: Option<String>,
+    /// Context window size in tokens. `null` clears (auto-detect from model).
+    pub context_limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]

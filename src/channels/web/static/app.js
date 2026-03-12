@@ -4016,6 +4016,7 @@ function llmSettingsElements() {
     acceptLanguage: document.getElementById('llm-settings-accept-language'),
     model: document.getElementById('llm-settings-model'),
     models: document.getElementById('llm-settings-models'),
+    contextLimit: document.getElementById('llm-settings-context-limit'),
     note: document.getElementById('llm-settings-note'),
     tokenInput: document.getElementById('llm-api-token'),
     tokenStatus: document.getElementById('llm-token-status'),
@@ -4142,6 +4143,7 @@ function applyLlmSettingsToForm(data) {
   els.acceptLanguage.value = (data.persisted && data.persisted.accept_language) || '';
 
   els.model.value = (data.persisted && data.persisted.model) || '';
+  els.contextLimit.value = (data.persisted && data.persisted.context_limit) || '';
   renderLlmSettingsNote(data);
   renderLlmTokenStatus(data);
 }
@@ -4164,11 +4166,13 @@ function loadLlmSettings() {
 function currentLlmSettingsFormPayload() {
   var els = llmSettingsElements();
   var provider = els.provider.value;
+  var contextVal = els.contextLimit.value.trim();
   var payload = {
     provider: provider,
     model: els.model.value.trim() || null,
     base_url: null,
     accept_language: null,
+    context_limit: contextVal ? parseInt(contextVal, 10) : null,
   };
   if (providerUsesBaseUrl(provider)) {
     payload.base_url = els.baseUrl.value.trim() || null;

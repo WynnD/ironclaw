@@ -197,6 +197,11 @@ impl Agent {
         Arc::clone(&self.scheduler)
     }
 
+    /// Get the context monitor (for external wiring, e.g. web gateway live settings).
+    pub fn context_monitor(&self) -> Arc<RwLock<ContextMonitor>> {
+        Arc::clone(&self.context_monitor)
+    }
+
     pub(super) fn store(&self) -> Option<&Arc<dyn Database>> {
         self.deps.store.as_ref()
     }
@@ -231,30 +236,53 @@ impl Agent {
     }
 
     /// Refresh the base context limit from the active model metadata (unless overridden).
+    ///
+    /// Priority: env `CONTEXT_LIMIT` > DB `context_limit` setting > model metadata > fallback.
     pub(super) async fn refresh_context_monitor_limit(&self) -> usize {
         let base_limit = if let Some(limit) = self.config.context_limit_override {
             limit
         } else {
-            let fallback = {
-                let monitor = self.context_monitor.read().await;
-                monitor.limit()
+            // Check DB-persisted context_limit (set via web UI settings).
+            let user_id = std::env::var("GATEWAY_USER_ID").unwrap_or_else(|_| "default".to_string());
+            let db_limit = if let Some(ref store) = self.deps.store {
+                store
+                    .get_setting(&user_id, "context_limit")
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.as_u64().map(|n| n as usize))
+            } else {
+                None
             };
-            match self.llm().model_metadata().await {
-                Ok(metadata) => {
-                    let limit = metadata
-                        .context_length
-                        .map(|v| v as usize)
-                        .unwrap_or(fallback);
-                    tracing::debug!(
-                        model = %metadata.id,
-                        context_limit = limit,
-                        "Resolved model context limit"
-                    );
-                    limit
-                }
-                Err(err) => {
-                    tracing::warn!("Failed to fetch model metadata for context limit: {}", err);
-                    fallback
+
+            if let Some(limit) = db_limit {
+                tracing::debug!(context_limit = limit, "Using DB-persisted context limit");
+                limit
+            } else {
+                let fallback = {
+                    let monitor = self.context_monitor.read().await;
+                    monitor.limit()
+                };
+                match self.llm().model_metadata().await {
+                    Ok(metadata) => {
+                        let limit = metadata
+                            .context_length
+                            .map(|v| v as usize)
+                            .unwrap_or(fallback);
+                        tracing::debug!(
+                            model = %metadata.id,
+                            context_limit = limit,
+                            "Resolved model context limit"
+                        );
+                        limit
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Failed to fetch model metadata for context limit: {}",
+                            err
+                        );
+                        fallback
+                    }
                 }
             }
         };

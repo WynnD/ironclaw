@@ -485,6 +485,7 @@ async fn async_main() -> anyhow::Result<()> {
     // ── Gateway channel ────────────────────────────────────────────────
 
     let mut gateway_url: Option<String> = None;
+    let mut gateway_state: Option<Arc<ironclaw::channels::web::server::GatewayState>> = None;
     let mut sse_sender: Option<
         tokio::sync::broadcast::Sender<ironclaw::channels::web::types::SseEvent>,
     > = None;
@@ -544,10 +545,11 @@ async fn async_main() -> anyhow::Result<()> {
 
         tracing::info!("Web UI: http://{}:{}/", gw_config.host, gw_config.port);
 
-        // Capture SSE sender before moving gw into channels.
+        // Capture SSE sender and gateway state before moving gw into channels.
         // IMPORTANT: This must come after all `with_*` calls since `rebuild_state`
         // creates a new SseManager, which would orphan this sender.
         sse_sender = Some(gw.state().sse.sender());
+        gateway_state = Some(Arc::clone(gw.state()));
 
         channel_names.push("gateway".to_string());
         channels.add(Box::new(gw)).await;
@@ -688,6 +690,11 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Fill the scheduler slot now that Agent (and its Scheduler) exist.
     *scheduler_slot.write().await = Some(agent.scheduler());
+
+    // Wire context monitor into gateway state for live context-limit updates.
+    if let Some(ref gw_state) = gateway_state {
+        *gw_state.context_monitor.write().await = Some(agent.context_monitor());
+    }
 
     agent.run().await?;
 
