@@ -12,6 +12,9 @@
 .sidecar/
 .todos/
 
+# Gas Town beads (local runtime state)
+.beads/
+
 target/
 
 # Benchmark results (local runs, not committed)

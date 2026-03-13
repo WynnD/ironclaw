@@ -2,6 +2,39 @@
 
 **IronClaw** is a secure personal AI assistant — user-first security, self-expanding tools, defense in depth, multi-channel access with proactive background execution.
 
+This is **Wynn's fork** (`WynnD/ironclaw`) of `nearai/ironclaw`.
+
+## Fork "Gotchas"
+- Use docker buildkit to build.
+- Upstream code often supports only "default" gateway user id. Our code must support the current id instead.
+- Name image tags after short commit hash
+
+### Git Remotes
+- **origin** — `WynnD/ironclaw` (this fork, push here)
+- **upstream** — `nearai/ironclaw` (pull upstream changes from here)
+
+### Deployment
+
+IronClaw is deployed to Wynn's home Kubernetes cluster as **`accountability-agent`** via ArgoCD GitOps.
+
+- **Deployment repo**: `../home-cluster` (`WynnD/home-cluster`, private)
+- **Cluster access**: `kubectl` (direct) and ArgoCD MCP server (available in this session)
+- **ArgoCD app**: `../home-cluster/argo/accountability-agent/accountability-agent.yaml`
+- **Kustomize overlay**: `../home-cluster/kustomize/accountability-agent/`
+- **Namespace**: `accountability-agent`
+- **Image**: `registry.wynndrahorad.com/ironclaw:<tag>` (tag set in `kustomization.yaml`)
+- **Database**: CNPG cluster `accountability-agent-db` (secret `accountability-agent-db-app` has URI)
+- **Secrets**: `accountability-agent-secrets` (LLM key, Telegram tokens, gateway auth, OpenAI key, etc.)
+- **Ingress**: Traefik with local-only middleware on `wynndrahorad.com`
+
+**Deploy workflow**: build image, push to `registry.wynndrahorad.com/ironclaw:<tag>`, commit/push `home-cluster` — ArgoCD runs image-updater
+
+## Operator Notes
+
+- Do not assume the active web gateway user is `default`.
+- In this environment, the gateway runs with a non-default `GATEWAY_USER_ID` (an ID-like value), so DB queries for settings such as `agent.auto_approved_tools` and `mcp_servers` must use the actual gateway user ID.
+- If the Extensions page shows an empty always-approved list while data exists in `settings`, check the `user_id` on the row first.
+
 ## Build & Test
 
 ```bash
