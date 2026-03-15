@@ -492,11 +492,12 @@ impl ContainerRunner {
 /// Tries these locations in order:
 /// 1. `DOCKER_HOST` env var (bollard default)
 /// 2. `/var/run/docker.sock` (Linux default; also used by OrbStack and Podman Desktop on macOS)
-/// 3. `~/.docker/run/docker.sock` (Docker Desktop 4.13+ on macOS — primary user-owned socket)
-/// 4. `~/.colima/default/docker.sock` (Colima — popular lightweight Docker Desktop alternative)
-/// 5. `~/.rd/docker.sock` (Rancher Desktop on macOS)
-/// 6. `$XDG_RUNTIME_DIR/docker.sock` (common rootless Docker socket on Linux)
-/// 7. `/run/user/$UID/docker.sock` (rootless Docker fallback on Linux)
+/// 3. `/var/run/docker/docker.sock` (shared-volume sidecar Docker socket)
+/// 4. `~/.docker/run/docker.sock` (Docker Desktop 4.13+ on macOS — primary user-owned socket)
+/// 5. `~/.colima/default/docker.sock` (Colima — popular lightweight Docker Desktop alternative)
+/// 6. `~/.rd/docker.sock` (Rancher Desktop on macOS)
+/// 7. `$XDG_RUNTIME_DIR/docker.sock` (common rootless Docker socket on Linux)
+/// 8. `/run/user/$UID/docker.sock` (rootless Docker fallback on Linux)
 pub async fn connect_docker() -> Result<Docker> {
     // First try bollard defaults (checks DOCKER_HOST env var, then /var/run/docker.sock).
     // This covers Linux, OrbStack (updates the /var/run symlink), and any user with
@@ -528,7 +529,8 @@ pub async fn connect_docker() -> Result<Docker> {
 
     Err(SandboxError::DockerNotAvailable {
         reason: "Could not connect to Docker daemon. Tried: $DOCKER_HOST, \
-            /var/run/docker.sock, ~/.docker/run/docker.sock, \
+            /var/run/docker.sock, /var/run/docker/docker.sock, \
+            ~/.docker/run/docker.sock, \
             ~/.colima/default/docker.sock, ~/.rd/docker.sock, \
             $XDG_RUNTIME_DIR/docker.sock, /run/user/$UID/docker.sock"
             .to_string(),
@@ -556,6 +558,8 @@ fn unix_socket_candidates_from_env(
             candidates.push(path);
         }
     };
+
+    push_unique(PathBuf::from("/var/run/docker/docker.sock")); // Shared-volume DinD sidecars
 
     if let Some(home) = home {
         push_unique(home.join(".docker/run/docker.sock")); // Docker Desktop 4.13+
@@ -611,6 +615,7 @@ mod tests {
             Some("1000".to_string()),
         );
 
+        assert!(candidates.contains(&PathBuf::from("/var/run/docker/docker.sock")));
         assert!(candidates.contains(&PathBuf::from("/home/tester/.docker/run/docker.sock")));
         assert!(candidates.contains(&PathBuf::from("/home/tester/.colima/default/docker.sock")));
         assert!(candidates.contains(&PathBuf::from("/home/tester/.rd/docker.sock")));
