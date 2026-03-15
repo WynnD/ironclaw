@@ -1849,6 +1849,19 @@ function loadExtensions() {
     // Split registry entries by kind
     var wasmEntries = registryData.entries.filter(function(e) { return e.kind !== 'mcp_server' && !e.installed; });
     var mcpEntries = registryData.entries.filter(function(e) { return e.kind === 'mcp_server'; });
+    var knownMcpNames = new Set(mcpEntries.map(function(e) { return e.name; }));
+    extData.extensions
+      .filter(function(ext) { return ext.kind === 'mcp_server' && !knownMcpNames.has(ext.name); })
+      .forEach(function(ext) {
+        mcpEntries.push({
+          name: ext.name,
+          display_name: ext.display_name || ext.name,
+          installed: true,
+          kind: ext.kind,
+          description: ext.description || '',
+          keywords: [],
+        });
+      });
 
     // Available WASM extensions
     if (wasmEntries.length === 0) {
