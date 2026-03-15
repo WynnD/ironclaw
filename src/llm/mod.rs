@@ -404,6 +404,7 @@ fn create_tinfoil_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvider>, L
         TINFOIL_BASE_URL,
         tf.api_key.expose_secret().to_string(),
         reqwest::header::HeaderMap::new(),
+        None,
     );
     Ok(Arc::new(adapter))
 }
@@ -460,15 +461,21 @@ fn create_openai_compatible_provider(
 
     let model = client.completion_model(&compat.model);
     tracing::info!(
+        enable_thinking = ?compat.enable_thinking,
         "Using OpenAI-compatible endpoint (chat completions, base_url: {}, model: {})",
         compat.base_url,
         compat.model
     );
 
+    let chat_template_kwargs_override = compat
+        .enable_thinking
+        .map(|enabled| serde_json::json!({ "enable_thinking": enabled }));
+
     let adapter = RigAdapter::new(model, &compat.model).with_native_transport(
         &compat.base_url,
         api_key_str,
         extra_headers,
+        chat_template_kwargs_override,
     );
     Ok(Arc::new(adapter))
 }
@@ -710,6 +717,7 @@ mod tests {
             base_url: "https://inference.baseten.co/v1".to_string(),
             api_key: None,
             model: model.to_string(),
+            enable_thinking: None,
             extra_headers: Vec::new(),
         });
         config

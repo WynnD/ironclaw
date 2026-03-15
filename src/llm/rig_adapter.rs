@@ -18,7 +18,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,6 +39,7 @@ struct NativeTransport {
     client: reqwest::Client,
     base_url: String,
     api_key: String,
+    chat_template_kwargs_override: Option<JsonValue>,
 }
 
 /// Adapter that wraps a rig-core `CompletionModel` and implements `LlmProvider`.
@@ -75,6 +76,7 @@ impl<M: CompletionModel> RigAdapter<M> {
         base_url: &str,
         api_key: String,
         extra_headers: reqwest::header::HeaderMap,
+        chat_template_kwargs_override: Option<JsonValue>,
     ) -> Self {
         let mut default_headers = reqwest::header::HeaderMap::new();
         default_headers.insert(
@@ -93,6 +95,7 @@ impl<M: CompletionModel> RigAdapter<M> {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
+            chat_template_kwargs_override,
         });
         self
     }
@@ -253,15 +256,41 @@ fn is_kimi_interleaved_thinking_model(model_name: &str) -> bool {
     is_kimi_k2_5_model(model_name) || is_kimi_k2_thinking_model(model_name)
 }
 
+fn is_qwen_openai_tool_model(model_name: &str) -> bool {
+    model_name.to_ascii_lowercase().contains("qwen")
+}
+
 fn should_use_glm_native_tool_rounds(model_name: &str) -> bool {
     crate::llm::is_glm_4_7_or_newer_model_id(model_name)
 }
 
-fn maybe_chat_template_kwargs_for_model(model_name: &str) -> Option<JsonValue> {
+fn should_use_native_openai_tool_rounds(model_name: &str) -> bool {
+    should_use_glm_native_tool_rounds(model_name) || is_qwen_openai_tool_model(model_name)
+}
+
+fn merged_chat_template_kwargs(
+    model_name: &str,
+    native_transport: Option<&NativeTransport>,
+) -> Option<JsonValue> {
+    let mut kwargs = serde_json::Map::new();
+
     if should_use_glm_native_tool_rounds(model_name) {
-        Some(serde_json::json!({ "clear_thinking": false }))
-    } else {
+        kwargs.insert("clear_thinking".to_string(), JsonValue::Bool(false));
+    }
+
+    if let Some(override_kwargs) = native_transport
+        .and_then(|transport| transport.chat_template_kwargs_override.as_ref())
+        .and_then(|value| value.as_object())
+    {
+        for (key, value) in override_kwargs {
+            kwargs.insert(key.clone(), value.clone());
+        }
+    }
+
+    if kwargs.is_empty() {
         None
+    } else {
+        Some(JsonValue::Object(kwargs))
     }
 }
 
@@ -639,7 +668,9 @@ fn convert_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<RigMessage
 
 /// Responses-style providers require a non-empty tool call ID.
 fn normalized_tool_call_id(raw: Option<&str>, seed: usize) -> String {
-    match raw.map(str::trim).filter(|id| !id.is_empty()) {
+    match raw.map(str::trim).filter(|id| {
+        !id.is_empty() && !id.eq_ignore_ascii_case("null") && !id.eq_ignore_ascii_case("none")
+    }) {
         Some(id) => id.to_string(),
         None => format!("generated_tool_call_{seed}"),
     }
@@ -754,9 +785,9 @@ fn extract_response(
             }
             AssistantContent::ToolCall(tc) => {
                 tool_calls.push(IronToolCall {
-                    id: tc.id.clone(),
+                    id: normalized_tool_call_id(Some(tc.id.as_str()), tool_calls.len()),
                     name: tc.function.name.clone(),
-                    arguments: tc.function.arguments.clone(),
+                    arguments: normalize_model_tool_arguments(tc.function.arguments.clone()),
                 });
             }
             AssistantContent::Reasoning(r) => {
@@ -946,7 +977,7 @@ impl<M: CompletionModel + Send + Sync + 'static> RigAdapter<M> {
             "tools": tools_json,
             "tool_choice": tool_choice.unwrap_or("auto"),
         });
-        if let Some(kwargs) = maybe_chat_template_kwargs_for_model(&self.model_name) {
+        if let Some(kwargs) = merged_chat_template_kwargs(&self.model_name, Some(transport)) {
             payload["chat_template_kwargs"] = kwargs;
         }
 
@@ -1033,7 +1064,7 @@ impl<M: CompletionModel + Send + Sync + 'static> RigAdapter<M> {
             "model": self.model_name,
             "messages": json_messages,
         });
-        if let Some(kwargs) = maybe_chat_template_kwargs_for_model(&self.model_name) {
+        if let Some(kwargs) = merged_chat_template_kwargs(&self.model_name, Some(transport)) {
             payload["chat_template_kwargs"] = kwargs;
         }
 
@@ -1230,15 +1261,31 @@ fn split_hidden_thinking(content: &str) -> (String, Option<String>) {
 
 /// Build OpenAI-format messages with plain string content (not array).
 fn build_native_messages(messages: &[ChatMessage]) -> Vec<JsonValue> {
+    let system_messages: Vec<&str> = messages
+        .iter()
+        .filter(|msg| msg.role == crate::llm::Role::System)
+        .map(|msg| msg.content.trim())
+        .filter(|content| !content.is_empty())
+        .collect();
+
     let mut out = Vec::new();
+    if !system_messages.is_empty() {
+        if system_messages.len() > 1 {
+            tracing::debug!(
+                system_messages = system_messages.len(),
+                "Collapsing multiple system messages into the first native OpenAI chat message",
+            );
+        }
+        out.push(serde_json::json!({
+            "role": "system",
+            "content": system_messages.join("\n\n"),
+        }));
+    }
+
+    let mut pending_generated_tool_call_ids: VecDeque<String> = VecDeque::new();
     for msg in messages {
         match msg.role {
-            crate::llm::Role::System => {
-                out.push(serde_json::json!({
-                    "role": "system",
-                    "content": msg.content,
-                }));
-            }
+            crate::llm::Role::System => {}
             crate::llm::Role::User => {
                 out.push(serde_json::json!({
                     "role": "user",
@@ -1250,7 +1297,19 @@ fn build_native_messages(messages: &[ChatMessage]) -> Vec<JsonValue> {
                 if let Some(ref tool_calls) = msg.tool_calls {
                     let tc_json: Vec<JsonValue> = tool_calls
                         .iter()
-                        .map(|tc| {
+                        .enumerate()
+                        .map(|(idx, tc)| {
+                            let tool_call_id =
+                                normalized_tool_call_id(Some(tc.id.as_str()), out.len() + idx);
+                            if tool_call_id != tc.id {
+                                tracing::debug!(
+                                    raw_tool_call_id = %tc.id,
+                                    normalized_tool_call_id = %tool_call_id,
+                                    tool_name = %tc.name,
+                                    "Normalized invalid assistant tool_call_id for native OpenAI payload",
+                                );
+                                pending_generated_tool_call_ids.push_back(tool_call_id.clone());
+                            }
                             // OpenAI API expects arguments as a JSON string
                             let args_str = if tc.arguments.is_string() {
                                 tc.arguments.as_str().unwrap_or("{}").to_string()
@@ -1258,7 +1317,7 @@ fn build_native_messages(messages: &[ChatMessage]) -> Vec<JsonValue> {
                                 serde_json::to_string(&tc.arguments).unwrap_or_default()
                             };
                             serde_json::json!({
-                                "id": tc.id,
+                                "id": tool_call_id,
                                 "type": "function",
                                 "function": {
                                     "name": tc.name,
@@ -1293,10 +1352,27 @@ fn build_native_messages(messages: &[ChatMessage]) -> Vec<JsonValue> {
                 }
             }
             crate::llm::Role::Tool => {
+                let tool_call_id = if tool_call_id_is_missing(msg.tool_call_id.as_deref()) {
+                    pending_generated_tool_call_ids
+                        .pop_front()
+                        .unwrap_or_else(|| {
+                            normalized_tool_call_id(msg.tool_call_id.as_deref(), out.len())
+                        })
+                } else {
+                    normalized_tool_call_id(msg.tool_call_id.as_deref(), out.len())
+                };
+                if msg.tool_call_id.as_deref() != Some(tool_call_id.as_str()) {
+                    tracing::debug!(
+                        raw_tool_call_id = ?msg.tool_call_id,
+                        normalized_tool_call_id = %tool_call_id,
+                        tool_name = ?msg.name,
+                        "Normalized invalid tool result tool_call_id for native OpenAI payload",
+                    );
+                }
                 out.push(serde_json::json!({
                     "role": "tool",
                     "content": msg.content,
-                    "tool_call_id": msg.tool_call_id.as_deref().unwrap_or(""),
+                    "tool_call_id": tool_call_id,
                 }));
             }
         }
@@ -1328,11 +1404,13 @@ fn parse_native_tool_response(
         .as_str()
         .or_else(|| message["reasoning"].as_str())
         .map(String::from);
+    let has_visible_content = message_content.is_some();
+    let has_reasoning_content = reasoning_content.is_some();
 
     let mut tool_calls = Vec::new();
     if let Some(tcs) = message["tool_calls"].as_array() {
-        for tc in tcs {
-            let id = tc["id"].as_str().unwrap_or("").to_string();
+        for (idx, tc) in tcs.iter().enumerate() {
+            let id = normalized_tool_call_id(tc["id"].as_str(), idx);
             let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
             let arguments = match tc["function"]["arguments"].as_str() {
                 Some(s) => serde_json::from_str(s).unwrap_or(JsonValue::Object(Default::default())),
@@ -1341,7 +1419,7 @@ fn parse_native_tool_response(
             tool_calls.push(IronToolCall {
                 id,
                 name,
-                arguments,
+                arguments: normalize_model_tool_arguments(arguments),
             });
         }
     }
@@ -1365,6 +1443,15 @@ fn parse_native_tool_response(
 
     let input_tokens = resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
     let output_tokens = resp["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+
+    tracing::debug!(
+        model = model_name,
+        tool_calls = tool_calls.len(),
+        has_visible_content,
+        has_reasoning_content,
+        finish_reason = ?finish_reason,
+        "Parsed native OpenAI-compatible tool response",
+    );
 
     Ok(ToolCompletionResponse {
         content,
@@ -1456,7 +1543,15 @@ where
         // Interleaved-thinking Kimi models: bypass rig-core's array content
         // serialization for tool rounds, because these endpoints expect plain
         // string content and emit reasoning in a provider-specific field.
-        if should_use_glm_native_tool_rounds(&self.model_name) && self.native_transport.is_some() {
+        if should_use_native_openai_tool_rounds(&self.model_name) && self.native_transport.is_some()
+        {
+            tracing::debug!(
+                model = %self.model_name,
+                qwen_native = is_qwen_openai_tool_model(&self.model_name),
+                glm_native = should_use_glm_native_tool_rounds(&self.model_name),
+                kimi_native = is_kimi_interleaved_thinking_model(&self.model_name),
+                "Using native OpenAI chat-completions tool transport",
+            );
             match self
                 .send_kimi_native_tool_request(
                     &messages,
@@ -1475,7 +1570,7 @@ where
                     tracing::warn!(
                         model = %self.model_name,
                         error = %e,
-                        "GLM native tool request failed; falling back to standard provider path"
+                        "Native OpenAI tool request failed; falling back to standard provider path"
                     );
                 }
             }
@@ -1710,6 +1805,37 @@ fn normalize_tool_name(name: &str, known_tools: &HashSet<String>) -> String {
     }
 
     name.to_string()
+}
+
+fn tool_call_id_is_missing(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        Some(id) => {
+            id.is_empty() || id.eq_ignore_ascii_case("null") || id.eq_ignore_ascii_case("none")
+        }
+        None => true,
+    }
+}
+
+fn normalize_model_tool_arguments(value: JsonValue) -> JsonValue {
+    match value {
+        JsonValue::String(s)
+            if s.trim().eq_ignore_ascii_case("null") || s.trim().eq_ignore_ascii_case("none") =>
+        {
+            JsonValue::Null
+        }
+        JsonValue::Array(items) => JsonValue::Array(
+            items
+                .into_iter()
+                .map(normalize_model_tool_arguments)
+                .collect(),
+        ),
+        JsonValue::Object(map) => JsonValue::Object(
+            map.into_iter()
+                .map(|(key, value)| (key, normalize_model_tool_arguments(value)))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 /// Normalize tool call names in-place using the known tool set.
@@ -2123,10 +2249,26 @@ mod tests {
     }
 
     #[test]
-    fn test_maybe_chat_template_kwargs_for_model_glm() {
-        let kwargs = maybe_chat_template_kwargs_for_model("zai-org/GLM-5").expect("glm kwargs");
+    fn test_merged_chat_template_kwargs_for_glm() {
+        let kwargs = merged_chat_template_kwargs("zai-org/GLM-5", None).expect("glm kwargs");
         assert_eq!(kwargs, serde_json::json!({"clear_thinking": false}));
-        assert!(maybe_chat_template_kwargs_for_model("moonshotai/Kimi-K2.5").is_none());
+        assert!(merged_chat_template_kwargs("moonshotai/Kimi-K2.5", None).is_none());
+    }
+
+    #[test]
+    fn test_merged_chat_template_kwargs_includes_enable_thinking_override() {
+        let transport = NativeTransport {
+            client: reqwest::Client::new(),
+            base_url: "http://localhost:8080/v1".to_string(),
+            api_key: "no-key".to_string(),
+            chat_template_kwargs_override: Some(serde_json::json!({
+                "enable_thinking": true
+            })),
+        };
+
+        let kwargs = merged_chat_template_kwargs("Qwen/Qwen3-30B-A3B", Some(&transport))
+            .expect("qwen kwargs");
+        assert_eq!(kwargs, serde_json::json!({"enable_thinking": true}));
     }
 
     #[test]
@@ -2188,6 +2330,34 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_native_tool_response_normalizes_null_tool_arguments_and_ids() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "null",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": "{\"path\":\"notes.txt\",\"encoding\":\"null\"}"
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+
+        let parsed =
+            parse_native_tool_response("Qwen/Qwen3-30B-A3B", &body).expect("response parses");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert!(parsed.tool_calls[0].id.starts_with("generated_tool_call_"));
+        assert_eq!(
+            parsed.tool_calls[0].arguments["encoding"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
     fn test_build_native_messages_exposes_reasoning_content_field() {
         let messages = vec![ChatMessage::assistant(
             "Visible reply<thinking>hidden reasoning</thinking>",
@@ -2198,6 +2368,52 @@ mod tests {
         assert_eq!(out[0]["role"], "assistant");
         assert_eq!(out[0]["content"], "Visible reply");
         assert_eq!(out[0]["reasoning_content"], "hidden reasoning");
+    }
+
+    #[test]
+    fn test_build_native_messages_collapses_system_messages_and_normalizes_tool_ids() {
+        let messages = vec![
+            ChatMessage::system("Primary system"),
+            ChatMessage::user("Need a tool"),
+            ChatMessage::system("Secondary system"),
+            ChatMessage::assistant_with_tool_calls(
+                None,
+                vec![IronToolCall {
+                    id: "null".to_string(),
+                    name: "time".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+            ),
+            ChatMessage::tool_result("null", "time", "2026-03-15T12:00:00Z"),
+        ];
+
+        let out = build_native_messages(&messages);
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(out[0]["content"], "Primary system\n\nSecondary system");
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[2]["role"], "assistant");
+        let normalized_id = out[2]["tool_calls"][0]["id"]
+            .as_str()
+            .expect("assistant tool id");
+        assert!(normalized_id.starts_with("generated_tool_call_"));
+        assert_eq!(out[3]["role"], "tool");
+        assert_eq!(out[3]["tool_call_id"], normalized_id);
+    }
+
+    #[test]
+    fn test_normalize_model_tool_arguments_converts_null_like_strings_recursively() {
+        let normalized = normalize_model_tool_arguments(serde_json::json!({
+            "top": "null",
+            "nested": {
+                "value": "None"
+            },
+            "items": ["ok", "NULL"]
+        }));
+
+        assert_eq!(normalized["top"], serde_json::Value::Null);
+        assert_eq!(normalized["nested"]["value"], serde_json::Value::Null);
+        assert_eq!(normalized["items"][0], serde_json::json!("ok"));
+        assert_eq!(normalized["items"][1], serde_json::Value::Null);
     }
 
     #[test]

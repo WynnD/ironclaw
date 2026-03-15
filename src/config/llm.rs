@@ -108,6 +108,9 @@ pub struct OpenAiCompatibleConfig {
     pub base_url: String,
     pub api_key: Option<SecretString>,
     pub model: String,
+    /// Optional `chat_template_kwargs.enable_thinking` override for
+    /// llama.cpp / llama-server style backends.
+    pub enable_thinking: Option<bool>,
     /// Extra HTTP headers injected into every LLM request.
     /// Parsed from `LLM_EXTRA_HEADERS` env var (format: `Key:Value,Key2:Value2`).
     pub extra_headers: Vec<(String, String)>,
@@ -321,9 +324,13 @@ impl LlmConfig {
                     key: "LLM_BASE_URL".to_string(),
                     hint: "Set LLM_BASE_URL when LLM_BACKEND=openai_compatible".to_string(),
                 })?;
-            let api_key = optional_env("LLM_API_KEY")?.map(SecretString::from);
+            let api_key = optional_env("LLM_API_KEY")?
+                .filter(|value| !is_disabled_optional_value(value))
+                .map(SecretString::from);
             let model = Self::resolve_model("LLM_MODEL", settings, "default")?;
+            let enable_thinking = parse_optional_bool_override_env("LLM_ENABLE_THINKING")?;
             let mut extra_headers = optional_env("LLM_EXTRA_HEADERS")?
+                .filter(|value| !is_disabled_optional_value(value))
                 .map(|val| parse_extra_headers(&val))
                 .transpose()?
                 .unwrap_or_default();
@@ -342,6 +349,7 @@ impl LlmConfig {
                 base_url,
                 api_key,
                 model,
+                enable_thinking,
                 extra_headers,
             })
         } else {
@@ -407,6 +415,31 @@ fn parse_extra_headers(val: &str) -> Result<Vec<(String, String)>, ConfigError> 
     Ok(headers)
 }
 
+fn is_disabled_optional_value(value: &str) -> bool {
+    let normalized = value.trim();
+    normalized.is_empty()
+        || normalized.eq_ignore_ascii_case("null")
+        || normalized.eq_ignore_ascii_case("none")
+}
+
+fn parse_optional_bool_override_env(key: &str) -> Result<Option<bool>, ConfigError> {
+    match optional_env(key)? {
+        Some(value) if is_disabled_optional_value(&value) => Ok(None),
+        Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(Some(true)),
+            "false" | "0" | "no" | "off" => Ok(Some(false)),
+            _ => Err(ConfigError::InvalidValue {
+                key: key.to_string(),
+                message: format!(
+                    "must be true/false (or null/none to unset), got '{}'",
+                    value
+                ),
+            }),
+        },
+        None => Ok(None),
+    }
+}
+
 /// Get the default session file path (~/.ironclaw/session.json).
 fn default_session_path() -> PathBuf {
     ironclaw_base_dir().join("session.json")
@@ -424,6 +457,9 @@ mod tests {
         unsafe {
             std::env::remove_var("LLM_BACKEND");
             std::env::remove_var("LLM_BASE_URL");
+            std::env::remove_var("LLM_API_KEY");
+            std::env::remove_var("LLM_ENABLE_THINKING");
+            std::env::remove_var("LLM_EXTRA_HEADERS");
             std::env::remove_var("LLM_MODEL");
         }
     }
@@ -554,6 +590,72 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k.eq_ignore_ascii_case("Accept-Language") && v == "en-US,en")
         );
+    }
+
+    #[test]
+    fn openai_compatible_treats_null_api_key_as_unset() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_openai_compatible_env();
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("LLM_API_KEY", "null");
+        }
+
+        let settings = Settings {
+            llm_backend: Some("openai_compatible".to_string()),
+            openai_compatible_base_url: Some("http://localhost:8080/v1".to_string()),
+            ..Default::default()
+        };
+
+        let cfg = LlmConfig::resolve(&settings).expect("resolve should succeed");
+        let compat = cfg
+            .openai_compatible
+            .expect("openai-compatible config should be present");
+        assert!(compat.api_key.is_none());
+    }
+
+    #[test]
+    fn openai_compatible_parses_enable_thinking_override() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_openai_compatible_env();
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("LLM_ENABLE_THINKING", "true");
+        }
+
+        let settings = Settings {
+            llm_backend: Some("openai_compatible".to_string()),
+            openai_compatible_base_url: Some("http://localhost:8080/v1".to_string()),
+            ..Default::default()
+        };
+
+        let cfg = LlmConfig::resolve(&settings).expect("resolve should succeed");
+        let compat = cfg
+            .openai_compatible
+            .expect("openai-compatible config should be present");
+        assert_eq!(compat.enable_thinking, Some(true));
+    }
+
+    #[test]
+    fn openai_compatible_treats_null_enable_thinking_as_unset() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        clear_openai_compatible_env();
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("LLM_ENABLE_THINKING", "null");
+        }
+
+        let settings = Settings {
+            llm_backend: Some("openai_compatible".to_string()),
+            openai_compatible_base_url: Some("http://localhost:8080/v1".to_string()),
+            ..Default::default()
+        };
+
+        let cfg = LlmConfig::resolve(&settings).expect("resolve should succeed");
+        let compat = cfg
+            .openai_compatible
+            .expect("openai-compatible config should be present");
+        assert_eq!(compat.enable_thinking, None);
     }
 
     #[test]

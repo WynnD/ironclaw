@@ -1,5 +1,5 @@
 -- Keep routine run history when deleting terminal jobs.
--- Existing behavior blocks job deletes due to routine_runs.job_id FK.
+-- Existing behavior blocked job deletes due to routine_runs.job_id FK.
 ALTER TABLE routine_runs
     DROP CONSTRAINT IF EXISTS routine_runs_job_id_fkey;
 

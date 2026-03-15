@@ -146,6 +146,32 @@ LLM_API_KEY=sk-...
 LLM_MODEL=gpt-4o                 # as configured in litellm config.yaml
 ```
 
+### llama.cpp / llama-server (Qwen jinja tool calling)
+
+For Qwen models served by `llama-server`, use the OpenAI-compatible backend and
+launch the server with the template features Qwen expects:
+
+```bash
+llama-server --jinja --reasoning-format deepseek ...
+```
+
+```env
+LLM_BACKEND=openai_compatible
+LLM_BASE_URL=http://localhost:8080/v1
+LLM_MODEL=Qwen/Qwen3-30B-A3B
+# LLM_API_KEY=null               # optional; null/none/empty are treated as unset
+LLM_ENABLE_THINKING=true         # forwards chat_template_kwargs.enable_thinking
+```
+
+IronClaw uses a native chat-completions path for Qwen tool rounds so the request
+body stays in plain OpenAI format:
+
+- One leading `system` message only
+- `user`, `assistant`, and `tool` roles only
+- Assistant `tool_calls[]` preserved verbatim
+- Tool results sent back as `role: "tool"` with matching `tool_call_id`
+- `reasoning_content` parsed alongside `tool_calls`
+
 ### LM Studio (local GUI)
 
 Start LM Studio's local server, then:
