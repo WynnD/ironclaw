@@ -630,9 +630,9 @@ mod tests {
         let config = McpServerConfig::new("", "https://example.com");
         assert!(config.validate().is_err());
 
-        // Invalid: HTTP for remote server
+        // Valid: self-hosted HTTP MCP server
         let config = McpServerConfig::new("remote", "http://mcp.example.com");
-        assert!(config.validate().is_err());
+        assert!(config.validate().is_ok());
     }
 
     #[test]
