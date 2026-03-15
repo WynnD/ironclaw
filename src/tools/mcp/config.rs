@@ -162,13 +162,12 @@ impl McpServerConfig {
                     });
                 }
 
-                // Remote servers must use HTTPS (localhost is allowed for development)
+                // Allow both HTTP and HTTPS transports. HTTPS is preferred, but
+                // self-hosted/internal MCP servers commonly run on plain HTTP.
                 let url_lower = self.url.to_lowercase();
-                let is_localhost =
-                    url_lower.contains("localhost") || url_lower.contains("127.0.0.1");
-                if !is_localhost && !url_lower.starts_with("https://") {
+                if !url_lower.starts_with("https://") && !url_lower.starts_with("http://") {
                     return Err(ConfigError::InvalidConfig {
-                        reason: "Remote MCP servers must use HTTPS".to_string(),
+                        reason: "MCP server URL must use http:// or https://".to_string(),
                     });
                 }
             }
