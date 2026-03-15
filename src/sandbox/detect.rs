@@ -102,26 +102,21 @@ pub struct DockerDetection {
 
 /// Check whether Docker is installed and running.
 ///
-/// 1. Checks if `docker` binary exists on PATH
-/// 2. If found, tries to connect and ping the Docker daemon via `connect_docker()`
-/// 3. Returns `Available`, `NotInstalled`, or `NotRunning`
+/// For local desktop installs this usually means both the `docker` CLI and the
+/// daemon are present. For remote or sidecar daemons, `DOCKER_HOST` can be
+/// enough even if the CLI binary is absent in the main process image.
 pub async fn check_docker() -> DockerDetection {
     let platform = Platform::current();
 
-    // Step 1: Check if docker binary is on PATH
-    if !docker_binary_exists() {
-        return DockerDetection {
-            status: DockerStatus::NotInstalled,
-            platform,
-        };
-    }
+    // First prefer the daemon probe. This covers remote/sidecar Docker setups
+    // where the API is reachable through DOCKER_HOST but the CLI binary is not
+    // installed in the current container image.
+    let daemon_reachable = crate::sandbox::connect_docker().await.is_ok();
+    let binary_present = docker_binary_exists();
+    let status = classify_status(daemon_reachable, binary_present);
 
-    // Step 2: Try to connect to the daemon
-    if crate::sandbox::connect_docker().await.is_ok() {
-        return DockerDetection {
-            status: DockerStatus::Available,
-            platform,
-        };
+    if status != DockerStatus::NotRunning {
+        return DockerDetection { status, platform };
     }
 
     // Windows fallback: if the named pipe probe fails but docker CLI can still
@@ -134,10 +129,7 @@ pub async fn check_docker() -> DockerDetection {
         };
     }
 
-    DockerDetection {
-        status: DockerStatus::NotRunning,
-        platform,
-    }
+    DockerDetection { status, platform }
 }
 
 /// Check if the `docker` binary exists on PATH.
@@ -188,6 +180,16 @@ fn docker_cli_daemon_reachable() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+fn classify_status(daemon_reachable: bool, binary_present: bool) -> DockerStatus {
+    if daemon_reachable {
+        DockerStatus::Available
+    } else if binary_present {
+        DockerStatus::NotRunning
+    } else {
+        DockerStatus::NotInstalled
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +224,21 @@ mod tests {
         assert!(!DockerStatus::NotInstalled.is_ok());
         assert!(!DockerStatus::NotRunning.is_ok());
         assert!(!DockerStatus::Disabled.is_ok());
+    }
+
+    #[test]
+    fn test_remote_daemon_without_cli_is_available() {
+        assert_eq!(classify_status(true, false), DockerStatus::Available);
+    }
+
+    #[test]
+    fn test_missing_cli_and_daemon_is_not_installed() {
+        assert_eq!(classify_status(false, false), DockerStatus::NotInstalled);
+    }
+
+    #[test]
+    fn test_local_cli_without_daemon_is_not_running() {
+        assert_eq!(classify_status(false, true), DockerStatus::NotRunning);
     }
 
     #[tokio::test]
