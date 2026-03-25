@@ -304,6 +304,15 @@ pub enum WorkspaceError {
     #[error("I/O error: {reason}")]
     IoError { reason: String },
 
+    #[error("Layer not found: {name}")]
+    LayerNotFound { name: String },
+
+    #[error("Layer '{name}' is read-only")]
+    LayerReadOnly { name: String },
+
+    #[error("Cannot write sensitive content: no private layer available for redirect")]
+    PrivacyRedirectFailed,
+
     #[error("Write rejected for '{path}': prompt injection detected ({reason})")]
     InjectionRejected { path: String, reason: String },
 }
@@ -375,6 +384,9 @@ pub enum RoutineError {
 
     #[error("Not authorized to trigger routine {id}")]
     NotAuthorized { id: Uuid },
+
+    #[error("Routine {name} is in cooldown period")]
+    Cooldown { name: String },
 
     #[error("Routine {name} at max concurrent runs")]
     MaxConcurrent { name: String },
